@@ -654,11 +654,12 @@ def check_environment(source: str) -> list[str]:
 #     ShutdownError). Assign _wid only AFTER the instance exists; on
 #     construction failure reset _wid=None and raise PlaybackError. Register property
 #     When DVD_PLAYER_SOFTWARE_RENDER=1: vo='gpu', gpu_context='x11egl',
-#     LIBGL_ALWAYS_SOFTWARE=1 (llvmpipe), display_fps_override=30 (cap the
-#     render rate near DVD frame rate instead of the 144 Hz display sync),
+#     LIBGL_ALWAYS_SOFTWARE=1 (llvmpipe), display_fps_override=25 (matches
+#     DVD content cadence rather than the display sync),
 #     scale='bilinear', dscale='bilinear', gpu_dumb_mode=True
-#     (cheapest llvmpipe shaders) and autosync=30 (gradual A/V drift
-#     correction — audio leads video on llvmpipe soft decode) — fallback for
+#     (cheapest llvmpipe shaders) and video_sync='audio' (retime against the
+#     audio clock; autosync stays at mpv's default 0, so no drift-correction
+#     episode after seeks) — fallback for
 #     NVIDIA-on-XWayland machines
 #     where all hardware GL contexts fail; DVD bitrates render fine in
 #     software at near video frame rate. The default hardware path is
@@ -727,7 +728,19 @@ def check_environment(source: str) -> list[str]:
 #     (non-fatal; libmpv exposes no separate VTSM title-menu jump;
 #     log.info this fallback once).
 #   * set_title(title): {PLAYING, PAUSED} only; player.disc_title = title.
-#   * seek_to(seconds): {PLAYING, PAUSED} only; player.time_pos = seconds.
+#   * seek_to(seconds): {PLAYING, PAUSED} only. Latest-wins settling:
+#     when no settle is pending, apply player.time_pos = seconds via _call
+#     and start the 350 ms singleShot _seek_settle; while it is active,
+#     store seconds in _pending_seek_pos and restart the timer (at most one
+#     immediate write per burst). _on_seek_settle applies the pending
+#     position via _call and clears it (at most one final write).
+#     eject()/dispose() stop _seek_settle (and clear _pending_seek_pos) so
+#     no write lands on a dead player; on a disposed engine seek_to is a
+#     no-op (returns before the state guard, never re-arms the timer).
+#   * seek atomicity: seek bursts are coalesced by _seek_settle (350 ms,
+#     singleShot QTimer created in __init__); an intermediate seek never
+#     overwrites a newer target, and the burst produces at most one
+#     immediate write plus one latest-wins settle write.
 #   * adjust_volume(delta): player.volume = min(150, max(0, volume + delta)).
 #   * resume_disc(saved): _pending_resume = dict(saved). Applied AT MOST
 #     ONCE by _apply_pending_resume(): IMMEDIATELY when staged while state
@@ -835,6 +848,7 @@ class DvdPlaybackEngine(QObject):
         self._title_menu_logged = False
         self._hash_worker: Any = None
         self._hash_epoch = 0  # stale-hash guard: workers carry their epoch
+        self._pending_seek_pos: float | None = None
         self._menu_active_raw.connect(self._apply_menu_active)
         self._time_pos_raw.connect(self._apply_time_pos)
         self._tracks_raw.connect(self._apply_tracks)
@@ -844,6 +858,10 @@ class DvdPlaybackEngine(QObject):
         self._load_watchdog.setSingleShot(True)
         self._load_watchdog.setInterval(LOAD_TIMEOUT_MS)
         self._load_watchdog.timeout.connect(self._on_load_timeout)
+        self._seek_settle = QTimer(self)
+        self._seek_settle.setSingleShot(True)
+        self._seek_settle.setInterval(350)
+        self._seek_settle.timeout.connect(self._on_seek_settle)
 
     # ── public API ──────────────────────────────────────────────────
     def attach_widget(self, wid: int) -> None:
@@ -876,12 +894,14 @@ class DvdPlaybackEngine(QObject):
                 options["gpu_context"] = "x11egl"
                 # llvmpipe on a 144 Hz display: cap presentation to DVD rate
                 # and pick the cheapest scalers/shader path.
-                options["display_fps_override"] = 30
+                options["display_fps_override"] = 25
                 options["scale"] = "bilinear"
                 options["dscale"] = "bilinear"
                 options["gpu_dumb_mode"] = True
-                # llvmpipe soft decode drifts; mpv retimes audio gradually.
-                options["autosync"] = 30
+                # retime against the audio clock; mpv's own autosync (0) is
+                # intentionally left at its default — no drift correction
+                # episode after seeks.
+                options["video_sync"] = "audio"
             player = mpv.MPV(**options)
         except Exception as exc:
             self._wid = None
@@ -1072,9 +1092,26 @@ class DvdPlaybackEngine(QObject):
 
     def seek_to(self, seconds: float) -> None:
         """Seek within the current title during PLAYING/PAUSED."""
+        if self._disposed:
+            return
         if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
             return
         position = float(seconds)
+        if self._seek_settle.isActive():
+            # Latest wins: coalesce intermediate seeks into one final apply.
+            self._pending_seek_pos = position
+            self._seek_settle.start()
+            return
+        self._pending_seek_pos = None
+        self._call(lambda p: setattr(p, "time_pos", position))
+        self._seek_settle.start()
+
+    def _on_seek_settle(self) -> None:
+        """Apply the most recent coalesced seek once the burst settles."""
+        position = self._pending_seek_pos
+        if position is None:
+            return
+        self._pending_seek_pos = None
         self._call(lambda p: setattr(p, "time_pos", position))
 
     def adjust_volume(self, delta: float) -> None:
@@ -1142,6 +1179,8 @@ class DvdPlaybackEngine(QObject):
         """Save state, terminate mpv, eject the disc and enter EJECTED."""
         self._save_resume_now()
         self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
+        self._seek_settle.stop()
+        self._pending_seek_pos = None
         source = self._source
         player = self._player
         self._player = None
@@ -1172,6 +1211,8 @@ class DvdPlaybackEngine(QObject):
         self._disposed = True
         self._load_watchdog.stop()
         self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
+        self._seek_settle.stop()
+        self._pending_seek_pos = None
         self._save_resume_now()
         player = self._player
         self._player = None

@@ -5,16 +5,41 @@ Architect. Every agent runs on **DeepSeek V4 Flash (Low Focus Mode)** except the
 architect (orchestration, Agent 5 duties). This file documents the agent roster,
 their activation protocol, and the verification evidence each one produces.
 
-## The Roster
+## The Roster (Avengers codenames)
 
-| Agent | Identity | Model | Scope |
-|---|---|---|---|
-| **1** | Media Backend & libdvdnav Engineer | flash#low | `dvd_player.py` sections 1–4 (`StateMachine`, `DiscIdentity` + `ResumeStore`, hardware helpers, `DvdPlaybackEngine`) |
-| **2** | Xbox 360 GUI & Input Controller Engineer | flash#low | sections 5–6 (`Xbox360Osd`, `MainWindow` — video embed, OSD, D-pad keys/gamepad, autoplay) |
-| **3** | Formal Verification Professor | flash#low | **Black-box** mathematical auditor: receives ONLY the stripped spec (signatures + state-transition table + I/O contracts, all method bodies folded away). Derives safety/liveness invariants, pre/post conditions and executable boundary vectors; audits the SPEC itself for contradictions. |
-| **4** | Black-Box Red-Team Attacker | flash#low | Attacks the shipped artifact with zero source access: drives only the documented public API/signals with hostile inputs (injection, NaN/inf seeds, dialog floods, event floods, lifecycle abuse, state fuzz). |
-| **5** | Token & Context Engineering Controller | architect (in-session) | **The most important agent.** Compiles every handoff: AST body-folding, static-prefix prompts, `SHARED_STATE`/CLUES handoffs, ≤15-line masked observations, diff-only agent outputs with token ceilings (A1/A2 ≤600, A3/A4 ≤350), telegraphic prose, loop-breaker circuit (two failures on the same `(agent, symbol, error-signature)` without progress ⇒ rollback + root-cause escalation). No agent receives context that Agent 5 has not minimized. |
-| **6** | Blind Acceptance Tester | flash#low | A fresh user with zero code access: reads only `README.md` + the UAT transcript, uses the app like a normal user, and judges the Xbox 360 experience. Final gate of every release. |
+| Agent | Codename | Identity | Model | Scope |
+|---|---|---|---|---|
+| **1** | **Tony Stark** | Media Backend & libdvdnav Engineer | flash#low | sections 1–4 (state machine, disc identity/resume, hardware, `DvdPlaybackEngine`) — builds the suit |
+| **2** | **Spider-Man** | Xbox 360 GUI & Input Controller Engineer | flash#low | sections 5–6 (OSD, window, input mapping, autoplay, scrubbing) — the friendly, agile interface |
+| **3** | **Dr. Strange** | Formal Verification Professor | flash#low | **NEVER sees code.** Reads only Thanos's minimized spec and derives the 14,000,605 constraints/contracts that Tony Stark and Spider-Man must satisfy. |
+| **4** | **Loki** | Cyber-Sec Pen-Tester | flash#low | Breaks the artifact in any way a user should never be able to: shell injection, command prompts, path traversal, races, floods. |
+| **5** | **Thanos** | Token & Context Minimizer — **the most important agent, and the ONLY one who spawns the others** | architect (in-session) | Takes `/tmp/TODO.md`, compresses it (chain-of-density), and hands each agent a minimized prompt packet. Perfectly balanced token budgets, as all things should be. |
+| **6** | **Captain America** | Blind Acceptance Tester | flash#low | The everyman hero: a fresh user with zero code access. "I can do this all day" — plays with the app until it's right. |
+
+## Thanos playbook (context & prompt engineering, researched 2026 practices)
+
+1. **XML delimiters** — every packet separates `<role>/<constraints>/<output_format>` (static, cache-stable prefix) from `<context>/<task>` (dynamic, bottom). Delimiters double as the first line of defense against prompt injection (Loki-proofing the prompt itself).
+2. **Context compaction** — never pass a full file: AST-folded slices, only the target section's signatures + SPEC, everything else `# [FOLDED]`. Retrieval-only context cut token spend ~60% in production systems; our pipeline applies it to every handoff.
+3. **Prompt caching** — static prefixes reused verbatim per agent across dispatches (60–80% cache hits on repeated calls).
+4. **Few-shot, hard cases** — 2–5 input→output examples per agent; examples include the difficult case, not the easy one.
+5. **Structured output contracts** — JSON/one-line schemas; a schema failure triggers a self-correction loop with the validation error fed back, not a blind retry.
+6. **Selective chain-of-thought** — deep reasoning only where correctness beats brevity (Dr. Strange's audits); implementers get lean packets.
+7. **Chain-of-density (CoD)** — Thanos compresses the TODO into dense packets: every entity kept, zero filler.
+8. **Token ceilings** — Tony/Spider ≤600, Dr. Strange ≤350, Loki ≤350, Cap ≤600; telegraphic prose; no fillers.
+9. **Loop-breaker** — hash `(agent, symbol, error-signature)`; two failures without progress ⇒ rollback + 3-line root-cause escalation.
+10. **Prompt versioning + ledger** — every packet versioned; every dispatch recorded (see ledger below).
+
+## Pipeline order (canonical)
+
+```
+TODO.md → Thanos (CoD compression) → Dr. Strange (constraints/contracts, blind)
+       → Tony Stark + Spider-Man (implement to contract)
+       → Loki (pen-test, destroy)
+       → if problems: back to Thanos → Tony Stark + Spider-Man
+       → Captain America (acceptance) → ship
+```
+
+Dr. Strange never sees code. Thanos alone creates the other agents, each with a minimized packet.
 
 ## XML Activation Protocol (every dispatch)
 
