@@ -628,6 +628,7 @@ def check_environment(source: str) -> list[str]:
 #     seek_to(self, seconds: float) -> None
 #     adjust_volume(self, delta: float) -> None
 #     resume_disc(self, saved: dict) -> None
+#     capture_frame(self) -> tuple[int, int, bytes] | None
 #     eject(self) -> None
 #     dispose(self) -> None
 #   Properties (read-only): state, menu_active, time_pos, duration, chapter,
@@ -702,6 +703,10 @@ def check_environment(source: str) -> list[str]:
 #     title (int, not None) -> disc_title = title; chapter (int, not None)
 #     -> chapter = chapter; pos (float > 0) -> time_pos = pos; then clear.
 #     All best-effort inside try/except (resume must never break playback).
+#   * capture_frame: GUI-thread seek-thumbnail helper. Returns
+#     (width, height, bgr0_bytes) from mpv 'screenshot-raw' for the current
+#     frame, or None when unavailable. NON-FATAL: every failure is swallowed
+#     (never raises, never changes state, never emits signals).
 #   * eject: _save_resume_now(); terminate player (set _player=None AND
 #     _wid=None so attach_widget() can rebuild mpv for the next load); if
 #     _menu_active: clear it and emit menu_active_changed(False); if
@@ -1036,6 +1041,45 @@ class DvdPlaybackEngine(QObject):
         """Stage a saved resume entry, applied on the next PLAYING state."""
         self._pending_resume = dict(saved) if saved else None
 
+    def capture_frame(self) -> tuple[int, int, bytes] | None:
+        """Return (width, height, bgr0_bytes) of the current video frame, or
+        None when unavailable. NEVER raises and NEVER changes state."""
+        player = self._player
+        if player is None or self._disposed:
+            return None
+        try:
+            raw = player.command("screenshot-raw")
+            if not isinstance(raw, dict):
+                return None
+            if raw.get("format") != "bgr0":
+                return None
+            width = int(raw.get("w", 0))
+            height = int(raw.get("h", 0))
+            if width <= 0 or height <= 0:
+                return None
+            data = bytes(raw.get("data", b""))
+            stride = int(raw.get("stride", width * 4))
+            row_bytes = width * 4
+            if stride == row_bytes:
+                packed = data
+            else:
+                packed = b"".join(
+                    data[offset : offset + row_bytes]
+                    for offset in range(0, stride * height, stride)
+                )
+            if len(packed) < row_bytes * height:
+                return None
+            return width, height, packed
+        except (
+            MPVError,
+            OSError,
+            SystemError,
+            AttributeError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
     def eject(self) -> None:
         """Save state, terminate mpv, eject the disc and enter EJECTED."""
         self._save_resume_now()
@@ -1350,6 +1394,9 @@ class DvdPlaybackEngine(QObject):
 #     transparent-for-mouse: it intercepts clicks only while visible.
 #   Signals:
 #     button_clicked = pyqtSignal(str)   # one of the BUTTON names below
+#     scrub_pressed = pyqtSignal(float)  # scrub fraction 0..1 at press
+#     scrub_moved = pyqtSignal(float)    # scrub fraction 0..1 while held
+#     scrub_released = pyqtSignal()      # left button released
 #   API (signatures exact):
 #     __init__(self, parent: Optional[QWidget] = None)
 #     set_transport(self, *, state: PlayerState, speed: float = 1.0,
@@ -1359,11 +1406,27 @@ class DvdPlaybackEngine(QObject):
 #                   chapter_count: Optional[int] = None,
 #                   audio_lang: Optional[str] = None,
 #                   subtitle_lang: Optional[str] = None) -> None
+#     set_preview(self, image: Optional[QImage]) -> None
 #     show_osd(self) -> None
+#     _seek_bar_rect(self) -> tuple[QRectF, QRectF]  # (track, padded hit)
 #     _button_rects(self) -> list[tuple[str, QRectF]]   # hit-testing/tests
 #     paintEvent(self, event: QPaintEvent) -> None
 #     mousePressEvent(self, event: QMouseEvent) -> None
-#     mouseMoveEvent(self, event: QMouseEvent) -> None  # hover repaint
+#     mouseMoveEvent(self, event: QMouseEvent) -> None  # hover/scrub repaint
+#     mouseReleaseEvent(self, event: QMouseEvent) -> None
+#   SEEK BAR: thin 6 px track at the TOP of the strip, spanning the width
+#     inside LEFT_MARGIN; filled portion QColor(116, 195, 41), remainder
+#     QColor(255, 255, 255, 40). Fraction = time_pos / duration when
+#     duration is a finite positive float and time_pos is known, else the
+#     bar paints empty. _seek_bar_rect returns the track plus a ~18 px tall
+#     vertically padded hit rect. Left press inside the hit rect starts a
+#     scrub (emit scrub_pressed(fraction)); moves while held emit
+#     scrub_moved(fraction); release emits scrub_released(). Bar hits take
+#     priority over button hits and moves are ignored unless pressed.
+#   PREVIEW: set_preview stores a QImage (or None) and repaints. While a
+#     preview is set, paintEvent draws it scaled into a 192x108 rounded rect
+#     just above the bar, centered on the current scrub x. show_osd and
+#     hide clear the preview (and scrub state).
 #   BUTTONS (order = left->right on the bar; glyph = painted text):
 #     ("prev", "⏮"), ("play_pause", "▶"), ("stop", "⏹"), ("next", "⏭"),
 #     ("ff", "⏩"), ("rw", "⏪"), ("audio", "AUD"), ("subtitle", "SUB"),
@@ -1392,10 +1455,16 @@ class DvdPlaybackEngine(QObject):
 #     button_clicked(name) and accept the event.
 #   * Paint-only: no child widgets, no external assets, no QSS.
 # ── [AGENT2: SECTION 5 BEGIN] ──
+from PyQt6.QtGui import QImage, QPainterPath
+
+
 class Xbox360Osd(QWidget):
     """Translucent Xbox 360-style transport strip drawn with QPainter."""
 
     button_clicked = pyqtSignal(str, arguments=())
+    scrub_pressed = pyqtSignal(float, arguments=())
+    scrub_moved = pyqtSignal(float, arguments=())
+    scrub_released = pyqtSignal(arguments=())
 
     BUTTONS: ClassVar[tuple[tuple[str, str], ...]] = (
         ("prev", "\u23ee"),
@@ -1426,6 +1495,9 @@ class Xbox360Osd(QWidget):
         self._audio_lang: str | None = None
         self._subtitle_lang: str | None = None
         self._hover: str | None = None
+        self._scrub_pressed = False
+        self._scrub_x: float | None = None
+        self._preview: QImage | None = None
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
         self._hide_timer = QTimer(self)
@@ -1458,9 +1530,56 @@ class Xbox360Osd(QWidget):
 
     def show_osd(self) -> None:
         """Show the strip and restart the auto-hide timeout."""
+        self._preview = None
+        self._scrub_pressed = False
+        self._scrub_x = None
         self.show()
         self.raise_()
         self._hide_timer.start(OSD_TIMEOUT_MS)
+        self.update()
+
+    def hideEvent(self, event: QEvent | None) -> None:
+        """Drop any preview/scrub state whenever the strip is hidden."""
+        self._preview = None
+        self._scrub_pressed = False
+        self._scrub_x = None
+        super().hideEvent(event)  # type: ignore[arg-type]
+
+    def set_preview(self, image: QImage | None) -> None:
+        """Store the snapshot shown above the bar while scrubbing."""
+        self._preview = image
+        self.update()
+
+    def _seek_bar_rect(self) -> tuple[QRectF, QRectF]:
+        """Return the (track, padded hit) rectangles of the seek bar."""
+        left = self.LEFT_MARGIN
+        width = max(0.0, float(self.width()) - 2.0 * self.LEFT_MARGIN)
+        track = QRectF(left, 5.0, width, 6.0)
+        hit_top = max(0.0, track.top() - 6.0)
+        hit = QRectF(left, hit_top, width, 18.0)
+        return track, hit
+
+    def _fraction_at(self, x: float) -> float:
+        """Map an x coordinate inside the track to a 0..1 fraction."""
+        track, _hit = self._seek_bar_rect()
+        if track.width() <= 0.0:
+            return 0.0
+        fraction = (float(x) - track.left()) / track.width()
+        return max(0.0, min(1.0, fraction))
+
+    def _seek_fraction(self) -> float:
+        """Return the playback fraction shown by the bar (0 when unknown)."""
+        duration = self._duration
+        time_pos = self._time_pos
+        if (
+            duration is None
+            or time_pos is None
+            or not math.isfinite(duration)
+            or not math.isfinite(time_pos)
+            or duration <= 0.0
+        ):
+            return 0.0
+        return max(0.0, min(1.0, time_pos / duration))
 
     def _button_rects(self) -> list[tuple[str, QRectF]]:
         """Return each button's name and hit rectangle, left to right."""
@@ -1511,6 +1630,22 @@ class Xbox360Osd(QWidget):
                 self.CORNER_RADIUS,
             )
 
+            track, _hit = self._seek_bar_rect()
+            if track.width() > 0.0:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 255, 255, 40))
+                painter.drawRoundedRect(track, 3.0, 3.0)
+                fraction = self._seek_fraction()
+                if fraction > 0.0:
+                    filled = QRectF(
+                        track.left(),
+                        track.top(),
+                        track.width() * fraction,
+                        track.height(),
+                    )
+                    painter.setBrush(QColor(116, 195, 41))
+                    painter.drawRoundedRect(filled, 3.0, 3.0)
+
             status_font = QFont()
             status_font.setPointSize(12)
             status_font.setBold(True)
@@ -1549,15 +1684,65 @@ class Xbox360Osd(QWidget):
                 painter.drawText(
                     rect, int(Qt.AlignmentFlag.AlignCenter), glyphs[name]
                 )
+
+            if self._preview is not None:
+                self._paint_preview(painter)
         finally:
             painter.end()
 
+    def _preview_rect(self) -> QRectF:
+        """Return the 192x108 preview frame rect centred on the scrub x."""
+        track, _hit = self._seek_bar_rect()
+        if self._scrub_x is None:
+            centre = track.center().x()
+        else:
+            centre = self._scrub_x
+        width = 192.0
+        height = 108.0
+        left = centre - width / 2.0
+        limit = float(self.width()) - self.LEFT_MARGIN - width
+        if limit >= self.LEFT_MARGIN:
+            left = max(self.LEFT_MARGIN, min(left, limit))
+        else:
+            left = max(0.0, min(left, max(0.0, float(self.width()) - width)))
+        return QRectF(left, track.top() - height - 4.0, width, height)
+
+    def _paint_preview(self, painter: QPainter) -> None:
+        """Paint the stored snapshot above the bar inside a rounded rect."""
+        preview = self._preview
+        if preview is None or preview.isNull():
+            return
+        rect = self._preview_rect()
+        path = QPainterPath()
+        path.addRoundedRect(rect, 8.0, 8.0)
+        painter.save()
+        try:
+            painter.setClipPath(path)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 220))
+            painter.drawRect(rect)
+            painter.drawImage(rect, preview)
+        finally:
+            painter.restore()
+
     def mousePressEvent(self, event: QMouseEvent | None) -> None:
-        """Emit ``button_clicked`` when a transport button is pressed."""
+        """Start scrubbing on the bar or emit ``button_clicked``."""
         if event is None:
             return
         if event.button() == Qt.MouseButton.LeftButton:
             position = event.position()
+            _track, hit = self._seek_bar_rect()
+            if hit.contains(position):
+                # Bar hits take priority over transport buttons.
+                track, _hit = self._seek_bar_rect()
+                fraction = self._fraction_at(position.x())
+                self._scrub_pressed = True
+                self._scrub_x = track.left() + fraction * track.width()
+                self._hide_timer.start(OSD_TIMEOUT_MS)
+                self.update()
+                self.scrub_pressed.emit(fraction)
+                event.accept()
+                return
             for name, rect in self._button_rects():
                 if rect.contains(position):
                     self.button_clicked.emit(name)
@@ -1566,11 +1751,21 @@ class Xbox360Osd(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent | None) -> None:
-        """Track which button is hovered so it can be highlighted."""
+        """Scrub while pressed, otherwise track the hovered button."""
         if event is None:
             return
-        hover: str | None = None
         position = event.position()
+        if self._scrub_pressed:
+            track, _hit = self._seek_bar_rect()
+            self._scrub_x = max(
+                track.left(), min(float(position.x()), track.right())
+            )
+            self._hide_timer.start(OSD_TIMEOUT_MS)
+            self.update()
+            self.scrub_moved.emit(self._fraction_at(position.x()))
+            event.accept()
+            return
+        hover: str | None = None
         for name, rect in self._button_rects():
             if rect.contains(position):
                 hover = name
@@ -1579,6 +1774,19 @@ class Xbox360Osd(QWidget):
             self._hover = hover
             self.update()
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent | None) -> None:
+        """Finish a scrub and emit ``scrub_released``."""
+        if event is None:
+            return
+        if self._scrub_pressed and event.button() == Qt.MouseButton.LeftButton:
+            self._scrub_pressed = False
+            self._scrub_x = None
+            self.update()
+            self.scrub_released.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     # ── painting helpers ────────────────────────────────────────────
     @staticmethod
@@ -1678,6 +1886,9 @@ class Xbox360Osd(QWidget):
 #     _on_video_mouse(self, obj, event: QMouseEvent) -> None
 #     _show_resume_prompt(self, disc_hash: str, saved: dict) -> None
 #     _sync_osd(self) -> None
+#     _on_scrub_pressed(self, fraction: float) -> None
+#     _on_scrub_moved(self, fraction: float) -> None
+#     _on_scrub_released(self) -> None
 #     _cycle_speed(self, direction: int) -> None
 #     _attach_engine(self) -> None
 #     _auto_detect_disc(self) -> None
@@ -1706,6 +1917,17 @@ class Xbox360Osd(QWidget):
 #     when menu active: engine.menu_select() only. Inside the menu the
 #     menu's own UI is the interface, so pointer activity never reveals
 #     the OSD there.
+#   * Console scrubbing (OSD seek bar): connect osd.scrub_pressed ->
+#     _on_scrub_pressed, osd.scrub_moved -> _on_scrub_moved,
+#     osd.scrub_released -> _on_scrub_released. On press/move compute
+#     seconds = fraction * engine.duration (skip when duration is None) and
+#     throttle seeks to one per ~100 ms; each seek calls
+#     engine.seek_to(seconds) then engine.capture_frame() (via getattr:
+#     absent backend -> no preview) and, when it returns (w, h, bytes),
+#     builds a QImage from the bgr0 bytes (Format_BGR888, w*4 stride, then
+#     mirrored as needed) and calls osd.set_preview(image). On release:
+#     final seek_to for the last fraction, osd.set_preview(None) and reset
+#     the throttle state. The preview exists ONLY between press and release.
 #   * _handle_key mapping (return False when unmapped; a consumed key
 #     reveals the OSD ONLY while engine.menu_active is FALSE; Qt.Key enum
 #     from PyQt6.QtCore):
@@ -1819,6 +2041,9 @@ class MainWindow(QMainWindow):
         self._disc_presence: dict[str, bool | None] = {}
         self._disc_gone_streak: dict[str, int] = {}
         self._auto_detected = False
+        self._scrub_active = False
+        self._scrub_fraction: float | None = None
+        self._scrub_last_seek = 0.0
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
@@ -1866,6 +2091,9 @@ class MainWindow(QMainWindow):
         eject_button.clicked.connect(self._on_eject_clicked)
         self.source.returnPressed.connect(self._on_load_clicked)
         self.osd.button_clicked.connect(self._on_osd_button)
+        self.osd.scrub_pressed.connect(self._on_scrub_pressed)
+        self.osd.scrub_moved.connect(self._on_scrub_moved)
+        self.osd.scrub_released.connect(self._on_scrub_released)
 
         engine.state_changed.connect(self._on_engine_state)
         engine.position_changed.connect(self._on_position)
@@ -2256,6 +2484,94 @@ class MainWindow(QMainWindow):
         self.engine.eject()
         self._loaded_source = None  # tray-close with a disc may then auto-boot
         self._set_status("EJECTED")
+
+    # ── OSD seek bar scrubbing ──────────────────────────────────────
+    def _scrub_seconds(self, fraction: float) -> float | None:
+        """Map a 0..1 fraction to seconds, or None without a duration."""
+        duration = self.engine.duration
+        if duration is None:
+            return None
+        try:
+            seconds_total = float(duration)
+            value = float(fraction)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(seconds_total)
+            or seconds_total <= 0.0
+            or not math.isfinite(value)
+        ):
+            return None
+        return max(0.0, min(1.0, value)) * seconds_total
+
+    def _scrub_seek(self, fraction: float, *, preview: bool) -> None:
+        """Seek to ``fraction`` and optionally capture the preview frame."""
+        seconds = self._scrub_seconds(fraction)
+        if seconds is None:
+            return
+        self.engine.seek_to(seconds)
+        self._scrub_last_seek = time.monotonic()
+        if preview:
+            self._refresh_scrub_preview()
+
+    def _on_scrub_pressed(self, fraction: float) -> None:
+        """Begin a scrub: seek immediately and show the preview."""
+        self._scrub_active = True
+        self._scrub_fraction = max(0.0, min(1.0, float(fraction)))
+        self._scrub_seek(self._scrub_fraction, preview=True)
+
+    def _on_scrub_moved(self, fraction: float) -> None:
+        """Continue a scrub, throttling engine seeks to ~100 ms."""
+        if not self._scrub_active:
+            return
+        self._scrub_fraction = max(0.0, min(1.0, float(fraction)))
+        if time.monotonic() - self._scrub_last_seek < 0.1:
+            return
+        self._scrub_seek(self._scrub_fraction, preview=True)
+
+    def _on_scrub_released(self) -> None:
+        """Finish a scrub: final seek, then drop the preview."""
+        self._scrub_active = False
+        fraction = self._scrub_fraction
+        self._scrub_fraction = None
+        if fraction is not None:
+            self._scrub_seek(fraction, preview=False)
+        self.osd.set_preview(None)
+        self._scrub_last_seek = 0.0
+
+    def _refresh_scrub_preview(self) -> None:
+        """Capture the current frame and show it as the scrub preview."""
+        if not self._scrub_active:
+            return
+        capture = getattr(self.engine, "capture_frame", None)
+        if capture is None:
+            return
+        try:
+            frame = capture()
+        except (PlaybackError, OSError, RuntimeError, SystemError, ValueError):
+            return
+        if not isinstance(frame, tuple) or len(frame) != 3:
+            return
+        width, height, data = frame
+        if not isinstance(width, int) or not isinstance(height, int):
+            return
+        if width <= 0 or height <= 0:
+            return
+        if not isinstance(data, (bytes, bytearray, memoryview)):
+            return
+        raw = bytes(data)
+        if len(raw) < width * height * 4:
+            return
+        image = QImage(
+            raw,
+            width,
+            height,
+            width * 4,
+            QImage.Format.Format_BGR888,
+        )
+        if image.isNull():
+            return
+        self.osd.set_preview(image.copy())
 
     def _on_osd_button(self, action: str) -> None:
         """Route an OSD transport click to the matching engine action."""
