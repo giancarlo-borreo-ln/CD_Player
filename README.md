@@ -60,6 +60,18 @@ uv run dvd-player /path/to/movie.iso       # or play a specific source
 uv run dvd-player /path/to/VIDEO_TS        # or a ripped DVD folder
 ```
 
+## Install as a desktop app (Rofi / app launcher)
+
+```sh
+uv tool install .                                          # installs `dvd-player` into ~/.local/bin
+cp packaging/dvd-player.desktop ~/.local/share/applications/
+uv run python packaging/make_icon.py                       # writes the app icon
+gtk-update-icon-cache -f ~/.local/share/icons/hicolor 2>/dev/null || true
+```
+
+You can now launch it from Rofi by typing `dvd-player` (it appears under
+AudioVideo). Updates: `uv tool install --force .`
+
 ## Device permissions
 
 The app reads block devices and (for eject) uses raw ioctls, so your user

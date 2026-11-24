@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=dvd-player
+Comment=Xbox 360-style DVD player (libmpv + dvdnav)
+Exec=dvd-player
+Icon=dvd-player
+Terminal=false
+Categories=AudioVideo;Player;
+StartupWMClass=dvd_player
