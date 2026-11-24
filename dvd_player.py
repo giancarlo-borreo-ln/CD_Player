@@ -1542,7 +1542,7 @@ class Xbox360Osd(QWidget):
     def _status_text(self) -> str:
         """Return the left-hand status label (speed-aware)."""
         speed = self._speed
-        if abs(speed - 1.0) > 1e-9:
+        if math.isfinite(speed) and abs(speed - 1.0) > 1e-9:
             direction = "FF" if speed > 1.0 else "RW"
             magnitude = abs(speed)
             if abs(magnitude - round(magnitude)) < 1e-9:
@@ -1682,14 +1682,15 @@ class Xbox360Osd(QWidget):
 #     (DISC_POLL_MS, always running) calls _poll_disc_insertion(): keep a
 #     per-device presence snapshot COMMITTED BEFORE ACTING (a modal resume
 #     prompt re-enters the event loop and this poller must then see the
-#     edge as consumed, never firing duplicate loads/dialogs); on an edge
-#     INTO True from any non-True value (False->True or tray-open
-#     None->True — covers re-insertion after an eject) and engine.state in
-#     {IDLE, STOPPED, EJECTED, ERROR}: set self.source text and
-#     _load_source(device, quiet=True) — inserting a disc while the app is
-#     open auto-boots it, like a console tray-close. On an edge OUT of True
-#     (True->False or True->None) for the currently loaded device: status
-#     'disc removed'.
+#     edge as consumed, never firing duplicate loads/dialogs); auto-load on
+#     an edge INTO True from any non-True value (False->True or tray-open
+#     None->True — covers re-insertion after an eject) WHEN engine.state in
+#     {IDLE, STOPPED, EJECTED, ERROR} AND self._loaded_source != device
+#     (a disc already loaded is never reloaded by a transient drive blip).
+#     Removal is debounced: on >=2 consecutive non-True polls (~2 *
+#     DISC_POLL_MS) for the currently loaded device: status 'disc removed'
+#     and clear _loaded_source. _on_eject_clicked clears _loaded_source
+#     immediately after eject so closing the tray with a disc auto-boots.
 #   * _load_source(source, quiet): the shared load flow. _attach_engine()
 #     first (idempotent; re-creates mpv after an eject). problems =
 #     check_environment(source): when problems — quiet: set self.status to
@@ -1735,6 +1736,7 @@ class MainWindow(QMainWindow):
         self._gamepad_states: dict[str, int] = {}
         self._gamepad_unavailable = False
         self._disc_presence: dict[str, bool | None] = {}
+        self._disc_gone_streak: dict[str, int] = {}
         self._auto_detected = False
 
         central = QWidget(self)
@@ -1930,8 +1932,12 @@ class MainWindow(QMainWindow):
             return
         if not pads:
             return
+        try:
+            pad_iter = iter(pads[0])
+        except (TypeError, AttributeError):
+            return  # malformed third-party payload: degrade silently
         states: dict[str, int] = {}
-        for control in pads[0]:
+        for control in pad_iter:
             code = str(getattr(control, "code", ""))
             try:
                 states[code] = int(getattr(control, "state", 0))
@@ -2063,25 +2069,27 @@ class MainWindow(QMainWindow):
             # the event loop and this poller must then see the edge as
             # consumed instead of firing duplicate loads/dialogs.
             self._disc_presence[device] = present
-            if (
-                present is True
-                and previous is not True
-                and self.engine.state
-                in (
-                    PlayerState.IDLE,
-                    PlayerState.STOPPED,
-                    PlayerState.EJECTED,
-                    PlayerState.ERROR,
-                )
-            ):
-                self.source.setText(device)
-                self._load_source(device, quiet=True)
-            elif (
-                present is not True
-                and previous is True
-                and self._loaded_source == device
-            ):
-                self._set_status("disc removed")
+            if present is True:
+                self._disc_gone_streak[device] = 0
+                if (
+                    previous is not True
+                    and self._loaded_source != device
+                    and self.engine.state
+                    in (
+                        PlayerState.IDLE,
+                        PlayerState.STOPPED,
+                        PlayerState.EJECTED,
+                        PlayerState.ERROR,
+                    )
+                ):
+                    self.source.setText(device)
+                    self._load_source(device, quiet=True)
+            elif self._loaded_source == device:
+                streak = self._disc_gone_streak.get(device, 0) + 1
+                self._disc_gone_streak[device] = streak
+                if streak >= 2:
+                    self._set_status("disc removed")
+                    self._loaded_source = None
 
     def _load_source(self, source: str, quiet: bool = False) -> None:
         """Check the source, offer resume state and load it."""
@@ -2137,6 +2145,7 @@ class MainWindow(QMainWindow):
     def _on_eject_clicked(self) -> None:
         """Eject the disc and show the new state."""
         self.engine.eject()
+        self._loaded_source = None  # tray-close with a disc may then auto-boot
         self._set_status("EJECTED")
 
     def _on_osd_button(self, action: str) -> None:
