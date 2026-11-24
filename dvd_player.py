@@ -20,6 +20,7 @@ import grp
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import stat
@@ -31,7 +32,6 @@ from enum import Enum, auto
 from pathlib import Path
 
 import mpv  # python-mpv (ctypes bindings over libmpv)
-
 from PyQt6.QtCore import QObject, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent,
@@ -65,6 +65,9 @@ log = logging.getLogger("dvd_player")
 from collections.abc import Callable
 from typing import Any, ClassVar
 
+from PyQt6.QtCore import QEvent
+from PyQt6.QtGui import QColor, QFont, QFontMetricsF, QPalette, QResizeEvent
+
 # ════════════════════════════════════════════════════════════════════
 # SECTION 1 — Constants, enums, state machine
 # ════════════════════════════════════════════════════════════════════
@@ -78,6 +81,7 @@ RESUME_FILE = CONFIG_DIR / "resume.json"
 RESUME_MAX_ENTRIES = 16  # cap stored per-disc entries
 OSD_TIMEOUT_MS = 4000  # Xbox-style OSD auto-hide delay
 GAMEPAD_POLL_MS = 50
+DISC_POLL_MS = 2000  # console-style disc-insertion polling (auto-play)
 LOAD_TIMEOUT_MS = 30000  # LOADING watchdog: must yield MENU_ACTIVE/PLAYING within this
 
 FF_SPEEDS = (2.0, 4.0, 8.0, 16.0)  # console trick-play ladder
@@ -105,17 +109,21 @@ class PlaybackError(Exception):
 #       transition(self, new: PlayerState) -> None
 #       reset(self) -> None
 #   LEGAL table (use exactly):
-#       IDLE        -> {LOADING}
-#       LOADING     -> {MENU_ACTIVE, PLAYING, ERROR}
+#       IDLE        -> {LOADING, EJECTED}
+#       LOADING     -> {MENU_ACTIVE, PLAYING, EJECTED, ERROR}
 #       MENU_ACTIVE -> {PLAYING, STOPPED, EJECTED, ERROR}
 #       PLAYING     -> {PAUSED, MENU_ACTIVE, STOPPED, EJECTED, ERROR}
 #       PAUSED      -> {PLAYING, MENU_ACTIVE, STOPPED, EJECTED, ERROR}
 #       STOPPED     -> {IDLE, LOADING, MENU_ACTIVE, EJECTED}
 #       EJECTED     -> {IDLE, LOADING}
-#       ERROR       -> {LOADING}
-#   transition(new): no-op when new == state; raise PlaybackError(
-#       f"illegal transition {self._state.name} -> {new.name}") otherwise.
-#   reset(): state = IDLE (no validation, used on fresh load lifecycle).
+#       ERROR       -> {LOADING, EJECTED}
+#   Eject is legal from EVERY state except EJECTED (console: the tray always
+#   opens, even while loading or after an error); eject from EJECTED is the
+#   same-state no-op. transition(new): no-op when new == state; raise
+#   PlaybackError(f"illegal transition {state} -> {new}") otherwise.
+#   reset(): state = IDLE — the DECLARED unvalidated exception (it produces
+#   STOPPED->IDLE and EJECTED->IDLE plus emergency resets); transition()
+#   itself never bypasses the table.
 #   GUI-thread only; mpv-thread callbacks must never call transition
 #   directly (see SECTION 4 threading contract).
 # ── [AGENT1: SECTION 1 BEGIN] ──
@@ -123,10 +131,11 @@ class StateMachine:
     """Validate player state transitions on the GUI thread."""
 
     _LEGAL: ClassVar[dict[PlayerState, set[PlayerState]]] = {
-        PlayerState.IDLE: {PlayerState.LOADING},
+        PlayerState.IDLE: {PlayerState.LOADING, PlayerState.EJECTED},
         PlayerState.LOADING: {
             PlayerState.MENU_ACTIVE,
             PlayerState.PLAYING,
+            PlayerState.EJECTED,
             PlayerState.ERROR,
         },
         PlayerState.MENU_ACTIVE: {
@@ -156,7 +165,7 @@ class StateMachine:
             PlayerState.EJECTED,
         },
         PlayerState.EJECTED: {PlayerState.IDLE, PlayerState.LOADING},
-        PlayerState.ERROR: {PlayerState.LOADING},
+        PlayerState.ERROR: {PlayerState.LOADING, PlayerState.EJECTED},
     }
 
     def __init__(self, initial: PlayerState = PlayerState.IDLE) -> None:
@@ -211,6 +220,8 @@ class StateMachine:
 #       forget(self, disc_hash: str) -> None
 #   Entry schema: {"pos": float, "title": int|None, "chapter": int|None,
 #                  "updated": float}
+#   pos is sanitized by the consumer (NaN/±inf/negative -> 0.0); the store
+#   itself only persists finite floats.
 # ── [AGENT1: SECTION 2 BEGIN] ──
 def _hash_stream(path: Path) -> str:
     """Return the sha256 hex digest of a file, reading it in 1 MiB chunks."""
@@ -312,9 +323,9 @@ def _entry_updated(entry: dict[str, object]) -> float:
 class ResumeStore:
     """Persist per-disc resume positions in a small JSON file."""
 
-    def __init__(self, path: Path = RESUME_FILE) -> None:
+    def __init__(self, path: Path | str = RESUME_FILE) -> None:
         """Use ``path`` as the backing JSON file."""
-        self._path = path
+        self._path = Path(path)
 
     def load(self) -> dict[str, dict[str, object]]:
         """Return all entries; ``{}`` when the file is missing or corrupt."""
@@ -675,8 +686,10 @@ def check_environment(source: str) -> list[str]:
 #   * set_title(title): {PLAYING, PAUSED} only; player.disc_title = title.
 #   * seek_to(seconds): {PLAYING, PAUSED} only; player.time_pos = seconds.
 #   * adjust_volume(delta): player.volume = min(150, max(0, volume + delta)).
-#   * resume_disc(saved): _pending_resume = dict(saved). Applied by
-#     _apply_pending_resume() on the first transition into PLAYING:
+#   * resume_disc(saved): _pending_resume = dict(saved). Applied AT MOST
+#     ONCE by _apply_pending_resume() on the first transition into PLAYING
+#     after staging (the stage is cleared BEFORE applying, so a later
+#     PAUSED->PLAYING unpause never re-applies it):
 #     title (int, not None) -> disc_title = title; chapter (int, not None)
 #     -> chapter = chapter; pos (float > 0) -> time_pos = pos; then clear.
 #     All best-effort inside try/except (resume must never break playback).
@@ -684,7 +697,9 @@ def check_environment(source: str) -> list[str]:
 #     _wid=None so attach_widget() can rebuild mpv for the next load); if
 #     _menu_active: clear it and emit menu_active_changed(False); if
 #     _source was a block device: eject_device(_source); transition(EJECTED)
-#     (legal from PLAYING/PAUSED/MENU_ACTIVE/STOPPED; wrap try/except).
+#     (legal from EVERY state except EJECTED — console tray semantics; the
+#     transition is wrapped in try/except and a rejected transition only
+#     logs; the load watchdog is disarmed by the non-LOADING transition).
 #   * dispose: idempotent; _save_resume_now(); if _player: terminate and
 #     _player=None. Does NOT change state.
 #   * _ensure_player: raise PlaybackError("engine not attached to a video
@@ -699,6 +714,8 @@ def check_environment(source: str) -> list[str]:
 #       elif not active and state == MENU_ACTIVE: transition(PLAYING)
 #       if state == PLAYING and _pending_resume: _apply_pending_resume()
 #       emit menu_active_changed(_menu_active)
+#     Invariant: menu_active == (state == MENU_ACTIVE) after each handler
+#     completes; eject() clears both.
 #   * _apply_time_pos(value): when value is not None: emit
 #     position_changed(float(value)).
 #   * _apply_tracks(value): split into audio/sub lists of dicts with keys
@@ -713,7 +730,12 @@ def check_environment(source: str) -> list[str]:
 #   * Every player call wrapped: on MPVError/OSError/SystemError/AttributeError -> transition(ERROR) +
 #     emit error_occurred(str(exc)) + log.exception. StateMachine blocks
 #     ERROR->ERROR double transitions (raise PlaybackError inside handler;
-#     catch it and only log).
+#     catch it and only log). ERROR is entered only from {LOADING,
+#     MENU_ACTIVE, PLAYING, PAUSED}; failures while IDLE/STOPPED/EJECTED
+#     surface via error_occurred + GUI status without a state change.
+#   * Residual-state rule: every public operation EXCEPT load is a NO-OP
+#     outside its declared pre-state (never raises, never signals); load
+#     raises PlaybackError outside {IDLE, STOPPED, EJECTED, ERROR}.
 #   * Properties return safe values when _player is None or the libmpv core
 #     has shut down: time_pos=None, duration=None, chapter=None,
 #     chapter_list=[], disc_title=None, volume=None, speed=_speed,
@@ -1317,8 +1339,11 @@ class DvdPlaybackEngine(QObject):
 #     'MENU', 'PLAYING', 'PAUSED', 'STOPPED', 'FF 4x', 'RW 2x' (speed
 #     multiplier when speed != 1.0, prefix FF/RW by sign). Then time
 #     'mm:ss / h:mm:ss' or '--:--' when time_pos is None, and 'CH x/y'
-#     when chapter_count is not None. Buttons right-aligned, 34 px spacing,
-#     14 pt font, base color white, hover color Xbox green
+#     when chapter_count is not None. Between time/chapter text and the
+#     buttons: current tracks 'AUD en · SUB fr' (parts omitted when None),
+#     10 pt, light gray QColor(200, 200, 200) — language switching visible
+#     on the bar (Xbox track-toggle feedback). Buttons right-aligned,
+#     34 px spacing, 14 pt font, base color white, hover color Xbox green
 #     QColor(116, 195, 41) via setMouseTracking(True). Draw helper
 #     _fmt_time(seconds: float) -> str ('mm:ss' or 'h:mm:ss').
 #   * show_osd: show(), raise_(), (re)start a singleShot
@@ -1328,6 +1353,237 @@ class DvdPlaybackEngine(QObject):
 #     button_clicked(name) and accept the event.
 #   * Paint-only: no child widgets, no external assets, no QSS.
 # ── [AGENT2: SECTION 5 BEGIN] ──
+class Xbox360Osd(QWidget):
+    """Translucent Xbox 360-style transport strip drawn with QPainter."""
+
+    button_clicked = pyqtSignal(str, arguments=())
+
+    BUTTONS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("prev", "\u23ee"),
+        ("play_pause", "\u25b6"),
+        ("stop", "\u23f9"),
+        ("next", "\u23ed"),
+        ("ff", "\u23e9"),
+        ("rw", "\u23ea"),
+        ("audio", "AUD"),
+        ("subtitle", "SUB"),
+        ("menu", "MENU"),
+        ("eject", "\u23cf"),
+    )
+    LEFT_MARGIN: ClassVar[float] = 16.0
+    BUTTON_GAP: ClassVar[float] = 34.0
+    BUTTON_MIN_WIDTH: ClassVar[float] = 34.0
+    CORNER_RADIUS: ClassVar[float] = 10.0
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create the strip and its single-shot auto-hide timer."""
+        super().__init__(parent)  # type: ignore[arg-type]
+        self._state = PlayerState.IDLE
+        self._speed = 1.0
+        self._time_pos: float | None = None
+        self._duration: float | None = None
+        self._chapter: int | None = None
+        self._chapter_count: int | None = None
+        self._audio_lang: str | None = None
+        self._subtitle_lang: str | None = None
+        self._hover: str | None = None
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+
+    # ── public API ──────────────────────────────────────────────────
+    def set_transport(
+        self,
+        *,
+        state: PlayerState,
+        speed: float = 1.0,
+        time_pos: float | None = None,
+        duration: float | None = None,
+        chapter: int | None = None,
+        chapter_count: int | None = None,
+        audio_lang: str | None = None,
+        subtitle_lang: str | None = None,
+    ) -> None:
+        """Store the values shown on the strip and repaint it."""
+        self._state = state
+        self._speed = float(speed)
+        self._time_pos = None if time_pos is None else float(time_pos)
+        self._duration = None if duration is None else float(duration)
+        self._chapter = chapter
+        self._chapter_count = chapter_count
+        self._audio_lang = audio_lang
+        self._subtitle_lang = subtitle_lang
+        self.update()
+
+    def show_osd(self) -> None:
+        """Show the strip and restart the auto-hide timeout."""
+        self.show()
+        self.raise_()
+        self._hide_timer.start(OSD_TIMEOUT_MS)
+
+    def _button_rects(self) -> list[tuple[str, QRectF]]:
+        """Return each button's name and hit rectangle, left to right."""
+        font = QFont()
+        font.setPointSize(14)
+        metrics = QFontMetricsF(font)
+        height = max(0.0, float(self.height()) - 16.0)
+        right = float(self.width()) - self.LEFT_MARGIN
+        rects: list[tuple[str, QRectF]] = []
+        for name, glyph in reversed(self.BUTTONS):
+            width = max(
+                self.BUTTON_MIN_WIDTH, metrics.horizontalAdvance(glyph) + 8.0
+            )
+            left = max(0.0, right - width)
+            visible = max(0.0, min(width, right - left))
+            rects.append((name, QRectF(left, 8.0, visible, height)))
+            right -= width + self.BUTTON_GAP
+        rects.reverse()
+        return rects
+
+    def paintEvent(self, event: QPaintEvent | None) -> None:
+        """Draw the translucent bar, status text and transport glyphs."""
+        del event
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(QColor(255, 255, 255, 70))
+            painter.setBrush(QColor(16, 16, 16, 190))
+            painter.drawRoundedRect(
+                QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5),
+                self.CORNER_RADIUS,
+                self.CORNER_RADIUS,
+            )
+
+            status_font = QFont()
+            status_font.setPointSize(12)
+            status_font.setBold(True)
+            painter.setFont(status_font)
+            painter.setPen(QColor(255, 255, 255))
+            metrics = painter.fontMetrics()
+            baseline = (self.height() + metrics.ascent() - metrics.descent()) / 2.0
+            x = self.LEFT_MARGIN
+            for text in self._text_chunks():
+                painter.drawText(int(x), int(baseline), text)
+                x += float(metrics.horizontalAdvance(text)) + 24.0
+
+            track_text = self._track_text()
+            if track_text is not None:
+                track_font = QFont()
+                track_font.setPointSize(10)
+                painter.setFont(track_font)
+                painter.setPen(QColor(200, 200, 200))
+                track_metrics = painter.fontMetrics()
+                track_baseline = (
+                    self.height()
+                    + track_metrics.ascent()
+                    - track_metrics.descent()
+                ) / 2.0
+                painter.drawText(int(x), int(track_baseline), track_text)
+
+            button_font = QFont()
+            button_font.setPointSize(14)
+            painter.setFont(button_font)
+            glyphs = dict(self.BUTTONS)
+            for name, rect in self._button_rects():
+                if name == self._hover:
+                    painter.setPen(QColor(116, 195, 41))
+                else:
+                    painter.setPen(QColor(255, 255, 255))
+                painter.drawText(
+                    rect, int(Qt.AlignmentFlag.AlignCenter), glyphs[name]
+                )
+        finally:
+            painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent | None) -> None:
+        """Emit ``button_clicked`` when a transport button is pressed."""
+        if event is None:
+            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            position = event.position()
+            for name, rect in self._button_rects():
+                if rect.contains(position):
+                    self.button_clicked.emit(name)
+                    event.accept()
+                    return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent | None) -> None:
+        """Track which button is hovered so it can be highlighted."""
+        if event is None:
+            return
+        hover: str | None = None
+        position = event.position()
+        for name, rect in self._button_rects():
+            if rect.contains(position):
+                hover = name
+                break
+        if hover != self._hover:
+            self._hover = hover
+            self.update()
+        super().mouseMoveEvent(event)
+
+    # ── painting helpers ────────────────────────────────────────────
+    @staticmethod
+    def _fmt_time(seconds: float | None) -> str:
+        """Format seconds as ``mm:ss`` or ``h:mm:ss``."""
+        try:
+            total = 0 if seconds is None else max(0, int(seconds))
+        except (OverflowError, ValueError, TypeError):
+            total = 0
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _status_text(self) -> str:
+        """Return the left-hand status label (speed-aware)."""
+        speed = self._speed
+        if abs(speed - 1.0) > 1e-9:
+            direction = "FF" if speed > 1.0 else "RW"
+            magnitude = abs(speed)
+            if abs(magnitude - round(magnitude)) < 1e-9:
+                return f"{direction} {round(magnitude)}x"
+            return f"{direction} {magnitude:g}x"
+        if self._state is PlayerState.MENU_ACTIVE:
+            return "MENU"
+        return self._state.name
+
+    def _time_text(self) -> str:
+        """Return the position/duration readout."""
+        if self._time_pos is None:
+            return "--:--"
+        text = self._fmt_time(self._time_pos)
+        if self._duration is not None:
+            text = f"{text} / {self._fmt_time(self._duration)}"
+        return text
+
+    def _chapter_text(self) -> str | None:
+        """Return the chapter readout, or None when no count is known."""
+        if self._chapter_count is None:
+            return None
+        chapter = "?" if self._chapter is None else str(self._chapter)
+        return f"CH {chapter}/{self._chapter_count}"
+
+    def _text_chunks(self) -> list[str]:
+        """Return the left-aligned text segments in paint order."""
+        chunks = [self._status_text(), self._time_text()]
+        chapter = self._chapter_text()
+        if chapter is not None:
+            chunks.append(chapter)
+        return chunks
+
+    def _track_text(self) -> str | None:
+        """Return the 'AUD xx · SUB yy' readout, or None when empty."""
+        parts: list[str] = []
+        if self._audio_lang:
+            parts.append(f"AUD {self._audio_lang}")
+        if self._subtitle_lang:
+            parts.append(f"SUB {self._subtitle_lang}")
+        return " · ".join(parts) if parts else None
 # ── [AGENT2: SECTION 5 END] ──
 
 # ════════════════════════════════════════════════════════════════════
@@ -1364,6 +1620,9 @@ class DvdPlaybackEngine(QObject):
 #     _sync_osd(self) -> None
 #     _cycle_speed(self, direction: int) -> None
 #     _attach_engine(self) -> None
+#     _auto_detect_disc(self) -> None
+#     _poll_disc_insertion(self) -> None
+#     _load_source(self, source: str, quiet: bool = False) -> None
 #     closeEvent(self, event: QCloseEvent) -> None
 #   Wiring:
 #   * engine signals -> handlers: state_changed->_on_engine_state (update
@@ -1374,9 +1633,10 @@ class DvdPlaybackEngine(QObject):
 #   * After window.show(): QTimer.singleShot(0, self._attach_engine) ->
 #     engine.attach_widget(int(self.video.winId())) inside try/except
 #     PlaybackError (QMessageBox.critical + status 'ERROR'); then when
-#     __init__ received a non-empty source: call _on_load_clicked().
-#     _attach_engine() is also called at the start of _on_load_clicked so
-#     a fresh mpv is rebuilt after eject() (attach_widget no-ops while
+#     __init__ received a non-empty source: set self.source text and
+#     _load_source(source, quiet=False); otherwise _auto_detect_disc().
+#     _attach_engine() is also called at the start of _load_source so a
+#     fresh mpv is rebuilt after eject() (attach_widget no-ops while
 #     already attached).
 #   * Video mouse: install eventFilter on self.video (_on_video_mouse):
 #     MouseMove -> osd.show_osd(); when engine.menu_active:
@@ -1395,7 +1655,11 @@ class DvdPlaybackEngine(QObject):
 #       Key_I -> cycle_audio         Key_O -> cycle_subtitle
 #       Key_Plus/Key_Equal -> adjust_volume(+5.0)
 #       Key_Minus -> adjust_volume(-5.0)
-#       Key_E -> eject               Key_Escape -> osd.hide() only
+#       Key_E -> eject               Key_Escape -> hide OSD ONLY (the single
+#       consumed key that does NOT reveal the OSD; every other consumed key
+#       reveals it via show_osd)
+#       Ctrl+F (handled directly in keyPressEvent, not _handle_key):
+#       toggle fullscreen -> showNormal()/showFullScreen() + reveal OSD
 #   * _cycle_speed(direction): current = engine.speed; ladder = FF_SPEEDS;
 #     direction +1: next step above current (wrap to 2.0 at top? NO: wrap
 #     from 16x back to 1.0); direction -1: previous step below current
@@ -1407,14 +1671,35 @@ class DvdPlaybackEngine(QObject):
 #     chapter, rb -> next chapter. Edge-triggered: act only when a control
 #     changes vs last poll (keep a tuple snapshot). ImportError -> stop
 #     the timer (log once). get_gamepad() raising -> swallow.
-#   * _on_load_clicked: self._attach_engine() first (idempotent; re-creates
-#     mpv after an eject); text = source.text().strip(); when empty use the
+#   * _on_load_clicked: text = source.text().strip(); when empty use the
 #     first list_dvd_devices() result if any, else QMessageBox.warning
-#     ('No source') and return. problems = check_environment(source); when
-#     problems: QMessageBox.warning joined text ('…\nProceeding anyway.').
-#     DiscIdentity.compute(source) -> on PlaybackError QMessageBox.critical
-#     and return. saved = ResumeStore().get(hash); when saved:
-#     _show_resume_prompt(hash, saved) else engine.load(source).
+#     ('No source') and return; then _load_source(text, quiet=False).
+#   * AUTO-PLAY (console behavior — the disc just boots):
+#     after _attach_engine() call _auto_detect_disc() AT MOST ONCE PER APP
+#     RUN (it can only observe the startup IDLE state): first device in
+#     list_dvd_devices() where disc_present(device) is True -> set
+#     self.source text and _load_source(device, quiet=True). A QTimer
+#     (DISC_POLL_MS, always running) calls _poll_disc_insertion(): keep a
+#     per-device presence snapshot COMMITTED BEFORE ACTING (a modal resume
+#     prompt re-enters the event loop and this poller must then see the
+#     edge as consumed, never firing duplicate loads/dialogs); on an edge
+#     INTO True from any non-True value (False->True or tray-open
+#     None->True — covers re-insertion after an eject) and engine.state in
+#     {IDLE, STOPPED, EJECTED, ERROR}: set self.source text and
+#     _load_source(device, quiet=True) — inserting a disc while the app is
+#     open auto-boots it, like a console tray-close. On an edge OUT of True
+#     (True->False or True->None) for the currently loaded device: status
+#     'disc removed'.
+#   * _load_source(source, quiet): the shared load flow. _attach_engine()
+#     first (idempotent; re-creates mpv after an eject). problems =
+#     check_environment(source): when problems — quiet: set self.status to
+#     the joined text (no modal, zero-click flow); not quiet:
+#     QMessageBox.warning joined text ('…\nProceeding anyway.').
+#     DiscIdentity.compute(source) -> on PlaybackError: quiet: self.status
+#     message; not quiet: QMessageBox.critical; return. saved =
+#     ResumeStore().get(hash): when saved: _show_resume_prompt(hash, saved)
+#     (modal in both modes — the console resume question) else
+#     engine.load(source).
 #   * _show_resume_prompt: QMessageBox.question 'Resume playback from
 #     mm:ss?' (Yes -> engine.load(source) then engine.resume_disc(saved);
 #     No -> ResumeStore().forget(hash) then engine.load(source)).
@@ -1435,6 +1720,558 @@ class DvdPlaybackEngine(QObject):
 #     cached tracks matched to engine player.aid/sid); called from
 #     _on_position/_on_engine_state/_on_menu_active/_on_tracks.
 # ── [AGENT2: SECTION 6 BEGIN] ──
+class MainWindow(QMainWindow):
+    """Top-level window: video surface, transport bar and input wiring."""
+
+    def __init__(self, engine: DvdPlaybackEngine, source: str | None = None) -> None:
+        """Build the window and connect engine signals and timers."""
+        super().__init__()
+        self.engine = engine
+        self._initial_source: str | None = source if source else None
+        self._pending_source: str | None = None
+        self._loaded_source: str | None = None
+        self._audio_tracks: list[dict[str, object]] = []
+        self._sub_tracks: list[dict[str, object]] = []
+        self._gamepad_states: dict[str, int] = {}
+        self._gamepad_unavailable = False
+        self._disc_presence: dict[str, bool | None] = {}
+        self._auto_detected = False
+
+        central = QWidget(self)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.video = QWidget(central)
+        self.video.setAutoFillBackground(True)
+        video_palette = self.video.palette()
+        video_palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0))
+        self.video.setPalette(video_palette)
+        self.video.installEventFilter(self)
+        layout.addWidget(self.video, 1)
+
+        bottom = QWidget(central)
+        bar = QHBoxLayout(bottom)
+        bar.setContentsMargins(6, 6, 6, 6)
+        bar.setSpacing(6)
+        self.source = QLineEdit(bottom)
+        self.source.setPlaceholderText(
+            "/dev/sr0 | /path/movie.iso | /path/to/VIDEO_TS"
+        )
+        browse_button = QPushButton("Browse…", bottom)
+        load_button = QPushButton("Load / Play", bottom)
+        eject_button = QPushButton("Eject", bottom)
+        self.status = QLabel("IDLE", bottom)
+        self.status.setMinimumWidth(90)
+        bar.addWidget(self.source, 1)
+        bar.addWidget(browse_button)
+        bar.addWidget(load_button)
+        bar.addWidget(eject_button)
+        bar.addWidget(self.status)
+        layout.addWidget(bottom)
+        self.setCentralWidget(central)
+
+        # The OSD floats above the window so it can hug the bottom edge.
+        self.osd = Xbox360Osd(self)
+        self.osd.hide()
+
+        browse_button.clicked.connect(self._on_browse_clicked)
+        load_button.clicked.connect(self._on_load_clicked)
+        eject_button.clicked.connect(self._on_eject_clicked)
+        self.source.returnPressed.connect(self._on_load_clicked)
+        self.osd.button_clicked.connect(self._on_osd_button)
+
+        engine.state_changed.connect(self._on_engine_state)
+        engine.position_changed.connect(self._on_position)
+        engine.tracks_changed.connect(self._on_tracks)
+        engine.menu_active_changed.connect(self._on_menu_active)
+        engine.error_occurred.connect(self._on_engine_error)
+
+        self._gamepad_timer = QTimer(self)
+        self._gamepad_timer.setInterval(GAMEPAD_POLL_MS)
+        self._gamepad_timer.timeout.connect(self._poll_gamepad)
+        self._gamepad_timer.start()
+
+        self._disc_timer = QTimer(self)
+        self._disc_timer.setInterval(DISC_POLL_MS)
+        self._disc_timer.timeout.connect(self._poll_disc_insertion)
+        self._disc_timer.start()
+
+        QTimer.singleShot(0, self._attach_engine)
+
+    # ── Qt events ───────────────────────────────────────────────────
+    def resizeEvent(self, event: QResizeEvent | None) -> None:
+        """Pin the OSD strip to the bottom edge of the window."""
+        super().resizeEvent(event)
+        self.osd.setGeometry(0, self.height() - 64, self.width(), 64)
+        self.osd.raise_()
+
+    def keyPressEvent(self, event: QKeyEvent | None) -> None:
+        """Route keys through the console mapping."""
+        if event is None:
+            return
+        if (
+            event.key() == Qt.Key.Key_F
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            if self.isFullScreen():
+                self.showNormal()
+            else:
+                self.showFullScreen()
+            self.osd.show_osd()
+            event.accept()
+            return
+        if self._handle_key(event.key()):
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def eventFilter(self, a0: QObject | None, a1: QEvent | None) -> bool:
+        """Forward mouse activity on the video surface."""
+        if a0 is self.video and isinstance(a1, QMouseEvent):
+            self._on_video_mouse(a0, a1)
+        return super().eventFilter(a0, a1)  # type: ignore[arg-type]
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        """Release the engine before the window goes away."""
+        self._gamepad_timer.stop()
+        self._disc_timer.stop()
+        self.osd.hide()
+        self.osd._hide_timer.stop()
+        self.engine.dispose()
+        if event is not None:
+            event.accept()
+
+    # ── input mapping ───────────────────────────────────────────────
+    def _handle_key(self, key: int) -> bool:
+        """Dispatch one key; return True when consumed."""
+        codes = Qt.Key
+        if key == codes.Key_Up.value:
+            self.engine.menu_nav("up")
+        elif key == codes.Key_Down.value:
+            self.engine.menu_nav("down")
+        elif key == codes.Key_Left.value:
+            self.engine.menu_nav("left")
+        elif key == codes.Key_Right.value:
+            self.engine.menu_nav("right")
+        elif key in (codes.Key_Return.value, codes.Key_Enter.value):
+            if self.engine.menu_active:
+                self.engine.menu_select()
+            else:
+                self.engine.play_pause()
+        elif key == codes.Key_Space.value:
+            self.engine.play_pause()
+        elif key == codes.Key_Backspace.value:
+            self.engine.menu_back()
+        elif key == codes.Key_X.value:
+            self.engine.show_root_menu()
+        elif key == codes.Key_Y.value:
+            self.engine.show_title_menu()
+        elif key == codes.Key_S.value:
+            self.engine.stop()
+        elif key == codes.Key_F.value:
+            self._cycle_speed(1)
+        elif key == codes.Key_R.value:
+            self._cycle_speed(-1)
+        elif key == codes.Key_N.value:
+            self.engine.next_chapter()
+        elif key == codes.Key_P.value:
+            self.engine.previous_chapter()
+        elif key == codes.Key_I.value:
+            self.engine.cycle_audio()
+        elif key == codes.Key_O.value:
+            self.engine.cycle_subtitle()
+        elif key in (codes.Key_Plus.value, codes.Key_Equal.value):
+            self.engine.adjust_volume(5.0)
+        elif key == codes.Key_Minus.value:
+            self.engine.adjust_volume(-5.0)
+        elif key == codes.Key_E.value:
+            self._on_eject_clicked()
+        elif key == codes.Key_Escape.value:
+            self.osd.hide()
+            return True
+        else:
+            return False
+        self.osd.show_osd()
+        return True
+
+    def _cycle_speed(self, direction: int) -> None:
+        """Step through the trick-play ladder (2x, 4x, 8x, 16x, 1x)."""
+        current = float(self.engine.speed)
+        ladder = FF_SPEEDS
+        if direction > 0:
+            above = [step for step in ladder if step > current + 1e-9]
+            target = above[0] if above else 1.0
+        else:
+            below = [step for step in ladder if step < current - 1e-9]
+            if below:
+                target = below[-1]
+            elif current <= 1.0 + 1e-9:
+                target = ladder[-1]  # wrap from normal speed
+            else:
+                target = 1.0  # step back to normal speed
+        self.engine.set_speed(target)
+
+    def _poll_gamepad(self) -> None:
+        """Poll an optional gamepad and edge-trigger console actions."""
+        try:
+            import inputs
+        except ImportError:
+            self._gamepad_timer.stop()
+            if not self._gamepad_unavailable:
+                self._gamepad_unavailable = True
+                log.info(
+                    "gamepad support unavailable: optional 'inputs' package missing"
+                )
+            return
+        try:
+            pads = inputs.get_gamepad()
+        except Exception:  # noqa: BLE001 - third-party driver errors
+            return
+        if not pads:
+            return
+        states: dict[str, int] = {}
+        for control in pads[0]:
+            code = str(getattr(control, "code", ""))
+            try:
+                states[code] = int(getattr(control, "state", 0))
+            except (TypeError, ValueError):
+                continue
+        for code, state in states.items():
+            if state != self._gamepad_states.get(code, 0):
+                self._gamepad_changed(code, state)
+        self._gamepad_states = states
+
+    def _gamepad_changed(self, code: str, state: int) -> None:
+        """Map one changed gamepad control to an engine action."""
+        if code == "ABS_HAT0Y":
+            if state < 0:
+                self.engine.menu_nav("up")
+            elif state > 0:
+                self.engine.menu_nav("down")
+            else:
+                return
+        elif code == "ABS_HAT0X":
+            if state < 0:
+                self.engine.menu_nav("left")
+            elif state > 0:
+                self.engine.menu_nav("right")
+            else:
+                return
+        elif state != 1:
+            return
+        elif code in ("BTN_DPAD_UP", "BTN_UP"):
+            self.engine.menu_nav("up")
+        elif code in ("BTN_DPAD_DOWN", "BTN_DOWN"):
+            self.engine.menu_nav("down")
+        elif code in ("BTN_DPAD_LEFT", "BTN_LEFT"):
+            self.engine.menu_nav("left")
+        elif code in ("BTN_DPAD_RIGHT", "BTN_RIGHT"):
+            self.engine.menu_nav("right")
+        elif code in ("BTN_SOUTH", "BTN_A"):
+            if self.engine.menu_active:
+                self.engine.menu_select()
+            else:
+                self.engine.play_pause()
+        elif code in ("BTN_EAST", "BTN_B"):
+            self.engine.menu_back()
+        elif code in ("BTN_WEST", "BTN_X"):
+            self.engine.show_root_menu()
+        elif code in ("BTN_NORTH", "BTN_Y"):
+            self.engine.show_title_menu()
+        elif code == "BTN_START":
+            self.engine.play_pause()
+        elif code in ("BTN_SELECT", "BTN_BACK"):
+            self.engine.stop()
+        elif code in ("BTN_TL", "BTN_L1"):
+            self.engine.previous_chapter()
+        elif code in ("BTN_TR", "BTN_R1"):
+            self.engine.next_chapter()
+        else:
+            return
+        self.osd.show_osd()
+
+    # ── engine signal handlers ──────────────────────────────────────
+    def _on_engine_state(self, state: PlayerState) -> None:
+        """Reflect the new state in the status label and OSD."""
+        self._set_status(state.name)
+        self._sync_osd()
+
+    def _on_position(self, seconds: float) -> None:
+        """Repaint the OSD as playback advances."""
+        del seconds
+        self._sync_osd()
+
+    def _on_tracks(self, audio: list, subs: list) -> None:  # type: ignore[type-arg]
+        """Cache the current track lists for language readouts."""
+        self._audio_tracks = [
+            dict(item) for item in audio if isinstance(item, dict)
+        ]
+        self._sub_tracks = [
+            dict(item) for item in subs if isinstance(item, dict)
+        ]
+        self._sync_osd()
+
+    def _on_menu_active(self, active: bool) -> None:
+        """Repaint the OSD when the disc menu appears or disappears."""
+        del active
+        self._sync_osd()
+
+    def _on_engine_error(self, message: str) -> None:
+        """Show a critical dialog for backend failures."""
+        self._set_status("ERROR")
+        QMessageBox.critical(self, "Playback error", message)
+
+    # ── buttons ─────────────────────────────────────────────────────
+    def _on_load_clicked(self) -> None:
+        """Resolve a source and start the shared load flow."""
+        text = self.source.text().strip()
+        if not text:
+            devices = list_dvd_devices()
+            if devices:
+                text = devices[0]
+            else:
+                QMessageBox.warning(
+                    self,
+                    "No source",
+                    "No DVD device was found and no source was entered.",
+                )
+                return
+        self._load_source(text, quiet=False)
+
+    def _auto_detect_disc(self) -> None:
+        """Boot the first drive that already holds a disc (console style)."""
+        target: str | None = None
+        for device in list_dvd_devices():
+            present = disc_present(device)
+            self._disc_presence[device] = present  # prime the poller snapshot
+            if present is True and target is None:
+                target = device
+        if target is not None:
+            self.source.setText(target)
+            self._load_source(target, quiet=True)
+
+    def _poll_disc_insertion(self) -> None:
+        """Auto-play discs on insertion and report removal."""
+        for device in list_dvd_devices():
+            try:
+                present = disc_present(device)
+            except Exception:  # noqa: BLE001 - hotplug/ioctl weirdness
+                present = None
+            previous = self._disc_presence.get(device)
+            # Commit the edge BEFORE acting: a modal resume prompt re-enters
+            # the event loop and this poller must then see the edge as
+            # consumed instead of firing duplicate loads/dialogs.
+            self._disc_presence[device] = present
+            if (
+                present is True
+                and previous is not True
+                and self.engine.state
+                in (
+                    PlayerState.IDLE,
+                    PlayerState.STOPPED,
+                    PlayerState.EJECTED,
+                    PlayerState.ERROR,
+                )
+            ):
+                self.source.setText(device)
+                self._load_source(device, quiet=True)
+            elif (
+                present is not True
+                and previous is True
+                and self._loaded_source == device
+            ):
+                self._set_status("disc removed")
+
+    def _load_source(self, source: str, quiet: bool = False) -> None:
+        """Check the source, offer resume state and load it."""
+        self._attach_engine()
+        if source in list_dvd_devices():
+            self._disc_presence[source] = True  # avoid a poller double-load
+        problems = check_environment(source)
+        if problems:
+            joined = "\n".join(problems)
+            if quiet:
+                self._set_status(joined)
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Environment check",
+                    joined + "\nProceeding anyway.",
+                )
+        try:
+            disc_hash = DiscIdentity.compute(source)
+        except PlaybackError as exc:
+            if quiet:
+                self._set_status(str(exc))
+            else:
+                QMessageBox.critical(self, "Cannot read disc", str(exc))
+            return
+        self._pending_source = source
+        saved = ResumeStore().get(disc_hash)
+        if saved:
+            self._show_resume_prompt(disc_hash, saved)
+        else:
+            self._play_source(source)
+
+    def _play_source(self, source: str) -> None:
+        """Load ``source``; an illegal-state PlaybackError -> status only."""
+        self._loaded_source = source
+        try:
+            self.engine.load(source)
+        except PlaybackError as exc:
+            self._set_status(str(exc))
+
+    def _on_browse_clicked(self) -> None:
+        """Pick an ISO image, falling back to a VIDEO_TS folder."""
+        path, _selected = QFileDialog.getOpenFileName(
+            self, "Select DVD image", "", ".iso (*.iso)"
+        )
+        if not path:
+            path = QFileDialog.getExistingDirectory(
+                self, "Select a folder with VIDEO_TS"
+            )
+        if path:
+            self.source.setText(path)
+
+    def _on_eject_clicked(self) -> None:
+        """Eject the disc and show the new state."""
+        self.engine.eject()
+        self._set_status("EJECTED")
+
+    def _on_osd_button(self, action: str) -> None:
+        """Route an OSD transport click to the matching engine action."""
+        if action == "play_pause":
+            self.engine.play_pause()
+        elif action == "stop":
+            self.engine.stop()
+        elif action == "ff":
+            self._cycle_speed(1)
+        elif action == "rw":
+            self._cycle_speed(-1)
+        elif action == "prev":
+            self.engine.previous_chapter()
+        elif action == "next":
+            self.engine.next_chapter()
+        elif action == "audio":
+            self.engine.cycle_audio()
+        elif action == "subtitle":
+            self.engine.cycle_subtitle()
+        elif action == "menu":
+            self.engine.show_root_menu()
+        elif action == "eject":
+            self._on_eject_clicked()
+
+    def _on_video_mouse(self, obj: object, event: QMouseEvent) -> None:
+        """Show the OSD on mouse activity and forward menu pointer moves."""
+        del obj
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseMove:
+            self.osd.show_osd()
+            if self.engine.menu_active:
+                position = event.position()
+                self.engine.menu_mouse_move(
+                    int(position.x()), int(position.y())
+                )
+        elif (
+            event_type == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.osd.show_osd()
+            if self.engine.menu_active:
+                self.engine.menu_select()
+
+    # ── resume & OSD sync ───────────────────────────────────────────
+    def _show_resume_prompt(self, disc_hash: str, saved: dict) -> None:  # type: ignore[type-arg]
+        """Ask whether to resume, then load the disc."""
+        position = saved.get("pos")
+        try:
+            seconds = float(position) if isinstance(position, (int, float)) else 0.0
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if math.isnan(seconds) or math.isinf(seconds):
+            seconds = 0.0
+        answer = QMessageBox.question(
+            self,
+            "Resume playback",
+            f"Resume playback from {Xbox360Osd._fmt_time(seconds)}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        source = self._pending_source or self.source.text().strip()
+        if answer == QMessageBox.StandardButton.Yes:
+            self._play_source(source)
+            self.engine.resume_disc(saved)
+        else:
+            ResumeStore().forget(disc_hash)
+            self._play_source(source)
+
+    def _set_status(self, text: str) -> None:
+        """Show status text, elided to fit (full text in the tooltip)."""
+        self.status.setToolTip(text)
+        metrics = self.status.fontMetrics()
+        width = max(180, self.status.width() - 4)
+        self.status.setText(
+            metrics.elidedText(text, Qt.TextElideMode.ElideRight, width)
+        )
+
+    def _sync_osd(self) -> None:
+        """Push the engine's current transport facts into the overlay."""
+        engine = self.engine
+        player = engine.player
+        chapter_count: int | None = None
+        audio_lang: str | None = None
+        subtitle_lang: str | None = None
+        if player is not None:
+            chapter_count = len(engine.chapter_list)
+            aid: object = None
+            sid: object = None
+            try:
+                aid = player.aid
+                sid = player.sid
+            except (OSError, SystemError, AttributeError, TypeError, ValueError):
+                aid = None
+                sid = None
+            audio_lang = self._track_lang(self._audio_tracks, aid)
+            subtitle_lang = self._track_lang(self._sub_tracks, sid)
+        self.osd.set_transport(
+            state=engine.state,
+            speed=engine.speed,
+            time_pos=engine.time_pos,
+            duration=engine.duration,
+            chapter=engine.chapter,
+            chapter_count=chapter_count,
+            audio_lang=audio_lang,
+            subtitle_lang=subtitle_lang,
+        )
+
+    @staticmethod
+    def _track_lang(tracks: list[dict[str, object]], chosen: object) -> str | None:
+        """Return the language of the track whose id equals ``chosen``."""
+        for track in tracks:
+            if track.get("id") == chosen:
+                lang = track.get("lang")
+                return lang if isinstance(lang, str) else None
+        return None
+
+    def _attach_engine(self) -> None:
+        """Bind mpv to the video widget, then honour an initial source."""
+        try:
+            self.engine.attach_widget(int(self.video.winId()))
+        except PlaybackError as exc:
+            log.exception("could not attach the video widget")
+            self._set_status("ERROR")
+            QMessageBox.critical(self, "Playback error", str(exc))
+            return
+        initial = self._initial_source
+        self._initial_source = None
+        if initial:
+            self._auto_detected = True
+            self.source.setText(initial)
+            self._load_source(initial, quiet=False)
+        elif not self._auto_detected:
+            self._auto_detected = True
+            self._auto_detect_disc()
 # ── [AGENT2: SECTION 6 END] ──
 
 # ════════════════════════════════════════════════════════════════════
