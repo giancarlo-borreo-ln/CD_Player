@@ -645,15 +645,24 @@ def check_environment(source: str) -> list[str]:
 #     _apply_disc_hash).
 #   * attach_widget(wid): idempotent while attached. Create mpv.MPV(
 #     wid=str(wid), input_default_bindings=False, input_cursor=False,
+#     cursor_autohide="no" (mpv's own ~1 s auto-hide would otherwise make the
+#     cursor vanish over the video, worst in fullscreen — independent of
+#     input_cursor=False),
 #     osc=False, osd_level=0, keep_open=True, idle=True — idle=True keeps
 #     the libmpv core alive between loads (idle=False lets the core shut
 #     down ~100 ms after creation, so every property read then raises
 #     ShutdownError). Assign _wid only AFTER the instance exists; on
 #     construction failure reset _wid=None and raise PlaybackError. Register property
-#     When DVD_PLAYER_SOFTWARE_RENDER=1: vo='gpu', gpu_context='x11egl'
-#     and LIBGL_ALWAYS_SOFTWARE=1 (llvmpipe) — fallback for NVIDIA-on-
-#     XWayland machines where all hardware GL contexts fail; DVD bitrates
-#     render fine in software.
+#     When DVD_PLAYER_SOFTWARE_RENDER=1: vo='gpu', gpu_context='x11egl',
+#     LIBGL_ALWAYS_SOFTWARE=1 (llvmpipe), display_fps_override=30 (cap the
+#     render rate near DVD frame rate instead of the 144 Hz display sync),
+#     scale='fast-bilinear', dscale='fast-bilinear', gpu_dumb_mode=True
+#     (cheapest llvmpipe shaders) and autosync=30 (gradual A/V drift
+#     correction — audio leads video on llvmpipe soft decode) — fallback for
+#     NVIDIA-on-XWayland machines
+#     where all hardware GL contexts fail; DVD bitrates render fine in
+#     software at near video frame rate. The default hardware path is
+#     unchanged.
 #     observers (python-mpv @self._player.property_observer decorator) for
 #     'time-pos', 'disc-menu-active', 'track-list', 'eof-reached' that emit
 #     the raw signals only (eof observer emits only when value is True).
@@ -849,6 +858,9 @@ class DvdPlaybackEngine(QObject):
                 "wid": str(wid),
                 "input_default_bindings": False,
                 "input_cursor": False,
+                # mpv auto-hides the cursor on its own (~1 s) regardless of
+                # input_cursor; keep it visible over the video in fullscreen.
+                "cursor_autohide": "no",
                 "osc": False,
                 "osd_level": 0,
                 "keep_open": True,
@@ -862,6 +874,14 @@ class DvdPlaybackEngine(QObject):
                 os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
                 options["vo"] = "gpu"
                 options["gpu_context"] = "x11egl"
+                # llvmpipe on a 144 Hz display: cap presentation to DVD rate
+                # and pick the cheapest scalers/shader path.
+                options["display_fps_override"] = 30
+                options["scale"] = "fast-bilinear"
+                options["dscale"] = "fast-bilinear"
+                options["gpu_dumb_mode"] = True
+                # llvmpipe soft decode drifts; mpv retimes audio gradually.
+                options["autosync"] = 30
             player = mpv.MPV(**options)
         except Exception as exc:
             self._wid = None
@@ -2028,13 +2048,16 @@ class Xbox360Osd(QWidget):
 #     _on_scrub_pressed, osd.scrub_moved -> _on_scrub_moved,
 #     osd.scrub_released -> _on_scrub_released. On press/move compute
 #     seconds = fraction * engine.duration (skip when duration is None) and
-#     throttle seeks to one per ~100 ms; each seek calls
-#     engine.seek_to(seconds) then engine.capture_frame() (via getattr:
-#     absent backend -> no preview) and, when it returns (w, h, bytes),
-#     builds a QImage from the bgr0 bytes (Format_BGR888, w*4 stride, then
-#     mirrored as needed) and calls osd.set_preview(image). On release:
-#     final seek_to for the last fraction, osd.set_preview(None) and reset
-#     the throttle state. The preview exists ONLY between press and release.
+#     throttle seeks to one per 250 ms (SCRUB_THROTTLE_MS). A preview is
+#     captured lazily: after a seek, engine.capture_frame() (via getattr:
+#     absent backend -> no preview) runs only when at least 200 ms
+#     (SCRUB_CAPTURE_MS) elapsed since the previous capture, so dragging
+#     does not issue a capture on every throttle tick. When it returns
+#     (w, h, bytes), builds a QImage from the bgr0 bytes (Format_BGR888,
+#     w*4 stride, then mirrored as needed) and calls osd.set_preview(image).
+#     On release: final seek_to for the last fraction (no capture),
+#     osd.set_preview(None) and reset the throttle/capture clocks. The
+#     preview exists ONLY between press and release.
 #   * _handle_key mapping (return False when unmapped; a consumed key
 #     reveals the OSD ONLY while engine.menu_active is FALSE; Qt.Key enum
 #     from PyQt6.QtCore):
@@ -2144,6 +2167,9 @@ class Xbox360Osd(QWidget):
 class MainWindow(QMainWindow):
     """Top-level window: video surface, transport bar and input wiring."""
 
+    SCRUB_THROTTLE_MS = 250
+    SCRUB_CAPTURE_MS = 200
+
     def __init__(self, engine: DvdPlaybackEngine, source: str | None = None) -> None:
         """Build the window and connect engine signals and timers."""
         super().__init__()
@@ -2163,6 +2189,7 @@ class MainWindow(QMainWindow):
         self._scrub_active = False
         self._scrub_fraction: float | None = None
         self._scrub_last_seek = 0.0
+        self._scrub_last_capture = 0.0
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
@@ -2644,11 +2671,12 @@ class MainWindow(QMainWindow):
         self._scrub_seek(self._scrub_fraction, preview=True)
 
     def _on_scrub_moved(self, fraction: float) -> None:
-        """Continue a scrub, throttling engine seeks to ~100 ms."""
+        """Continue a scrub, throttling engine seeks to one per 250 ms."""
         if not self._scrub_active:
             return
         self._scrub_fraction = max(0.0, min(1.0, float(fraction)))
-        if time.monotonic() - self._scrub_last_seek < 0.1:
+        elapsed = time.monotonic() - self._scrub_last_seek
+        if elapsed < self.SCRUB_THROTTLE_MS / 1000.0:
             return
         self._scrub_seek(self._scrub_fraction, preview=True)
 
@@ -2661,14 +2689,19 @@ class MainWindow(QMainWindow):
             self._scrub_seek(fraction, preview=False)
         self.osd.set_preview(None)
         self._scrub_last_seek = 0.0
+        self._scrub_last_capture = 0.0
 
     def _refresh_scrub_preview(self) -> None:
         """Capture the current frame and show it as the scrub preview."""
         if not self._scrub_active:
             return
+        now = time.monotonic()
+        if now - self._scrub_last_capture < self.SCRUB_CAPTURE_MS / 1000.0:
+            return
         capture = getattr(self.engine, "capture_frame", None)
         if capture is None:
             return
+        self._scrub_last_capture = now
         try:
             frame = capture()
         except (PlaybackError, OSError, RuntimeError, SystemError, ValueError):
