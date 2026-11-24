@@ -41,7 +41,7 @@ TODO.md → Thanos (CoD compression) → Dr. Strange (constraints/contracts, bli
        → Captain America (acceptance) → ship
 ```
 
-Dr. Strange never sees code. Thanos alone creates the other agents, each with a minimized packet.
+Dr. Strange never sees code. **Thanos ALONE launches the other agents** — no agent (Tony Stark, Spider-Man, Dr. Strange, Loki, Nick Fury, Captain America) may ever be spawned by anyone else, and every launch carries a Thanos-minimized packet (folded context, static prefix, budget, binary exit). Thanos's own hands (the architect meta-role) do the mechanical work that is not an agent's job: running suites, verifying reports, reinstalling, committing.
 
 ## XML Activation Protocol (every dispatch)
 
