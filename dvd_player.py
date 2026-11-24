@@ -21,7 +21,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import shutil
 import stat
 import struct
@@ -30,15 +29,16 @@ import sys
 import time
 from enum import Enum, auto
 from pathlib import Path
-from typing import Optional
+
+import mpv  # python-mpv (ctypes bindings over libmpv)
 
 from PyQt6.QtCore import QObject, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent,
     QKeyEvent,
     QMouseEvent,
-    QPaintEvent,
     QPainter,
+    QPaintEvent,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -53,11 +53,17 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-import mpv  # python-mpv (ctypes bindings over libmpv)
+# python-mpv >= 1.0 has no legacy ``mpv.MPVError``: C-API failures are
+# reported as ValueError (ErrorCode.raise_for_ec), a dead core raises
+# ShutdownError (a SystemError), and property errors raise AttributeError.
+# This alias keeps the legacy name used throughout the engine.
+MPVError = ValueError
 
 log = logging.getLogger("dvd_player")
 
 # ── [AGENTS: extra imports appended here if needed] ──
+from collections.abc import Callable
+from typing import Any, ClassVar
 
 # ════════════════════════════════════════════════════════════════════
 # SECTION 1 — Constants, enums, state machine
@@ -72,6 +78,7 @@ RESUME_FILE = CONFIG_DIR / "resume.json"
 RESUME_MAX_ENTRIES = 16  # cap stored per-disc entries
 OSD_TIMEOUT_MS = 4000  # Xbox-style OSD auto-hide delay
 GAMEPAD_POLL_MS = 50
+LOAD_TIMEOUT_MS = 30000  # LOADING watchdog: must yield MENU_ACTIVE/PLAYING within this
 
 FF_SPEEDS = (2.0, 4.0, 8.0, 16.0)  # console trick-play ladder
 
@@ -100,10 +107,10 @@ class PlaybackError(Exception):
 #   LEGAL table (use exactly):
 #       IDLE        -> {LOADING}
 #       LOADING     -> {MENU_ACTIVE, PLAYING, ERROR}
-#       MENU_ACTIVE -> {PLAYING, STOPPED, ERROR}
-#       PLAYING     -> {PAUSED, MENU_ACTIVE, STOPPED, ERROR}
-#       PAUSED      -> {PLAYING, MENU_ACTIVE, STOPPED, ERROR}
-#       STOPPED     -> {IDLE, LOADING, EJECTED}
+#       MENU_ACTIVE -> {PLAYING, STOPPED, EJECTED, ERROR}
+#       PLAYING     -> {PAUSED, MENU_ACTIVE, STOPPED, EJECTED, ERROR}
+#       PAUSED      -> {PLAYING, MENU_ACTIVE, STOPPED, EJECTED, ERROR}
+#       STOPPED     -> {IDLE, LOADING, MENU_ACTIVE, EJECTED}
 #       EJECTED     -> {IDLE, LOADING}
 #       ERROR       -> {LOADING}
 #   transition(new): no-op when new == state; raise PlaybackError(
@@ -112,6 +119,68 @@ class PlaybackError(Exception):
 #   GUI-thread only; mpv-thread callbacks must never call transition
 #   directly (see SECTION 4 threading contract).
 # ── [AGENT1: SECTION 1 BEGIN] ──
+class StateMachine:
+    """Validate player state transitions on the GUI thread."""
+
+    _LEGAL: ClassVar[dict[PlayerState, set[PlayerState]]] = {
+        PlayerState.IDLE: {PlayerState.LOADING},
+        PlayerState.LOADING: {
+            PlayerState.MENU_ACTIVE,
+            PlayerState.PLAYING,
+            PlayerState.ERROR,
+        },
+        PlayerState.MENU_ACTIVE: {
+            PlayerState.PLAYING,
+            PlayerState.STOPPED,
+            PlayerState.EJECTED,
+            PlayerState.ERROR,
+        },
+        PlayerState.PLAYING: {
+            PlayerState.PAUSED,
+            PlayerState.MENU_ACTIVE,
+            PlayerState.STOPPED,
+            PlayerState.EJECTED,
+            PlayerState.ERROR,
+        },
+        PlayerState.PAUSED: {
+            PlayerState.PLAYING,
+            PlayerState.MENU_ACTIVE,
+            PlayerState.STOPPED,
+            PlayerState.EJECTED,
+            PlayerState.ERROR,
+        },
+        PlayerState.STOPPED: {
+            PlayerState.IDLE,
+            PlayerState.LOADING,
+            PlayerState.MENU_ACTIVE,
+            PlayerState.EJECTED,
+        },
+        PlayerState.EJECTED: {PlayerState.IDLE, PlayerState.LOADING},
+        PlayerState.ERROR: {PlayerState.LOADING},
+    }
+
+    def __init__(self, initial: PlayerState = PlayerState.IDLE) -> None:
+        """Create a state machine in ``initial`` (no validation)."""
+        self._state = initial
+
+    @property
+    def state(self) -> PlayerState:
+        """Current state."""
+        return self._state
+
+    def transition(self, new: PlayerState) -> None:
+        """Move to ``new``; same-state is a no-op, illegal moves raise."""
+        if new == self._state:
+            return
+        if new not in self._LEGAL[self._state]:
+            raise PlaybackError(
+                f"illegal transition {self._state.name} -> {new.name}"
+            )
+        self._state = new
+
+    def reset(self) -> None:
+        """Return to IDLE without validation."""
+        self._state = PlayerState.IDLE
 # ── [AGENT1: SECTION 1 END] ──
 
 # ════════════════════════════════════════════════════════════════════
@@ -143,6 +212,172 @@ class PlaybackError(Exception):
 #   Entry schema: {"pos": float, "title": int|None, "chapter": int|None,
 #                  "updated": float}
 # ── [AGENT1: SECTION 2 BEGIN] ──
+def _hash_stream(path: Path) -> str:
+    """Return the sha256 hex digest of a file, reading it in 1 MiB chunks."""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError as exc:
+        raise PlaybackError(f"cannot read {str(path)!r}: {exc}") from exc
+    return digest.hexdigest()
+
+
+class DiscIdentity:
+    """Stable per-disc identifiers used to key resume state."""
+
+    @staticmethod
+    def compute(source: str) -> str:
+        """Return a lowercase sha256 hex digest for a disc device, ISO or folder."""
+        path = Path(source)
+        try:
+            info = path.stat()
+        except (OSError, ValueError) as exc:
+            raise PlaybackError(
+                f"cannot access disc source {source!r}: {exc}"
+            ) from exc
+        if stat.S_ISBLK(info.st_mode):
+            return DiscIdentity._compute_block(path)
+        if stat.S_ISDIR(info.st_mode):
+            return DiscIdentity._compute_directory(path)
+        if stat.S_ISREG(info.st_mode):
+            return _hash_stream(path)
+        raise PlaybackError(f"unsupported disc source {source!r}: not a device, file or directory")
+
+    @staticmethod
+    def _compute_block(path: Path) -> str:
+        """Digest volume id, device size and a data sample of a block device."""
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            raise PlaybackError(
+                f"cannot open disc device {str(path)!r}: {exc}"
+            ) from exc
+        try:
+            size = struct.unpack(
+                "Q", fcntl.ioctl(fd, BLKGETSIZE64, struct.pack("Q", 0))
+            )[0]
+            volume_id = DiscIdentity._read_pvd(fd)
+            try:
+                sample = os.pread(fd, 256 * 1024, 524288)
+            except OSError:
+                sample = b""
+        except OSError as exc:
+            raise PlaybackError(
+                f"cannot read disc device {str(path)!r}: {exc}"
+            ) from exc
+        finally:
+            os.close(fd)
+        digest = hashlib.sha256()
+        digest.update(volume_id)
+        digest.update(str(size).encode("ascii"))
+        digest.update(sample)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _read_pvd(fd: int) -> bytes:
+        """Return the ISO9660 volume id (PVD bytes 40:72), stripped of NUL/spaces."""
+        try:
+            pvd = os.pread(fd, 2048, 32768)
+        except OSError:
+            return b""
+        raw = pvd[40:72].decode("utf-8", "replace").replace("\x00", "").strip()
+        return raw.encode("utf-8")
+
+    @staticmethod
+    def _compute_directory(path: Path) -> str:
+        """Hash VIDEO_TS/VIDEO_TS.IFO, falling back to VIDEO_TS.BUP."""
+        video_ts = path / "VIDEO_TS"
+        for name in ("VIDEO_TS.IFO", "VIDEO_TS.BUP"):
+            candidate = video_ts / name
+            if candidate.is_file():
+                return _hash_stream(candidate)
+        raise PlaybackError(
+            f"not a DVD layout: {str(path)!r} has no VIDEO_TS/VIDEO_TS.IFO"
+        )
+
+
+def _entry_updated(entry: dict[str, object]) -> float:
+    """Return an entry's ``updated`` timestamp as float (0.0 when absent)."""
+    value = entry.get("updated")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
+
+
+class ResumeStore:
+    """Persist per-disc resume positions in a small JSON file."""
+
+    def __init__(self, path: Path = RESUME_FILE) -> None:
+        """Use ``path`` as the backing JSON file."""
+        self._path = path
+
+    def load(self) -> dict[str, dict[str, object]]:
+        """Return all entries; ``{}`` when the file is missing or corrupt."""
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(key): dict(value)
+            for key, value in data.items()
+            if isinstance(value, dict)
+        }
+
+    def get(self, disc_hash: str) -> dict[str, object] | None:
+        """Return the stored entry for ``disc_hash``, if any."""
+        return self.load().get(disc_hash)
+
+    def save(
+        self,
+        disc_hash: str,
+        pos: float,
+        title: int | None,
+        chapter: int | None,
+    ) -> None:
+        """Upsert an entry, stamp it, and prune the oldest entries."""
+        entries = self.load()
+        entries[disc_hash] = {
+            "pos": float(pos),
+            "title": title,
+            "chapter": chapter,
+            "updated": time.time(),
+        }
+        if len(entries) > RESUME_MAX_ENTRIES:
+            newest = sorted(
+                entries.items(), key=lambda item: _entry_updated(item[1]), reverse=True
+            )
+            entries = dict(newest[:RESUME_MAX_ENTRIES])
+        self._write(entries)
+
+    def forget(self, disc_hash: str) -> None:
+        """Drop the entry for ``disc_hash`` (no-op when absent)."""
+        entries = self.load()
+        if entries.pop(disc_hash, None) is None:
+            return
+        self._write(entries)
+
+    def _write(self, entries: dict[str, dict[str, object]]) -> None:
+        """Atomically replace the backing file with ``entries``."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_name(f".{self._path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(
+                json.dumps(entries, indent=2, sort_keys=True), encoding="utf-8"
+            )
+            os.replace(tmp, self._path)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 # ── [AGENT1: SECTION 2 END] ──
 
 # ════════════════════════════════════════════════════════════════════
@@ -187,6 +422,158 @@ CDS_DISC_OK = 4
 #          is None.
 #       Preserve order 1..4. GUI may proceed despite warnings.
 # ── [AGENT1: SECTION 3 BEGIN] ──
+def list_dvd_devices() -> list[str]:
+    """Return existing optical device nodes, deduplicated by real path."""
+    candidates = ["/dev/cdrom", "/dev/dvd"]
+    try:
+        candidates.extend(
+            os.path.join("/dev", name)
+            for name in os.listdir("/dev")
+            if name.startswith("sr")
+        )
+    except OSError:
+        pass
+    devices: list[str] = []
+    seen: set[str] = set()
+    for candidate in sorted(candidates):
+        try:
+            real = os.path.realpath(candidate)
+        except OSError:
+            continue
+        if not os.path.exists(candidate) or real in seen:
+            continue
+        seen.add(real)
+        devices.append(candidate)
+    return devices
+
+
+def _drive_status(fd: int) -> bool | None:
+    """Map a CDROM_DRIVE_STATUS ioctl to True/False/None."""
+    try:
+        status = int(fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0))
+    except OSError:
+        return None
+    if status == CDS_DISC_OK:
+        return True
+    if status == CDS_NO_DISC:
+        return False
+    return None
+
+
+def disc_present(device: str) -> bool | None:
+    """Return True when a disc is ready, False when absent, None when unknown."""
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        return _drive_status(fd)
+    finally:
+        os.close(fd)
+
+
+def eject_device(device: str) -> None:
+    """Open the tray via ioctl, falling back to the ``eject`` binary."""
+    ioctl_error: OSError | None = None
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError as exc:
+        ioctl_error = exc
+    else:
+        try:
+            fcntl.ioctl(fd, CDROMEJECT, 0)
+            return
+        except OSError as exc:
+            ioctl_error = exc
+        finally:
+            os.close(fd)
+    eject_bin = shutil.which("eject")
+    if eject_bin is not None:
+        try:
+            completed = subprocess.run(
+                [eject_bin, device],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        except OSError as exc:
+            ioctl_error = ioctl_error or exc
+        else:
+            if completed.returncode == 0:
+                return
+    raise PlaybackError(
+        f"cannot eject {device!r}: {ioctl_error}. The drive may be missing, "
+        "busy/mounted, or you lack permissions (add the user to the 'optical' group)."
+    )
+
+
+def _check_block_device(device: str) -> list[str]:
+    """Report access and 'optical' group problems for a block device."""
+    problems: list[str] = []
+    try:
+        os.close(os.open(device, os.O_RDONLY | os.O_NONBLOCK))
+    except PermissionError:
+        problems.append(
+            f"no read permission on {device}: add the user to the 'optical' group"
+        )
+    except OSError as exc:
+        problems.append(f"cannot open {device}: {exc}")
+    try:
+        members = grp.getgrnam("optical").gr_mem
+    except KeyError:
+        members = None
+    if members is not None:
+        user = getpass.getuser()
+        if user not in members:
+            problems.append(f"user {user!r} is not in the 'optical' group")
+    return problems
+
+
+def _sg_loaded() -> bool:
+    """Return True when the sg kernel module appears to be loaded."""
+    try:
+        if Path("/sys/module/sg").exists():
+            return True
+        text = Path("/proc/modules").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True
+    return any(line.split(" ", 1)[0] == "sg" for line in text.splitlines())
+
+
+def check_environment(source: str) -> list[str]:
+    """Return human-readable environment problems; ``[]`` means all good."""
+    problems: list[str] = []
+    try:
+        info = os.stat(source)
+    except (OSError, ValueError):
+        return [f"source {source!r} does not exist or is not accessible"]
+    is_block = stat.S_ISBLK(info.st_mode)
+    is_file = stat.S_ISREG(info.st_mode)
+    is_dir = stat.S_ISDIR(info.st_mode)
+    if not (is_block or is_file or is_dir):
+        problems.append(
+            f"source {source!r} is not a block device, regular file or directory"
+        )
+    elif is_dir:
+        video_ts = Path(source) / "VIDEO_TS"
+        if not (
+            (video_ts / "VIDEO_TS.IFO").is_file()
+            or (video_ts / "VIDEO_TS.BUP").is_file()
+        ):
+            problems.append(
+                f"not a DVD layout: {source!r} has no VIDEO_TS/VIDEO_TS.IFO"
+            )
+    if is_block:
+        problems.extend(_check_block_device(source))
+    if not _sg_loaded():
+        problems.append(
+            "kernel module 'sg' is not loaded: SCSI passthrough may be unavailable"
+        )
+    if ctypes.util.find_library("dvdcss") is None:
+        problems.append(
+            "libdvdcss not found: encrypted DVDs cannot be decrypted"
+        )
+    return problems
 # ── [AGENT1: SECTION 3 END] ──
 
 # ════════════════════════════════════════════════════════════════════
@@ -239,21 +626,31 @@ CDS_DISC_OK = 4
 #     _pending_resume=None, _menu_active=False, _speed=1.0, _audio=[],
 #     _subs=[]; connect raw signals to private handlers (_apply_menu_active,
 #     _apply_time_pos, _apply_tracks, _apply_eof).
-#   * attach_widget(wid): idempotent (second call is a no-op). Create
-#     mpv.MPV(wid=str(wid), input_default_bindings=False, input_cursor=False,
-#     osc=False, osd_level=0, keep_open=True, idle=False); register property
+#   * attach_widget(wid): idempotent while attached. Create mpv.MPV(
+#     wid=str(wid), input_default_bindings=False, input_cursor=False,
+#     osc=False, osd_level=0, keep_open=True, idle=True — idle=True keeps
+#     the libmpv core alive between loads (idle=False lets the core shut
+#     down ~100 ms after creation, so every property read then raises
+#     ShutdownError). Assign _wid only AFTER the instance exists; on
+#     construction failure reset _wid=None and raise PlaybackError. Register property
 #     observers (python-mpv @self._player.property_observer decorator) for
 #     'time-pos', 'disc-menu-active', 'track-list', 'eof-reached' that emit
 #     the raw signals only (eof observer emits only when value is True).
 #   * load(source): allowed from {IDLE, STOPPED, EJECTED, ERROR}, else
-#     PlaybackError. _ensure_player(). transition(LOADING). Compute
+#     PlaybackError. transition(LOADING); _ensure_player() — on failure
+#     _fail(exc) (LOADING->ERROR + error_occurred emitted) then raise. Compute
 #     DiscIdentity.compute(source) (PlaybackError -> transition(ERROR) +
 #     emit error_occurred + return). Try player.dvd_device = source; on
 #     exception fall back to player.command('loadfile', 'dvdnav://',
 #     'replace', f'dvd-device={source}') else player.play('dvdnav://').
-#     Store _source/_disc_hash. Any mpv.MPVError/OSError -> transition(ERROR)
+#     Store _source/_disc_hash. Any MPVError/OSError/SystemError/AttributeError -> transition(ERROR)
 #     + emit error_occurred(str(exc)) + log.exception. LOADING->PLAYING /
 #     LOADING->MENU_ACTIVE arrives later via _apply_menu_active.
+#   * load watchdog: entering LOADING starts a singleShot
+#     QTimer(LOAD_TIMEOUT_MS); every _transition out of LOADING stops it.
+#     _on_load_timeout() fires _fail(PlaybackError("playback did not start:
+#     disc unreadable or drive error")) when still LOADING, so an unreadable
+#     disc always surfaces error_occurred instead of a silent stuck LOADING.
 #   * play_pause: PLAYING->PAUSED (player.pause=True); PAUSED->PLAYING
 #     (False); MENU_ACTIVE: no-op (A=select in menus). Else no-op.
 #   * stop: from {PLAYING, PAUSED, MENU_ACTIVE}: _save_resume_now();
@@ -261,8 +658,8 @@ CDS_DISC_OK = 4
 #   * set_speed(mult): {PLAYING, PAUSED} only; player.speed = mult;
 #     _speed = mult.
 #   * next_chapter/previous_chapter: only when state is PLAYING and
-#     player.chapter is not None; player.chapter += 1 (prev: -= 1),
-#     guarded by try/except.
+#     player.chapter is not None; player.chapter += 1 (prev:
+#     max(1, chapter - 1) — DVD chapters are 1-based), guarded by try/except.
 #   * cycle_audio: {PLAYING, PAUSED} only; ids = [t['id'] for t in
 #     player.track_list if t.get('type') == 'audio']; if ids and player.aid
 #     in ids: player.aid = ids[(ids.index(player.aid) + 1) % len(ids)].
@@ -283,9 +680,11 @@ CDS_DISC_OK = 4
 #     title (int, not None) -> disc_title = title; chapter (int, not None)
 #     -> chapter = chapter; pos (float > 0) -> time_pos = pos; then clear.
 #     All best-effort inside try/except (resume must never break playback).
-#   * eject: _save_resume_now(); terminate player (set _player=None); if
-#     _source was a block device: eject_device(_source); transition(EJECTED).
-#     Safe from any state except when player calls raise (wrap try/except).
+#   * eject: _save_resume_now(); terminate player (set _player=None AND
+#     _wid=None so attach_widget() can rebuild mpv for the next load); if
+#     _menu_active: clear it and emit menu_active_changed(False); if
+#     _source was a block device: eject_device(_source); transition(EJECTED)
+#     (legal from PLAYING/PAUSED/MENU_ACTIVE/STOPPED; wrap try/except).
 #   * dispose: idempotent; _save_resume_now(); if _player: terminate and
 #     _player=None. Does NOT change state.
 #   * _ensure_player: raise PlaybackError("engine not attached to a video
@@ -295,7 +694,7 @@ CDS_DISC_OK = 4
 #     disc_title when not menu else None, chapter).
 #   * _apply_menu_active(active) — handler for _menu_active_raw:
 #       _menu_active = bool(active)
-#       if active and state in {LOADING, PLAYING, PAUSED}: transition(MENU_ACTIVE)
+#       if active and state in {LOADING, PLAYING, PAUSED, STOPPED}: transition(MENU_ACTIVE)
 #       elif not active and state == LOADING: transition(PLAYING)
 #       elif not active and state == MENU_ACTIVE: transition(PLAYING)
 #       if state == PLAYING and _pending_resume: _apply_pending_resume()
@@ -305,20 +704,583 @@ CDS_DISC_OK = 4
 #   * _apply_tracks(value): split into audio/sub lists of dicts with keys
 #     {'id','lang','title'} (missing -> None); cache in _audio/_subs;
 #     emit tracks_changed(_audio, _subs).
-#   * _apply_eof(): when state in {PLAYING, PAUSED} and not _menu_active:
-#     transition(STOPPED); emit playback_ended().
+#   * _apply_eof(): LOADING -> _fail(PlaybackError("disc failed to start:
+#     end-of-file during load")); {PLAYING, PAUSED} and not _menu_active ->
+#     transition(STOPPED) + emit playback_ended(). On real DVDs a title end
+#     is followed by dvdnav re-entering the menu, hence STOPPED->MENU_ACTIVE
+#     is a legal transition so the state machine follows the disc.
 #   * _transition(new): _sm.transition(new) then emit state_changed(state).
-#   * Every player call wrapped: on mpv.MPVError -> transition(ERROR) +
+#   * Every player call wrapped: on MPVError/OSError/SystemError/AttributeError -> transition(ERROR) +
 #     emit error_occurred(str(exc)) + log.exception. StateMachine blocks
 #     ERROR->ERROR double transitions (raise PlaybackError inside handler;
 #     catch it and only log).
-#   * Properties return safe values when _player is None (time_pos=None,
-#     duration=None, chapter=None, chapter_list=[], disc_title=None,
-#     volume=None, speed=_speed, menu_active=_menu_active, state=_sm.state).
+#   * Properties return safe values when _player is None or the libmpv core
+#     has shut down: time_pos=None, duration=None, chapter=None,
+#     chapter_list=[], disc_title=None, volume=None, speed=_speed,
+#     menu_active=_menu_active, state=_sm.state. Every property read is
+#     wrapped in try/except (OSError, SystemError, AttributeError,
+#     TypeError, ValueError) and degrades to None/[].
 #   * Threading contract: ALL public methods GUI-thread-only. mpv observers
 #     run on mpv's thread and may ONLY emit raw signals — never touch the
 #     StateMachine, never emit public signals directly.
 # ── [AGENT1: SECTION 4 BEGIN] ──
+class DvdPlaybackEngine(QObject):
+    """libmpv/dvdnav backend; all public methods are GUI-thread-only."""
+
+    state_changed = pyqtSignal(object, arguments=())
+    position_changed = pyqtSignal(float, arguments=())
+    menu_active_changed = pyqtSignal(bool, arguments=())
+    tracks_changed = pyqtSignal(object, object, arguments=())
+    playback_ended = pyqtSignal(arguments=())
+    error_occurred = pyqtSignal(str, arguments=())
+
+    _menu_active_raw = pyqtSignal(bool, arguments=())
+    _time_pos_raw = pyqtSignal(float, arguments=())
+    _tracks_raw = pyqtSignal(object, arguments=())
+    _eof_raw = pyqtSignal(arguments=())
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        """Wire raw observer signals and start in IDLE."""
+        super().__init__(parent)  # type: ignore[arg-type]
+        self._sm = StateMachine(PlayerState.IDLE)
+        self._resume = ResumeStore()
+        self._player: Any = None
+        self._wid: int | None = None
+        self._source: str | None = None
+        self._disc_hash: str | None = None
+        self._pending_resume: dict[str, object] | None = None
+        self._menu_active = False
+        self._speed = 1.0
+        self._audio: list[dict[str, object]] = []
+        self._subs: list[dict[str, object]] = []
+        self._disposed = False
+        self._title_menu_logged = False
+        self._menu_active_raw.connect(self._apply_menu_active)
+        self._time_pos_raw.connect(self._apply_time_pos)
+        self._tracks_raw.connect(self._apply_tracks)
+        self._eof_raw.connect(self._apply_eof)
+        self._load_watchdog = QTimer(self)
+        self._load_watchdog.setSingleShot(True)
+        self._load_watchdog.setInterval(LOAD_TIMEOUT_MS)
+        self._load_watchdog.timeout.connect(self._on_load_timeout)
+
+    # ── public API ──────────────────────────────────────────────────
+    def attach_widget(self, wid: int) -> None:
+        """Create the mpv instance bound to the given native window id."""
+        if self._wid is not None and self._player is not None:
+            return
+        try:
+            player = mpv.MPV(
+                wid=str(wid),
+                input_default_bindings=False,
+                input_cursor=False,
+                osc=False,
+                osd_level=0,
+                keep_open=True,
+                idle=True,  # keep the libmpv core alive between loads
+            )
+        except Exception as exc:
+            self._wid = None
+            log.exception("mpv initialization failed")
+            raise PlaybackError(f"could not initialize mpv: {exc}") from exc
+        self._wid = int(wid)
+        self._player = player
+
+        @player.property_observer("time-pos")  # type: ignore[untyped-decorator]
+        def _observe_time_pos(_name: str, value: Any) -> None:
+            if value is not None:
+                self._time_pos_raw.emit(float(value))
+
+        @player.property_observer("disc-menu-active")  # type: ignore[untyped-decorator]
+        def _observe_menu(_name: str, value: Any) -> None:
+            self._menu_active_raw.emit(bool(value))
+
+        @player.property_observer("track-list")  # type: ignore[untyped-decorator]
+        def _observe_tracks(_name: str, value: Any) -> None:
+            self._tracks_raw.emit(value)
+
+        @player.property_observer("eof-reached")  # type: ignore[untyped-decorator]
+        def _observe_eof(_name: str, value: Any) -> None:
+            if value is True:
+                self._eof_raw.emit()
+
+    def load(self, source: str) -> None:
+        """Open ``source`` (device, ISO or VIDEO_TS folder) through dvdnav."""
+        state = self.state
+        if state not in (
+            PlayerState.IDLE,
+            PlayerState.STOPPED,
+            PlayerState.EJECTED,
+            PlayerState.ERROR,
+        ):
+            raise PlaybackError(f"cannot load while in state {state.name}")
+        self._transition(PlayerState.LOADING)
+        self._load_watchdog.start()
+        try:
+            player = self._ensure_player()
+        except PlaybackError as exc:
+            self._fail(exc)
+            raise
+        try:
+            disc_hash = DiscIdentity.compute(source)
+        except PlaybackError as exc:
+            self._fail(exc)
+            return
+        try:
+            try:
+                player.dvd_device = source
+            except (AttributeError, MPVError, OSError, SystemError):
+                try:
+                    player.command(
+                        "loadfile", "dvdnav://", "replace", f"dvd-device={source}"
+                    )
+                except (MPVError, OSError, SystemError, AttributeError):
+                    player.play("dvdnav://")
+        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            self._fail(exc)
+            return
+        self._source = source
+        self._disc_hash = disc_hash
+
+    def play_pause(self) -> None:
+        """Toggle pause for PLAYING/PAUSED; A selects inside menus."""
+        if self.state is PlayerState.PLAYING:
+            if self._call(lambda p: setattr(p, "pause", True)):
+                self._transition(PlayerState.PAUSED)
+        elif self.state is PlayerState.PAUSED and self._call(
+            lambda p: setattr(p, "pause", False)
+        ):
+            self._transition(PlayerState.PLAYING)
+
+    def stop(self) -> None:
+        """Save resume state and stop playback."""
+        if self.state not in (
+            PlayerState.PLAYING,
+            PlayerState.PAUSED,
+            PlayerState.MENU_ACTIVE,
+        ):
+            return
+        self._save_resume_now()
+        if self._call(lambda p: p.command("stop")):
+            self._transition(PlayerState.STOPPED)
+
+    def set_speed(self, mult: float) -> None:
+        """Set playback speed during PLAYING/PAUSED."""
+        if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
+            return
+        value = float(mult)
+        if self._call(lambda p: setattr(p, "speed", value)):
+            self._speed = value
+
+    def next_chapter(self) -> None:
+        """Skip to the next DVD chapter while playing."""
+        if self.state is not PlayerState.PLAYING or self._player is None:
+            return
+        try:
+            chapter = self._player.chapter
+            if chapter is not None:
+                self._player.chapter = int(chapter) + 1
+        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            self._fail(exc)
+
+    def previous_chapter(self) -> None:
+        """Skip to the previous DVD chapter while playing."""
+        if self.state is not PlayerState.PLAYING or self._player is None:
+            return
+        try:
+            chapter = self._player.chapter
+            if chapter is not None:
+                self._player.chapter = max(1, int(chapter) - 1)
+        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            self._fail(exc)
+
+    def cycle_audio(self) -> None:
+        """Cycle to the next audio track during PLAYING/PAUSED."""
+        if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
+            return
+        player = self._player
+        if player is None:
+            return
+        try:
+            ids = [
+                track["id"]
+                for track in player.track_list
+                if track.get("type") == "audio"
+            ]
+            current = player.aid
+            if ids and current in ids:
+                player.aid = ids[(ids.index(current) + 1) % len(ids)]
+        except (MPVError, OSError, SystemError, AttributeError, KeyError, TypeError) as exc:
+            self._fail(exc)
+
+    def cycle_subtitle(self) -> None:
+        """Cycle to the next subtitle track during PLAYING/PAUSED."""
+        if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
+            return
+        player = self._player
+        if player is None:
+            return
+        try:
+            ids = [
+                track["id"]
+                for track in player.track_list
+                if track.get("type") == "sub"
+            ]
+            current = player.sid
+            if ids and current in ids:
+                player.sid = ids[(ids.index(current) + 1) % len(ids)]
+        except (MPVError, OSError, SystemError, AttributeError, KeyError, TypeError) as exc:
+            self._fail(exc)
+
+    def menu_nav(self, direction: str) -> None:
+        """Move the DVD menu highlight in one of four directions."""
+        if not self._menu_active or direction not in {"up", "down", "left", "right"}:
+            return
+        self._call(lambda p: p.command("discnav", direction))
+
+    def menu_select(self) -> None:
+        """Activate the highlighted DVD menu item."""
+        if not self._menu_active:
+            return
+        self._call(lambda p: p.command("discnav", "select"))
+
+    def menu_back(self) -> None:
+        """Return to the previous DVD menu."""
+        if not self._menu_active:
+            return
+        self._call(lambda p: p.command("discnav", "prev"))
+
+    def menu_mouse_move(self, x: int, y: int) -> None:
+        """Forward a menu pointer position to dvdnav."""
+        if not self._menu_active:
+            return
+        px, py = int(x), int(y)
+        self._call(lambda p: p.command("discnav", "mouse_move", px, py))
+
+    def show_root_menu(self) -> None:
+        """Jump to the disc root menu."""
+        self._call(lambda p: p.command("discnav", "menu"))
+
+    def show_title_menu(self) -> None:
+        """Jump to the title menu (falls back to the root menu)."""
+        if not self._title_menu_logged:
+            self._title_menu_logged = True
+            log.info("title menu unavailable: falling back to discnav 'menu'")
+        self._call(lambda p: p.command("discnav", "menu"))
+
+    def set_title(self, title: int) -> None:
+        """Switch to DVD title ``title`` during PLAYING/PAUSED."""
+        if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
+            return
+        value = int(title)
+        self._call(lambda p: setattr(p, "disc_title", value))
+
+    def seek_to(self, seconds: float) -> None:
+        """Seek within the current title during PLAYING/PAUSED."""
+        if self.state not in (PlayerState.PLAYING, PlayerState.PAUSED):
+            return
+        position = float(seconds)
+        self._call(lambda p: setattr(p, "time_pos", position))
+
+    def adjust_volume(self, delta: float) -> None:
+        """Add ``delta`` to the volume, clamped to 0..150."""
+        player = self._player
+        if player is None:
+            return
+        try:
+            current = player.volume
+            base = 100.0 if current is None else float(current)
+            player.volume = min(150.0, max(0.0, base + float(delta)))
+        except (MPVError, OSError, SystemError, AttributeError, TypeError, ValueError) as exc:
+            self._fail(exc)
+
+    def resume_disc(self, saved: dict) -> None:  # type: ignore[type-arg]
+        """Stage a saved resume entry, applied on the next PLAYING state."""
+        self._pending_resume = dict(saved) if saved else None
+
+    def eject(self) -> None:
+        """Save state, terminate mpv, eject the disc and enter EJECTED."""
+        self._save_resume_now()
+        source = self._source
+        player = self._player
+        self._player = None
+        self._wid = None  # allow attach_widget() to rebuild mpv on next load
+        if player is not None:
+            try:
+                player.terminate()
+            except (MPVError, OSError, SystemError, AttributeError):
+                log.exception("mpv terminate failed during eject")
+        if self._menu_active:
+            self._menu_active = False
+            self.menu_active_changed.emit(False)
+        if source is not None:
+            try:
+                if stat.S_ISBLK(os.stat(source).st_mode):
+                    eject_device(source)
+            except (OSError, PlaybackError):
+                log.exception("could not eject %r", source)
+        try:
+            self._transition(PlayerState.EJECTED)
+        except PlaybackError:
+            log.debug("eject transition rejected from %s", self.state.name)
+
+    def dispose(self) -> None:
+        """Release mpv once; safe to call repeatedly."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self._load_watchdog.stop()
+        self._save_resume_now()
+        player = self._player
+        self._player = None
+        if player is not None:
+            try:
+                player.terminate()
+            except (MPVError, OSError, SystemError, AttributeError):
+                log.exception("mpv terminate failed during dispose")
+
+    # ── properties ──────────────────────────────────────────────────
+    @property
+    def state(self) -> PlayerState:
+        """Current player state."""
+        return self._sm.state
+
+    @property
+    def menu_active(self) -> bool:
+        """Whether a DVD menu is currently shown."""
+        return self._menu_active
+
+    @property
+    def time_pos(self) -> float | None:
+        """Position within the current title, in seconds."""
+        player = self._player
+        if player is None:
+            return None
+        try:
+            value = player.time_pos
+        except (OSError, SystemError, AttributeError, TypeError, ValueError):
+            return None
+        return None if value is None else float(value)
+
+    @property
+    def duration(self) -> float | None:
+        """Duration of the current title, in seconds."""
+        player = self._player
+        if player is None:
+            return None
+        try:
+            value = player.duration
+        except (OSError, SystemError, AttributeError, TypeError, ValueError):
+            return None
+        return None if value is None else float(value)
+
+    @property
+    def chapter(self) -> int | None:
+        """Current chapter number, if known."""
+        player = self._player
+        if player is None:
+            return None
+        try:
+            value = player.chapter
+        except (OSError, SystemError, AttributeError, TypeError, ValueError):
+            return None
+        return None if value is None else int(value)
+
+    @property
+    def chapter_list(self) -> list[int]:
+        """Chapter start times reported by mpv (empty when unavailable)."""
+        player = self._player
+        if player is None:
+            return []
+        try:
+            value = player.chapter_list
+        except (OSError, SystemError, AttributeError):
+            return []
+        if not isinstance(value, list):
+            return []
+        return [int(item) for item in value]
+
+    @property
+    def speed(self) -> float:
+        """Requested playback speed multiplier."""
+        return self._speed
+
+    @property
+    def disc_title(self) -> int | None:
+        """Current DVD title number, if known."""
+        player = self._player
+        if player is None:
+            return None
+        try:
+            value = player.disc_title
+        except (
+            MPVError,
+            AttributeError,
+            OSError,
+            SystemError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def volume(self) -> float | None:
+        """Current mpv volume (0..150)."""
+        player = self._player
+        if player is None:
+            return None
+        try:
+            value = player.volume
+        except (OSError, SystemError, AttributeError, TypeError, ValueError):
+            return None
+        return None if value is None else float(value)
+
+    @property
+    def player(self) -> Any:
+        """Underlying python-mpv instance, if attached."""
+        return self._player
+
+    # ── private helpers ─────────────────────────────────────────────
+    def _ensure_player(self) -> Any:
+        """Return the mpv instance or raise when no widget is attached."""
+        if self._player is None:
+            raise PlaybackError(
+                "engine not attached to a video widget yet (attach_widget first)"
+            )
+        return self._player
+
+    def _call(self, action: Callable[[Any], None]) -> bool:
+        """Run a player action, converting mpv failures into ERROR state."""
+        player = self._player
+        if player is None:
+            return False
+        try:
+            action(player)
+        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            self._fail(exc)
+            return False
+        return True
+
+    def _fail(self, exc: Exception) -> None:
+        """Enter ERROR (when legal) and notify listeners."""
+        log.exception("playback error: %s", exc)
+        try:
+            self._transition(PlayerState.ERROR)
+        except PlaybackError:
+            log.debug("state machine rejected ERROR from %s", self.state.name)
+        self.error_occurred.emit(str(exc))
+
+    def _save_resume_now(self) -> None:
+        """Persist the current position for the loaded disc, if possible."""
+        if self._disc_hash is None:
+            return
+        if self.state not in (
+            PlayerState.PLAYING,
+            PlayerState.PAUSED,
+            PlayerState.MENU_ACTIVE,
+        ):
+            return
+        try:
+            title = None if self._menu_active else self.disc_title
+            self._resume.save(
+                self._disc_hash,
+                self.time_pos or 0.0,
+                title,
+                self.chapter,
+            )
+        except OSError as exc:
+            log.warning("could not save resume state: %s", exc)
+
+    def _apply_menu_active(self, active: bool) -> None:
+        """React to dvdnav menu activation on the GUI thread."""
+        self._menu_active = bool(active)
+        state = self.state
+        if active and state in (
+            PlayerState.LOADING,
+            PlayerState.PLAYING,
+            PlayerState.PAUSED,
+            PlayerState.STOPPED,
+        ):
+            self._transition(PlayerState.MENU_ACTIVE)
+        elif not active and state in (PlayerState.LOADING, PlayerState.MENU_ACTIVE):
+            self._transition(PlayerState.PLAYING)
+        if self.state is PlayerState.PLAYING and self._pending_resume:
+            self._apply_pending_resume()
+        self.menu_active_changed.emit(self._menu_active)
+
+    def _apply_pending_resume(self) -> None:
+        """Best-effort restore of the staged resume entry."""
+        saved = self._pending_resume
+        self._pending_resume = None
+        player = self._player
+        if not saved or player is None:
+            return
+        try:
+            title = saved.get("title")
+            if isinstance(title, int):
+                player.disc_title = title
+            chapter = saved.get("chapter")
+            if isinstance(chapter, int):
+                player.chapter = chapter
+            pos = saved.get("pos")
+            if isinstance(pos, (int, float)) and float(pos) > 0:
+                player.time_pos = float(pos)
+        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            log.warning("could not apply resume state: %s", exc)
+
+    def _apply_time_pos(self, value: float | None) -> None:
+        """Forward a new playback position to listeners."""
+        if value is not None:
+            self.position_changed.emit(float(value))
+
+    def _apply_tracks(self, value: object) -> None:
+        """Split mpv's track list into audio/subtitle summaries."""
+        audio: list[dict[str, object]] = []
+        subs: list[dict[str, object]] = []
+        if isinstance(value, list):
+            for track in value:
+                if not isinstance(track, dict):
+                    continue
+                entry: dict[str, object] = {
+                    "id": track.get("id"),
+                    "lang": track.get("lang"),
+                    "title": track.get("title"),
+                }
+                if track.get("type") == "audio":
+                    audio.append(entry)
+                elif track.get("type") == "sub":
+                    subs.append(entry)
+        self._audio = audio
+        self._subs = subs
+        self.tracks_changed.emit(self._audio, self._subs)
+
+    def _apply_eof(self) -> None:
+        """Handle end-of-file on the GUI thread."""
+        if self.state is PlayerState.LOADING:
+            self._fail(PlaybackError("disc failed to start: end-of-file during load"))
+        elif self.state in (PlayerState.PLAYING, PlayerState.PAUSED) and not self._menu_active:
+            self._transition(PlayerState.STOPPED)
+            self.playback_ended.emit()
+
+    def _on_load_timeout(self) -> None:
+        """Watchdog: LOADING must resolve within LOAD_TIMEOUT_MS."""
+        if self.state is PlayerState.LOADING:
+            self._fail(
+                PlaybackError("playback did not start: disc unreadable or drive error")
+            )
+
+    def _transition(self, new: PlayerState) -> None:
+        """Apply a validated transition and announce it."""
+        self._sm.transition(new)
+        if new is not PlayerState.LOADING:
+            self._load_watchdog.stop()
+        self.state_changed.emit(self._sm.state)
 # ── [AGENT1: SECTION 4 END] ──
 
 # ════════════════════════════════════════════════════════════════════
@@ -410,8 +1372,12 @@ CDS_DISC_OK = 4
 #     menu_active_changed->_on_menu_active (_sync_osd); error_occurred->
 #     _on_engine_error (QMessageBox.critical).
 #   * After window.show(): QTimer.singleShot(0, self._attach_engine) ->
-#     engine.attach_widget(int(self.video.winId())); then when __init__
-#     received a non-empty source: call _on_load_clicked().
+#     engine.attach_widget(int(self.video.winId())) inside try/except
+#     PlaybackError (QMessageBox.critical + status 'ERROR'); then when
+#     __init__ received a non-empty source: call _on_load_clicked().
+#     _attach_engine() is also called at the start of _on_load_clicked so
+#     a fresh mpv is rebuilt after eject() (attach_widget no-ops while
+#     already attached).
 #   * Video mouse: install eventFilter on self.video (_on_video_mouse):
 #     MouseMove -> osd.show_osd(); when engine.menu_active:
 #     engine.menu_mouse_move(pos.x(), pos.y()). MouseButtonPress (Left) ->
@@ -441,7 +1407,8 @@ CDS_DISC_OK = 4
 #     chapter, rb -> next chapter. Edge-triggered: act only when a control
 #     changes vs last poll (keep a tuple snapshot). ImportError -> stop
 #     the timer (log once). get_gamepad() raising -> swallow.
-#   * _on_load_clicked: text = source.text().strip(); when empty use the
+#   * _on_load_clicked: self._attach_engine() first (idempotent; re-creates
+#     mpv after an eject); text = source.text().strip(); when empty use the
 #     first list_dvd_devices() result if any, else QMessageBox.warning
 #     ('No source') and return. problems = check_environment(source); when
 #     problems: QMessageBox.warning joined text ('…\nProceeding anyway.').
