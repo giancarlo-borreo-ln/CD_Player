@@ -19,6 +19,7 @@ import getpass
 import grp
 import hashlib
 import json
+import locale
 import logging
 import math
 import os
@@ -793,6 +794,9 @@ class DvdPlaybackEngine(QObject):
         """Create the mpv instance bound to the given native window id."""
         if self._wid is not None and self._player is not None:
             return
+        # Qt may reset LC_NUMERIC after app init; libmpv requires the C
+        # locale (warns, and may crash, with comma-decimal locales).
+        locale.setlocale(locale.LC_NUMERIC, "C")
         try:
             player = mpv.MPV(
                 wid=str(wid),
@@ -2312,10 +2316,14 @@ def main() -> int:
             "Wayland session detected: forcing QT_QPA_PLATFORM=xcb for mpv embedding"
         )
     app = QApplication(sys.argv)
+    # Qt resets LC_NUMERIC at app init; libmpv requires the C locale
+    # (prints a warning and may crash with comma-decimal locales).
+    locale.setlocale(locale.LC_NUMERIC, "C")
     app.setApplicationName(APP_NAME)
     app.setStyle("Fusion")
     engine = DvdPlaybackEngine()
     window = MainWindow(engine, sys.argv[1] if len(sys.argv) > 1 else None)
+    window.setWindowTitle("DVD Player")
     window.show()
     code = app.exec()
     engine.dispose()
