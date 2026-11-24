@@ -741,7 +741,9 @@ def check_environment(source: str) -> list[str]:
 #     chapter_list=[], disc_title=None, volume=None, speed=_speed,
 #     menu_active=_menu_active, state=_sm.state. Every property read is
 #     wrapped in try/except (OSError, SystemError, AttributeError,
-#     TypeError, ValueError) and degrades to None/[].
+#     TypeError, ValueError) and degrades to None/[]. chapter-list entries
+#     may be floats or {'title':..., 'time':...} maps (mpv >= 0.36); the
+#     property extracts the time from either shape.
 #   * Threading contract: ALL public methods GUI-thread-only. mpv observers
 #     run on mpv's thread and may ONLY emit raw signals — never touch the
 #     StateMachine, never emit public signals directly.
@@ -1113,7 +1115,16 @@ class DvdPlaybackEngine(QObject):
             return []
         if not isinstance(value, list):
             return []
-        return [int(item) for item in value]
+        times: list[int] = []
+        for item in value:
+            raw = item.get("time") if isinstance(item, dict) else item
+            if raw is None:
+                continue
+            try:
+                times.append(int(raw))
+            except (TypeError, ValueError):
+                continue
+        return times
 
     @property
     def speed(self) -> float:
@@ -1688,7 +1699,9 @@ class Xbox360Osd(QWidget):
 #     first (idempotent; re-creates mpv after an eject). problems =
 #     check_environment(source): when problems — quiet: set self.status to
 #     the joined text (no modal, zero-click flow); not quiet:
-#     QMessageBox.warning joined text ('…\nProceeding anyway.').
+#     QMessageBox.warning joined text ('…\nProceeding anyway.') but ONLY
+#     when the source exists (a missing source skips the warning so the
+#     subsequent critical reads as one clear message).
 #     DiscIdentity.compute(source) -> on PlaybackError: quiet: self.status
 #     message; not quiet: QMessageBox.critical; return. saved =
 #     ResumeStore().get(hash): when saved: _show_resume_prompt(hash, saved)
@@ -2094,7 +2107,9 @@ class MainWindow(QMainWindow):
             joined = "\n".join(problems)
             if quiet:
                 self._set_status(joined)
-            else:
+            elif os.path.exists(source):
+                # A missing source skips the warning: the critical below is
+                # the one clear message the user needs.
                 QMessageBox.warning(
                     self,
                     "Environment check",
