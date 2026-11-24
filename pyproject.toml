@@ -1,0 +1,29 @@
+[project]
+name = "dvd-player"
+version = "0.1.0"
+description = "Xbox 360-style DVD player for Arch Linux (PyQt6 + libmpv/dvdnav)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "PyQt6>=6.6",
+    "python-mpv>=1.0.5",
+]
+
+[project.optional-dependencies]
+gamepad = ["inputs>=0.5"]
+dev = ["mypy>=1.10", "ruff>=0.6"]
+
+[project.scripts]
+dvd-player = "dvd_player:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
