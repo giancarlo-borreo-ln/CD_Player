@@ -656,7 +656,7 @@ def check_environment(source: str) -> list[str]:
 #     When DVD_PLAYER_SOFTWARE_RENDER=1: vo='gpu', gpu_context='x11egl',
 #     LIBGL_ALWAYS_SOFTWARE=1 (llvmpipe), display_fps_override=30 (cap the
 #     render rate near DVD frame rate instead of the 144 Hz display sync),
-#     scale='fast-bilinear', dscale='fast-bilinear', gpu_dumb_mode=True
+#     scale='bilinear', dscale='bilinear', gpu_dumb_mode=True
 #     (cheapest llvmpipe shaders) and autosync=30 (gradual A/V drift
 #     correction — audio leads video on llvmpipe soft decode) — fallback for
 #     NVIDIA-on-XWayland machines
@@ -877,8 +877,8 @@ class DvdPlaybackEngine(QObject):
                 # llvmpipe on a 144 Hz display: cap presentation to DVD rate
                 # and pick the cheapest scalers/shader path.
                 options["display_fps_override"] = 30
-                options["scale"] = "fast-bilinear"
-                options["dscale"] = "fast-bilinear"
+                options["scale"] = "bilinear"
+                options["dscale"] = "bilinear"
                 options["gpu_dumb_mode"] = True
                 # llvmpipe soft decode drifts; mpv retimes audio gradually.
                 options["autosync"] = 30
