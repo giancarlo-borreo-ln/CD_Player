@@ -15,6 +15,7 @@ their activation protocol, and the verification evidence each one produces.
 | **4** | **Loki** | Cyber-Sec Pen-Tester | flash#low | Breaks the artifact in any way a user should never be able to: shell injection, command prompts, path traversal, races, floods. |
 | **5** | **Thanos** | Token & Context Minimizer — **the most important agent, and the ONLY one who spawns the others** | architect (in-session) | Takes `/tmp/TODO.md`, compresses it (chain-of-density), and hands each agent a minimized prompt packet. Perfectly balanced token budgets, as all things should be. |
 | **6** | **Captain America** | Blind Acceptance Tester | flash#low | The everyman hero: a fresh user with zero code access. "I can do this all day" — plays with the app until it's right. |
+| **7** | **Nick Fury** | Project Organizer — modern Python layout | flash#low | Invoked ONLY by Thanos (with all of Thanos's knowledge) when the codebase outgrows the single file: splits the project into a modern `src/` package layout (module boundaries = the SECTION architecture), moves tests into `tests/`, keeps packaging/entry points working — zero behavior change, every suite re-verified. |
 
 ## Thanos playbook (context & prompt engineering, researched 2026 practices)
 
@@ -28,6 +29,7 @@ their activation protocol, and the verification evidence each one produces.
 8. **Token ceilings** — Tony/Spider ≤600, Dr. Strange ≤350, Loki ≤350, Cap ≤600; telegraphic prose; no fillers.
 9. **Loop-breaker** — hash `(agent, symbol, error-signature)`; two failures without progress ⇒ rollback + 3-line root-cause escalation.
 10. **Prompt versioning + ledger** — every packet versioned; every dispatch recorded (see ledger below).
+11. **Budget audit (constant)** — Thanos attributes tokens per agent per dispatch, enforces static caps, and tightens any offender's packet. Grounded in 2026 research: per-agent attribution beats session totals; static caps before loops; cost-per-completed-task is the primary metric; state resets prevent quadratic history growth; minification is gated by evals (compression can silently drop success rates).
 
 ## Pipeline order (canonical)
 
@@ -58,22 +60,30 @@ agent — dynamic content goes last for prompt-cache friendliness.
 
 ## Source layout & agent edit markers
 
-`dvd_player.py` is the single application file. Agent-owned regions are
-delimited by `# ── [AGENTn: SECTION k BEGIN/END] ──` marker pairs; the
-architect-owned SPEC comment block directly above each region is the
-authoritative contract. Agents edit only between their markers (plus the
-Section 0 import block); the SPEC is never re-litigated.
+The application is a src-layout package: `src/dvd_player/`. The historical
+single-file SECTION architecture maps one-to-one onto modules, and each
+module still carries its SECTION header plus the architect-owned SPEC
+comment block (the authoritative contract). Agents edit only their module;
+the SPEC is never re-litigated. `src/dvd_player/__init__.py` re-exports the
+whole public surface (and imported Qt/stdlib names), so
+`import dvd_player as dp` behaves exactly like the old single module.
 
 ```
-SECTION 0  imports / framework shim        architect
-SECTION 1  constants, enums, state machine agent 1
-SECTION 2  DiscIdentity + ResumeStore      agent 1
-SECTION 3  hardware helpers                agent 1
-SECTION 4  DvdPlaybackEngine (libmpv)      agent 1
-SECTION 5  Xbox360Osd                      agent 2
-SECTION 6  MainWindow                      agent 2
-SECTION 7  main()                          architect
+module                              SECTION  contents                                  owner
+src/dvd_player/state.py               1      constants, enums, PlayerState, StateMachine  agent 1
+src/dvd_player/identity.py            2      DiscIdentity, ResumeStore                     agent 1
+src/dvd_player/hardware.py            3      ioctl constants + drive helpers               agent 1
+src/dvd_player/engine.py              4      DvdPlaybackEngine (libmpv / dvdnav)           agent 1
+src/dvd_player/osd.py                 5      Xbox360Osd overlay                            agent 2
+src/dvd_player/window.py            5/6      HomeMenu, ChapterGrid, HelpOverlay, MainWindow agent 2
+src/dvd_player/mpris.py               6      MprisService + D-Bus adaptors                 agent 2
+src/dvd_player/app.py                 7      main(): logging, locale, xcb setup            architect
+src/dvd_player/__init__.py            0      package facade: version, re-exports           architect
+src/dvd_player/__main__.py            0      `python -m dvd_player`                        architect
 ```
+
+Acceptance suites live in `tests/` and run from the repo root with
+`QT_QPA_PLATFORM=offscreen uv run python tests/<name>.py`.
 
 ## State machine (the invariant Agents 3/4 enforce)
 

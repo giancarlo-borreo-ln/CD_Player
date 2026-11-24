@@ -5,8 +5,8 @@ subtitles — with the exact look and feel of the **Xbox 360 DVD Player**:
 translucent OSD transport bar, D-pad menu navigation, console auto-boot and
 per-disc resume state.
 
-A single-file application: `dvd_player.py` (PyQt6 GUI + libmpv `dvdnav://`
-backend), packaged with `uv`.
+A modern `src/`-layout Python package (`src/dvd_player/`: PyQt6 GUI + libmpv
+`dvdnav://` backend), packaged with `uv` and hatchling.
 
 > Built by a multi-agent pipeline — see [docs/AGENTS.md](docs/AGENTS.md) for
 > the agent roster, activation protocol, and verification ledger.
@@ -61,6 +61,36 @@ uv sync
 uv run dvd-player                          # auto-boots any disc in the drive
 uv run dvd-player /path/to/movie.iso       # or play a specific source
 uv run dvd-player /path/to/VIDEO_TS        # or a ripped DVD folder
+uv run python -m dvd_player                # equivalent module entry point
+```
+
+## Development
+
+The package lives in `src/dvd_player/` (module boundaries mirror the SECTION
+architecture — see `docs/AGENTS.md`). Install dev tools and check the tree
+from the repo root:
+
+```sh
+uv sync --extra dev
+uv run ruff check src/dvd_player
+uv run mypy --strict src/dvd_player
+```
+
+The acceptance suites are plain scripts under `tests/`; run each from the
+repo root (offscreen Qt, no display needed):
+
+```sh
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_backend_smoke.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_verification.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_formal_exam.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_redteam.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_gui_smoke.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_verification_gui.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_blackbox.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_blackbox_async.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_blackbox_reset.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_loki_sync.py
+QT_QPA_PLATFORM=offscreen uv run python tests/dvd_uat_driver.py
 ```
 
 ## Install as a desktop app (Rofi / app launcher)
@@ -111,8 +141,13 @@ no silent failures.
 | — | `I` / `O` | Next audio language / next subtitle |
 | Vol | `+` / `-` | Volume up / down |
 | Eject | `E` | Eject |
-| Guide | any key / mouse | Show OSD (auto-hides after 4 s) |
-| — | `Esc` | Hide OSD |
+| Guide | `M` | Toggle OSD (auto-hides after 4 s; any key/mouse also reveals it) |
+| Guide | `G` | Open home menu (DVD / USB / Storage blades) |
+| — | `C` | Chapter grid (playing / paused) |
+| — | `A` | Cycle aspect ratio (auto → 16:9 → 4:3) |
+| — | `Ctrl+H` | Help overlay — every control on one screen |
+| — | `Ctrl+L` | Load a disc image / VIDEO_TS folder |
+| — | `Esc` | Close help/home/chapter overlays · hide OSD |
 | — | `Ctrl+F` | Toggle fullscreen |
 
 **Gamepad** (optional): the same mapping via evdev (`inputs` package) — D-pad
