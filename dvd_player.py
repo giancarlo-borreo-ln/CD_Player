@@ -681,13 +681,17 @@ def check_environment(source: str) -> list[str]:
 #     in ids: player.aid = ids[(ids.index(player.aid) + 1) % len(ids)].
 #     cycle_subtitle: same shape with type 'sub' and player.sid.
 #   * menu_nav(direction in {'up','down','left','right'}): only when
-#     _menu_active; player.command('discnav', direction) in try/except.
-#     menu_select: discnav 'select' (menu only). menu_back: discnav 'prev'
-#     (menu only). menu_mouse_move(x, y): discnav 'mouse_move' x y (menu
-#     only, ints).
-#   * show_root_menu: player.command('discnav', 'menu').
-#   * show_title_menu: player.command('discnav', 'menu') (libmpv exposes no
-#     separate VTSM title-menu jump; log.info this fallback once).
+#     _menu_active; player.command('discnav', direction) via _discnav,
+#     which is NON-FATAL (mpv failures are logged at info, never ERROR /
+#     error_occurred).
+#     menu_select: discnav 'select' (menu only, non-fatal). menu_back:
+#     discnav 'prev' (menu only, non-fatal). menu_mouse_move(x, y):
+#     discnav 'mouse_move' x y (menu only, ints, non-fatal).
+#   * show_root_menu: player.command('discnav', 'menu') via _discnav
+#     (non-fatal: an unavailable discnav never errors the engine).
+#   * show_title_menu: player.command('discnav', 'menu') via _discnav
+#     (non-fatal; libmpv exposes no separate VTSM title-menu jump;
+#     log.info this fallback once).
 #   * set_title(title): {PLAYING, PAUSED} only; player.disc_title = title.
 #   * seek_to(seconds): {PLAYING, PAUSED} only; player.time_pos = seconds.
 #   * adjust_volume(delta): player.volume = min(150, max(0, volume + delta)).
@@ -970,37 +974,37 @@ class DvdPlaybackEngine(QObject):
         """Move the DVD menu highlight in one of four directions."""
         if not self._menu_active or direction not in {"up", "down", "left", "right"}:
             return
-        self._call(lambda p: p.command("discnav", direction))
+        self._discnav(direction)
 
     def menu_select(self) -> None:
         """Activate the highlighted DVD menu item."""
         if not self._menu_active:
             return
-        self._call(lambda p: p.command("discnav", "select"))
+        self._discnav("select")
 
     def menu_back(self) -> None:
         """Return to the previous DVD menu."""
         if not self._menu_active:
             return
-        self._call(lambda p: p.command("discnav", "prev"))
+        self._discnav("prev")
 
     def menu_mouse_move(self, x: int, y: int) -> None:
         """Forward a menu pointer position to dvdnav."""
         if not self._menu_active:
             return
         px, py = int(x), int(y)
-        self._call(lambda p: p.command("discnav", "mouse_move", px, py))
+        self._discnav("mouse_move", px, py)
 
     def show_root_menu(self) -> None:
         """Jump to the disc root menu."""
-        self._call(lambda p: p.command("discnav", "menu"))
+        self._discnav("menu")
 
     def show_title_menu(self) -> None:
         """Jump to the title menu (falls back to the root menu)."""
         if not self._title_menu_logged:
             self._title_menu_logged = True
             log.info("title menu unavailable: falling back to discnav 'menu'")
-        self._call(lambda p: p.command("discnav", "menu"))
+        self._discnav("menu")
 
     def set_title(self, title: int) -> None:
         """Switch to DVD title ``title`` during PLAYING/PAUSED."""
@@ -1198,6 +1202,16 @@ class DvdPlaybackEngine(QObject):
             )
         return self._player
 
+    def _discnav(self, *args: object) -> None:
+        """Send a dvdnav command; failures are non-fatal and only logged."""
+        player = self._player
+        if player is None:
+            return
+        try:
+            player.command("discnav", *args)
+        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            log.info("discnav %s unavailable: %s", args, exc)
+
     def _call(self, action: Callable[[Any], None]) -> bool:
         """Run a player action, converting mpv failures into ERROR state."""
         player = self._player
@@ -1365,7 +1379,11 @@ class DvdPlaybackEngine(QObject):
 #     10 pt, light gray QColor(200, 200, 200) — language switching visible
 #     on the bar (Xbox track-toggle feedback). Buttons right-aligned,
 #     34 px spacing, 14 pt font, base color white, hover color Xbox green
-#     QColor(116, 195, 41) via setMouseTracking(True). Draw helper
+#     QColor(116, 195, 41) via setMouseTracking(True). The 'eject' button
+#     is separated from 'menu' by an EXTRA BUTTON_GAP (2x spacing total)
+#     so the irreversible action stands apart; the extra gap is applied
+#     only when the bar is wide enough to fit the whole button row (a
+#     narrower strip degrades to the normal spacing). Draw helper
 #     _fmt_time(seconds: float) -> str ('mm:ss' or 'h:mm:ss').
 #   * show_osd: show(), raise_(), (re)start a singleShot
 #     QTimer(OSD_TIMEOUT_MS) -> hide() (Xbox: any activity resets timeout).
@@ -1451,15 +1469,31 @@ class Xbox360Osd(QWidget):
         metrics = QFontMetricsF(font)
         height = max(0.0, float(self.height()) - 16.0)
         right = float(self.width()) - self.LEFT_MARGIN
+        widths = [
+            (name, max(self.BUTTON_MIN_WIDTH, metrics.horizontalAdvance(glyph) + 8.0))
+            for name, glyph in self.BUTTONS
+        ]
+        needed = sum(width for _, width in widths) + self.BUTTON_GAP * (
+            len(widths) - 1
+        )
+        # Only spend the extra gap when the bar can actually fit every
+        # button; on a bar too narrow for the row it would just push
+        # buttons off the left edge (graceful degradation).
+        eject_extra = (
+            self.BUTTON_GAP
+            if float(self.width()) - 2.0 * self.LEFT_MARGIN
+            >= needed + self.BUTTON_GAP
+            else 0.0
+        )
         rects: list[tuple[str, QRectF]] = []
-        for name, glyph in reversed(self.BUTTONS):
-            width = max(
-                self.BUTTON_MIN_WIDTH, metrics.horizontalAdvance(glyph) + 8.0
-            )
+        for name, width in reversed(widths):
             left = max(0.0, right - width)
             visible = max(0.0, min(width, right - left))
             rects.append((name, QRectF(left, 8.0, visible, height)))
             right -= width + self.BUTTON_GAP
+            if name == "eject":
+                # Keep the irreversible eject action visually apart.
+                right -= eject_extra
         rects.reverse()
         return rects
 
@@ -1621,6 +1655,11 @@ class Xbox360Osd(QWidget):
 #         (placeholder '/dev/sr0 | /path/movie.iso | /path/to/VIDEO_TS'),
 #         'Browse…' QPushButton, 'Load / Play' QPushButton, 'Eject'
 #         QPushButton, self.status QLabel (elided, initial 'IDLE').
+#         The bar is HIDDEN BY DEFAULT (widgets stay constructed and
+#         reachable for tests, but .hide() is called after it is added to
+#         the layout) so the video fills the whole window — console look,
+#         no accidental ejects or edits from the noisy strip.
+#     * self.setMinimumSize(854, 480) in __init__ (video-only contract).
 #   API (signatures exact):
 #     __init__(self, engine: DvdPlaybackEngine, source: Optional[str] = None)
 #     resizeEvent(self, event) -> None
@@ -1681,6 +1720,11 @@ class Xbox360Osd(QWidget):
 #       reveals it via show_osd)
 #       Ctrl+F (handled directly in keyPressEvent, not _handle_key):
 #       toggle fullscreen -> showNormal()/showFullScreen() + reveal OSD
+#       Ctrl+L (handled directly in keyPressEvent, not _handle_key):
+#       open the browse dialog (same ISO dialog / VIDEO_TS folder fallback
+#       as _on_browse_clicked) and, when a path is picked, set self.source
+#       text and IMMEDIATELY _load_source(picked, quiet=False) — file
+#       loading is one shortcut away even with the bar hidden.
 #   * _cycle_speed(direction): current = engine.speed; ladder = FF_SPEEDS;
 #     direction +1: next step above current (wrap to 2.0 at top? NO: wrap
 #     from 16x back to 1.0); direction -1: previous step below current
@@ -1731,11 +1775,13 @@ class Xbox360Osd(QWidget):
 #     'ff' -> _cycle_speed(+1); 'rw' -> _cycle_speed(-1); 'prev' ->
 #     previous_chapter; 'next' -> next_chapter; 'audio' -> cycle_audio;
 #     'subtitle' -> cycle_subtitle; 'menu' -> show_root_menu; 'eject' ->
-#     _on_eject_clicked.
+#     QMessageBox.question(self, "Eject", "Eject the disc?",
+#     Yes|No, default Yes) — only Yes triggers _on_eject_clicked(), so an
+#     accidental tap or click can never eject the disc.
 #   * _on_eject_clicked: engine.eject(); status 'EJECTED'.
 #   * _on_browse_clicked: QFileDialog.getOpenFileName('.iso (*.iso)');
 #     when canceled try getExistingDirectory ('folder with VIDEO_TS');
-#     set self.source text when picked.
+#     set self.source text when picked (no load — Ctrl+L loads directly).
 #   * closeEvent: engine.dispose(); event.accept().
 #   * _sync_osd: osd.set_transport(state=engine.state, speed=engine.speed,
 #     time_pos=engine.time_pos, duration=engine.duration,
@@ -1751,6 +1797,7 @@ class MainWindow(QMainWindow):
         """Build the window and connect engine signals and timers."""
         super().__init__()
         self.engine = engine
+        self.setMinimumSize(854, 480)
         self._initial_source: str | None = source if source else None
         self._pending_source: str | None = None
         self._loaded_source: str | None = None
@@ -1794,6 +1841,9 @@ class MainWindow(QMainWindow):
         bar.addWidget(eject_button)
         bar.addWidget(self.status)
         layout.addWidget(bottom)
+        # Console contract: video only. Keep the widgets constructed (and
+        # reachable for tests) but hide the noisy strip by default.
+        bottom.hide()
         self.setCentralWidget(central)
 
         # The OSD floats above the window so it can hug the bottom edge.
@@ -1844,6 +1894,16 @@ class MainWindow(QMainWindow):
             else:
                 self.showFullScreen()
             self.osd.show_osd()
+            event.accept()
+            return
+        if (
+            event.key() == Qt.Key.Key_L
+            and event.modifiers() & Qt.KeyboardModifier.ControlModifier
+        ):
+            picked = self._browse_for_source()
+            if picked:
+                self.source.setText(picked)
+                self._load_source(picked, quiet=False)
             event.accept()
             return
         if self._handle_key(event.key()):
@@ -2155,8 +2215,8 @@ class MainWindow(QMainWindow):
         except PlaybackError as exc:
             self._set_status(str(exc))
 
-    def _on_browse_clicked(self) -> None:
-        """Pick an ISO image, falling back to a VIDEO_TS folder."""
+    def _browse_for_source(self) -> str | None:
+        """Pick an ISO image (or VIDEO_TS folder); return None on cancel."""
         path, _selected = QFileDialog.getOpenFileName(
             self, "Select DVD image", "", ".iso (*.iso)"
         )
@@ -2164,6 +2224,11 @@ class MainWindow(QMainWindow):
             path = QFileDialog.getExistingDirectory(
                 self, "Select a folder with VIDEO_TS"
             )
+        return path or None
+
+    def _on_browse_clicked(self) -> None:
+        """Pick an ISO image, falling back to a VIDEO_TS folder."""
+        path = self._browse_for_source()
         if path:
             self.source.setText(path)
 
@@ -2194,7 +2259,15 @@ class MainWindow(QMainWindow):
         elif action == "menu":
             self.engine.show_root_menu()
         elif action == "eject":
-            self._on_eject_clicked()
+            answer = QMessageBox.question(
+                self,
+                "Eject",
+                "Eject the disc?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._on_eject_clicked()
 
     def _on_video_mouse(self, obj: object, event: QMouseEvent) -> None:
         """Show the OSD on mouse activity and forward menu pointer moves."""
