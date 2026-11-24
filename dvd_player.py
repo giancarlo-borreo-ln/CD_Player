@@ -1688,7 +1688,8 @@ class Xbox360Osd(QWidget):
 #   * engine signals -> handlers: state_changed->_on_engine_state (update
 #     self.status with state name + _sync_osd); position_changed->_on_position
 #     (_sync_osd); tracks_changed->_on_tracks (cache lists + _sync_osd);
-#     menu_active_changed->_on_menu_active (_sync_osd); error_occurred->
+#     menu_active_changed->_on_menu_active (True -> osd.hide() then
+#     _sync_osd); error_occurred->
 #     _on_engine_error (QMessageBox.critical).
 #   * After window.show(): QTimer.singleShot(0, self._attach_engine) ->
 #     engine.attach_widget(int(self.video.winId())) inside try/except
@@ -1699,11 +1700,15 @@ class Xbox360Osd(QWidget):
 #     fresh mpv is rebuilt after eject() (attach_widget no-ops while
 #     already attached).
 #   * Video mouse: install eventFilter on self.video (_on_video_mouse):
-#     MouseMove -> osd.show_osd(); when engine.menu_active:
-#     engine.menu_mouse_move(pos.x(), pos.y()). MouseButtonPress (Left) ->
-#     osd.show_osd(); when menu active: engine.menu_select().
-#   * _handle_key mapping (return False when unmapped; osd.show_osd() on
-#     every consumed key; Qt.Key enum from PyQt6.QtCore):
+#     MouseMove -> when NOT engine.menu_active: osd.show_osd(); when
+#     engine.menu_active: engine.menu_mouse_move(pos.x(), pos.y()) only.
+#     MouseButtonPress (Left) -> when NOT menu active: osd.show_osd();
+#     when menu active: engine.menu_select() only. Inside the menu the
+#     menu's own UI is the interface, so pointer activity never reveals
+#     the OSD there.
+#   * _handle_key mapping (return False when unmapped; a consumed key
+#     reveals the OSD ONLY while engine.menu_active is FALSE; Qt.Key enum
+#     from PyQt6.QtCore):
 #       Key_Up/Down/Left/Right -> engine.menu_nav('up'/'down'/'left'/'right')
 #       Key_Return/Key_Enter -> menu active: menu_select else play_pause
 #       Key_Space -> play_pause
@@ -1715,9 +1720,15 @@ class Xbox360Osd(QWidget):
 #       Key_I -> cycle_audio         Key_O -> cycle_subtitle
 #       Key_Plus/Key_Equal -> adjust_volume(+5.0)
 #       Key_Minus -> adjust_volume(-5.0)
-#       Key_E -> eject               Key_Escape -> hide OSD ONLY (the single
-#       consumed key that does NOT reveal the OSD; every other consumed key
-#       reveals it via show_osd)
+#       Key_E -> eject
+#       Key_M -> GUIDE: toggle the OSD anywhere (visible -> hide; hidden ->
+#       show_osd), including inside the menu. This is the explicit way to
+#       summon or dismiss transport controls.
+#       Key_Escape -> hide OSD ONLY (never reveals it)
+#     OSD-reveal rule: implicit reveal (keys, pointer) happens only while
+#     NOT in the menu. Entering the menu (_on_menu_active True) hides the
+#     OSD; the DVD menu itself is the interface. Key_M is the only guide
+#     toggle at any time.
 #       Ctrl+F (handled directly in keyPressEvent, not _handle_key):
 #       toggle fullscreen -> showNormal()/showFullScreen() + reveal OSD
 #       Ctrl+L (handled directly in keyPressEvent, not _handle_key):
@@ -1972,12 +1983,19 @@ class MainWindow(QMainWindow):
             self.engine.adjust_volume(-5.0)
         elif key == codes.Key_E.value:
             self._on_eject_clicked()
+        elif key == codes.Key_M.value:
+            if self.osd.isVisible():
+                self.osd.hide()
+            else:
+                self.osd.show_osd()
+            return True
         elif key == codes.Key_Escape.value:
             self.osd.hide()
             return True
         else:
             return False
-        self.osd.show_osd()
+        if not self.engine.menu_active:
+            self.osd.show_osd()
         return True
 
     def _cycle_speed(self, direction: int) -> None:
@@ -2102,8 +2120,9 @@ class MainWindow(QMainWindow):
         self._sync_osd()
 
     def _on_menu_active(self, active: bool) -> None:
-        """Repaint the OSD when the disc menu appears or disappears."""
-        del active
+        """Hide the OSD when the menu appears; the menu is the interface."""
+        if active:
+            self.osd.hide()
         self._sync_osd()
 
     def _on_engine_error(self, message: str) -> None:
@@ -2270,12 +2289,13 @@ class MainWindow(QMainWindow):
                 self._on_eject_clicked()
 
     def _on_video_mouse(self, obj: object, event: QMouseEvent) -> None:
-        """Show the OSD on mouse activity and forward menu pointer moves."""
+        """Reveal the OSD on pointer activity; forward menu clicks."""
         del obj
         event_type = event.type()
         if event_type == QEvent.Type.MouseMove:
-            self.osd.show_osd()
-            if self.engine.menu_active:
+            if not self.engine.menu_active:
+                self.osd.show_osd()
+            else:
                 position = event.position()
                 self.engine.menu_mouse_move(
                     int(position.x()), int(position.y())
@@ -2284,9 +2304,10 @@ class MainWindow(QMainWindow):
             event_type == QEvent.Type.MouseButtonPress
             and event.button() == Qt.MouseButton.LeftButton
         ):
-            self.osd.show_osd()
             if self.engine.menu_active:
                 self.engine.menu_select()
+            else:
+                self.osd.show_osd()
 
     # ── resume & OSD sync ───────────────────────────────────────────
     def _show_resume_prompt(self, disc_hash: str, saved: dict) -> None:  # type: ignore[type-arg]
