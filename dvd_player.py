@@ -2310,7 +2310,10 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
-    if os.environ.get("WAYLAND_DISPLAY") and "QT_QPA_PLATFORM" not in os.environ:
+    if (
+        os.environ.get("WAYLAND_DISPLAY")
+        and not os.environ.get("QT_QPA_PLATFORM", "").startswith("xcb")
+    ):
         os.environ["QT_QPA_PLATFORM"] = "xcb"
         log.info(
             "Wayland session detected: forcing QT_QPA_PLATFORM=xcb for mpv embedding"
