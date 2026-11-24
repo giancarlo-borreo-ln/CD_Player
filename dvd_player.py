@@ -651,9 +651,9 @@ def check_environment(source: str) -> list[str]:
 #     PlaybackError. transition(LOADING); _ensure_player() — on failure
 #     _fail(exc) (LOADING->ERROR + error_occurred emitted) then raise. Compute
 #     DiscIdentity.compute(source) (PlaybackError -> transition(ERROR) +
-#     emit error_occurred + return). Try player.dvd_device = source; on
-#     exception fall back to player.command('loadfile', 'dvdnav://',
-#     'replace', f'dvd-device={source}') else player.play('dvdnav://').
+#     emit error_occurred + return). Set player.dvd_device = source THEN
+#     player.play("dvdnav://") — BOTH run in the success path (setting the
+#     device alone never starts playback); on failure _fail(exc) + return.
 #     Store _source/_disc_hash. Any MPVError/OSError/SystemError/AttributeError -> transition(ERROR)
 #     + emit error_occurred(str(exc)) + log.exception. LOADING->PLAYING /
 #     LOADING->MENU_ACTIVE arrives later via _apply_menu_active.
@@ -849,16 +849,9 @@ class DvdPlaybackEngine(QObject):
             self._fail(exc)
             return
         try:
-            try:
-                player.dvd_device = source
-            except (AttributeError, MPVError, OSError, SystemError):
-                try:
-                    player.command(
-                        "loadfile", "dvdnav://", "replace", f"dvd-device={source}"
-                    )
-                except (MPVError, OSError, SystemError, AttributeError):
-                    player.play("dvdnav://")
-        except (MPVError, OSError, SystemError, AttributeError) as exc:
+            player.dvd_device = source
+            player.play("dvdnav://")
+        except (AttributeError, MPVError, OSError, SystemError) as exc:
             self._fail(exc)
             return
         self._source = source
