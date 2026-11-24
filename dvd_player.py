@@ -645,6 +645,10 @@ def check_environment(source: str) -> list[str]:
 #     down ~100 ms after creation, so every property read then raises
 #     ShutdownError). Assign _wid only AFTER the instance exists; on
 #     construction failure reset _wid=None and raise PlaybackError. Register property
+#     When DVD_PLAYER_SOFTWARE_RENDER=1: vo='gpu', gpu_context='x11egl'
+#     and LIBGL_ALWAYS_SOFTWARE=1 (llvmpipe) — fallback for NVIDIA-on-
+#     XWayland machines where all hardware GL contexts fail; DVD bitrates
+#     render fine in software.
 #     observers (python-mpv @self._player.property_observer decorator) for
 #     'time-pos', 'disc-menu-active', 'track-list', 'eof-reached' that emit
 #     the raw signals only (eof observer emits only when value is True).
@@ -798,15 +802,24 @@ class DvdPlaybackEngine(QObject):
         # locale (warns, and may crash, with comma-decimal locales).
         locale.setlocale(locale.LC_NUMERIC, "C")
         try:
-            player = mpv.MPV(
-                wid=str(wid),
-                input_default_bindings=False,
-                input_cursor=False,
-                osc=False,
-                osd_level=0,
-                keep_open=True,
-                idle=True,  # keep the libmpv core alive between loads
-            )
+            options: dict[str, Any] = {
+                "wid": str(wid),
+                "input_default_bindings": False,
+                "input_cursor": False,
+                "osc": False,
+                "osd_level": 0,
+                "keep_open": True,
+                "idle": True,  # keep the libmpv core alive between loads
+            }
+            if os.environ.get("DVD_PLAYER_SOFTWARE_RENDER") == "1":
+                # NVIDIA-on-XWayland: every hardware GL context fails there
+                # (Mesa has no NVIDIA DRI driver, NVIDIA EGL dmabuf import
+                # fails, GLX is indirect); llvmpipe via x11egl renders fine
+                # and DVD bitrates are light enough for software decode+scale.
+                os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+                options["vo"] = "gpu"
+                options["gpu_context"] = "x11egl"
+            player = mpv.MPV(**options)
         except Exception as exc:
             self._wid = None
             log.exception("mpv initialization failed")

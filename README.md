@@ -8,6 +8,9 @@ per-disc resume state.
 A single-file application: `dvd_player.py` (PyQt6 GUI + libmpv `dvdnav://`
 backend), packaged with `uv`.
 
+> Built by a multi-agent pipeline — see [docs/AGENTS.md](docs/AGENTS.md) for
+> the agent roster, activation protocol, and verification ledger.
+
 ---
 
 ## Features
@@ -143,6 +146,7 @@ discs, keyed by a per-disc hash).
 | Region-locked discs | CSS/region is bypassed by libdvdcss on RPC-1 drives; RPC-2 drives are flashed by the drive firmware itself — set the region in the drive's firmware tools (e.g. `regionset`) |
 | Scratching / unreadable disc | The app reports "playback did not start: disc unreadable or drive error" within 30 s instead of hanging |
 | No window on Wayland | The app forces `QT_QPA_PLATFORM=xcb` (XWayland) automatically, because libmpv embeds via native window handles; override with `QT_QPA_PLATFORM=wayland` if you don't need video embedding |
+| Black video / sound only on NVIDIA laptops (XWayland) | Hardware GL contexts fail on NVIDIA+XWayland (Mesa has no NVIDIA DRI driver, NVIDIA EGL dmabuf import fails, GLX is indirect). Launch with `DVD_PLAYER_SOFTWARE_RENDER=1 dvd-player` (llvmpipe software rendering — fine for DVD bitrates). The installed desktop entry already sets this on affected machines. |
 | Blank video in a VM | libmpv needs a real or virtual GPU context (Xvfb + `LIBGL_ALWAYS_SOFTWARE=1` for software rendering) |
 
 ## Notes & limitations
