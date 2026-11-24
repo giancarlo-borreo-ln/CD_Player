@@ -13,7 +13,7 @@ their activation protocol, and the verification evidence each one produces.
 | **2** | Xbox 360 GUI & Input Controller Engineer | flash#low | sections 5–6 (`Xbox360Osd`, `MainWindow` — video embed, OSD, D-pad keys/gamepad, autoplay) |
 | **3** | Formal Verification Professor | flash#low | **Black-box** mathematical auditor: receives ONLY the stripped spec (signatures + state-transition table + I/O contracts, all method bodies folded away). Derives safety/liveness invariants, pre/post conditions and executable boundary vectors; audits the SPEC itself for contradictions. |
 | **4** | Black-Box Red-Team Attacker | flash#low | Attacks the shipped artifact with zero source access: drives only the documented public API/signals with hostile inputs (injection, NaN/inf seeds, dialog floods, event floods, lifecycle abuse, state fuzz). |
-| **5** | Token & Context Engineering Controller | architect (in-session) | Compiles every handoff: AST body-folding, static-prefix prompts, `SHARED_STATE`/CLUES handoffs, ≤15-line masked observations, diff-only agent outputs with token ceilings (A1/A2 ≤600, A3/A4 ≤350), loop-breaker circuit (two failures on the same `(agent, symbol, error-signature)` without progress ⇒ rollback + root-cause escalation). |
+| **5** | Token & Context Engineering Controller | architect (in-session) | **The most important agent.** Compiles every handoff: AST body-folding, static-prefix prompts, `SHARED_STATE`/CLUES handoffs, ≤15-line masked observations, diff-only agent outputs with token ceilings (A1/A2 ≤600, A3/A4 ≤350), telegraphic prose, loop-breaker circuit (two failures on the same `(agent, symbol, error-signature)` without progress ⇒ rollback + root-cause escalation). No agent receives context that Agent 5 has not minimized. |
 | **6** | Blind Acceptance Tester | flash#low | A fresh user with zero code access: reads only `README.md` + the UAT transcript, uses the app like a normal user, and judges the Xbox 360 experience. Final gate of every release. |
 
 ## XML Activation Protocol (every dispatch)
@@ -100,6 +100,24 @@ Only a physical disc could expose these — both fixed and regression-tested:
 - `M4` README — `c7b72e6`
 - `M5` blind acceptance + real-disc fixes — `4717469` → `effa773`
 - Packaging (Rofi/launcher), C-locale, Wayland→xcb, software-render fallback — `395768e` → `d42894f`
+
+## Agent 5 blessing gate (mandatory for EVERY dispatch)
+
+No subagent may be spawned without Agent 5's blessing: a compiled prompt
+packet containing (1) folded context — only the target section's signatures
++ SPEC, everything else `# [FOLDED]`; (2) static prefix — `<role>`,
+`<constraints>`, `<output_format>` unchanged from the agent's last dispatch;
+(3) dynamic `<context>/<task>` slice at the bottom; (4) token budget
+(A1/A2 ≤600, A3/A4 ≤350, A6 ≤600); (5) masked observations (≤15 lines);
+(6) binary `<exit>` criterion. Every dispatch is recorded in the ledger:
+
+| # | target | folded scope | budget | exit | result |
+|---|---|---|---|---|---|
+| 1 | A1 backend | §4 + SPEC | 350 | suites green | PASS |
+| 2 | A2 GUI | §5–6 + SPEC | 400 | suites green | PASS |
+| 3 | A3 formal | spec-only | 350 | verdict | FAIL→C1/C2/C3 |
+| 4 | A4 blackbox | public API | 350 | ≥30 asserts | pending |
+| 5 | A6 acceptance | README+transcript | 600 | 9 scenarios | pending |
 
 ## Protocol overrides (user-issued, mid-execution)
 

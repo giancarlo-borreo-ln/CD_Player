@@ -600,11 +600,14 @@ def check_environment(source: str) -> list[str]:
 #     tracks_changed = pyqtSignal(object, object) # (audio_list, sub_list)
 #     playback_ended = pyqtSignal()
 #     error_occurred = pyqtSignal(str)
-#     (private raw signals emitted ONLY from mpv observer callbacks:
+#     disc_hash_ready = pyqtSignal(str)  # (async DiscIdentity digest)
+#     (private raw signals emitted ONLY from mpv observer callbacks and the
+#      disc-hash worker:
 #      _menu_active_raw = pyqtSignal(bool)
 #      _time_pos_raw = pyqtSignal(float)
 #      _tracks_raw = pyqtSignal(object)
 #      _eof_raw = pyqtSignal()
+#      _disc_hash_raw = pyqtSignal(object)  # {"ok":bool,"hash"|"error":str}
 #      Connect them to private handlers in __init__; Qt auto-queues
 #      cross-thread emissions so handlers always run on the GUI thread.)
 #   Public API (signatures exact):
@@ -637,8 +640,9 @@ def check_environment(source: str) -> list[str]:
 #   * __init__: QObject ctor; StateMachine(IDLE); ResumeStore();
 #     _player=None, _wid=None, _source=None, _disc_hash=None,
 #     _pending_resume=None, _menu_active=False, _speed=1.0, _audio=[],
-#     _subs=[]; connect raw signals to private handlers (_apply_menu_active,
-#     _apply_time_pos, _apply_tracks, _apply_eof).
+#     _subs=[], _hash_worker=None; connect raw signals to private handlers
+#     (_apply_menu_active, _apply_time_pos, _apply_tracks, _apply_eof,
+#     _apply_disc_hash).
 #   * attach_widget(wid): idempotent while attached. Create mpv.MPV(
 #     wid=str(wid), input_default_bindings=False, input_cursor=False,
 #     osc=False, osd_level=0, keep_open=True, idle=True — idle=True keeps
@@ -655,14 +659,34 @@ def check_environment(source: str) -> list[str]:
 #     the raw signals only (eof observer emits only when value is True).
 #   * load(source): allowed from {IDLE, STOPPED, EJECTED, ERROR}, else
 #     PlaybackError. transition(LOADING); _ensure_player() — on failure
-#     _fail(exc) (LOADING->ERROR + error_occurred emitted) then raise. Compute
-#     DiscIdentity.compute(source) (PlaybackError -> transition(ERROR) +
-#     emit error_occurred + return). Set player.dvd_device = source THEN
-#     player.play("dvdnav://") — BOTH run in the success path (setting the
-#     device alone never starts playback); on failure _fail(exc) + return.
-#     Store _source/_disc_hash. Any MPVError/OSError/SystemError/AttributeError -> transition(ERROR)
-#     + emit error_occurred(str(exc)) + log.exception. LOADING->PLAYING /
-#     LOADING->MENU_ACTIVE arrives later via _apply_menu_active.
+#     _fail(exc) (LOADING->ERROR + error_occurred emitted) then raise.
+#     Immediately AFTER obtaining the player and BEFORE touching dvd_device,
+#     reset carryover transport (aid/sid auto, speed 1.0, pause off) plus
+#     _speed = 1.0 — mpv keeps these across load() and DVD track ids are
+#     per-title, so a stale aid/sid would select the wrong stream. Each
+#     reset is NON-FATAL (only log.debug; never _fail / never leaves
+#     LOADING). Set
+#     player.dvd_device = source THEN player.play("dvdnav://") — BOTH run in
+#     the success path (setting the device alone never starts playback); on
+#     failure _fail(exc) + return. Store _source, reset _disc_hash=None, then
+#     START the async hash worker: load NEVER reads the disc on the GUI
+#     thread, so playback begins immediately. The hash (and a resume prompt)
+#     arrives later while PLAYING. Any MPVError/OSError/SystemError/
+#     AttributeError -> transition(ERROR) + emit error_occurred(str(exc)) +
+#     log.exception. LOADING->PLAYING / LOADING->MENU_ACTIVE arrives later
+#     via _apply_menu_active; hash failures are only logged (playback errors
+#     surface through mpv/watchdog).
+#   * _start_hash_worker(source, epoch): daemon threading.Thread running
+#     DiscIdentity.compute(source); it emits ONLY _disc_hash_raw with
+#     {"ok": True, "hash": str, "epoch": int} or {"ok": False, "error": str,
+#     "epoch": int} (emit wrapped in try/except RuntimeError for shutdown);
+#     kept on _hash_worker. load()/eject()/dispose() bump _hash_epoch so
+#     in-flight workers of a previous disc are invalidated.
+#   * _apply_disc_hash(payload) — GUI-thread handler for _disc_hash_raw:
+#     payloads whose epoch != current _hash_epoch are DROPPED (stale-hash
+#     guard). On ok -> _disc_hash = hash; emit disc_hash_ready(hash). On
+#     error -> log.warning only (no state change, no error_occurred).
+
 #   * load watchdog: entering LOADING starts a singleShot
 #     QTimer(LOAD_TIMEOUT_MS); every _transition out of LOADING stops it.
 #     _on_load_timeout() fires _fail(PlaybackError("playback did not start:
@@ -697,9 +721,12 @@ def check_environment(source: str) -> list[str]:
 #   * seek_to(seconds): {PLAYING, PAUSED} only; player.time_pos = seconds.
 #   * adjust_volume(delta): player.volume = min(150, max(0, volume + delta)).
 #   * resume_disc(saved): _pending_resume = dict(saved). Applied AT MOST
-#     ONCE by _apply_pending_resume() on the first transition into PLAYING
-#     after staging (the stage is cleared BEFORE applying, so a later
-#     PAUSED->PLAYING unpause never re-applies it):
+#     ONCE by _apply_pending_resume(): IMMEDIATELY when staged while state
+#     is PLAYING and not _menu_active and _player is not None (the async
+#     hash/prompt often arrives after playback started), otherwise on the
+#     first transition into PLAYING after staging (the stage is cleared
+#     BEFORE applying, so a later PAUSED->PLAYING unpause never re-applies
+#     it):
 #     title (int, not None) -> disc_title = title; chapter (int, not None)
 #     -> chapter = chapter; pos (float > 0) -> time_pos = pos; then clear.
 #     All best-effort inside try/except (resume must never break playback).
@@ -714,8 +741,9 @@ def check_environment(source: str) -> list[str]:
 #     (legal from EVERY state except EJECTED — console tray semantics; the
 #     transition is wrapped in try/except and a rejected transition only
 #     logs; the load watchdog is disarmed by the non-LOADING transition).
-#   * dispose: idempotent; _save_resume_now(); if _player: terminate and
-#     _player=None. Does NOT change state.
+#   * dispose: idempotent; stops the load watchdog and bumps _hash_epoch
+#     (invalidates any in-flight disc-hash worker); _save_resume_now(); if
+#     _player: terminate and _player=None. Does NOT change state.
 #   * _ensure_player: raise PlaybackError("engine not attached to a video
 #     widget yet (attach_widget first)") when _player is None.
 #   * _save_resume_now: when _disc_hash and state in {PLAYING, PAUSED,
@@ -760,7 +788,8 @@ def check_environment(source: str) -> list[str]:
 #     property extracts the time from either shape.
 #   * Threading contract: ALL public methods GUI-thread-only. mpv observers
 #     run on mpv's thread and may ONLY emit raw signals — never touch the
-#     StateMachine, never emit public signals directly.
+#     StateMachine, never emit public signals directly. The disc-hash worker
+#     thread may ONLY emit _disc_hash_raw (and nothing else).
 # ── [AGENT1: SECTION 4 BEGIN] ──
 class DvdPlaybackEngine(QObject):
     """libmpv/dvdnav backend; all public methods are GUI-thread-only."""
@@ -771,11 +800,13 @@ class DvdPlaybackEngine(QObject):
     tracks_changed = pyqtSignal(object, object, arguments=())
     playback_ended = pyqtSignal(arguments=())
     error_occurred = pyqtSignal(str, arguments=())
+    disc_hash_ready = pyqtSignal(str, arguments=())
 
     _menu_active_raw = pyqtSignal(bool, arguments=())
     _time_pos_raw = pyqtSignal(float, arguments=())
     _tracks_raw = pyqtSignal(object, arguments=())
     _eof_raw = pyqtSignal(arguments=())
+    _disc_hash_raw = pyqtSignal(object, arguments=())
 
     def __init__(self, parent: QObject | None = None) -> None:
         """Wire raw observer signals and start in IDLE."""
@@ -793,10 +824,13 @@ class DvdPlaybackEngine(QObject):
         self._subs: list[dict[str, object]] = []
         self._disposed = False
         self._title_menu_logged = False
+        self._hash_worker: Any = None
+        self._hash_epoch = 0  # stale-hash guard: workers carry their epoch
         self._menu_active_raw.connect(self._apply_menu_active)
         self._time_pos_raw.connect(self._apply_time_pos)
         self._tracks_raw.connect(self._apply_tracks)
         self._eof_raw.connect(self._apply_eof)
+        self._disc_hash_raw.connect(self._apply_disc_hash)
         self._load_watchdog = QTimer(self)
         self._load_watchdog.setSingleShot(True)
         self._load_watchdog.setInterval(LOAD_TIMEOUT_MS)
@@ -871,11 +905,7 @@ class DvdPlaybackEngine(QObject):
         except PlaybackError as exc:
             self._fail(exc)
             raise
-        try:
-            disc_hash = DiscIdentity.compute(source)
-        except PlaybackError as exc:
-            self._fail(exc)
-            return
+        self._reset_carryover_transport(player)
         try:
             player.dvd_device = source
             player.play("dvdnav://")
@@ -883,7 +913,9 @@ class DvdPlaybackEngine(QObject):
             self._fail(exc)
             return
         self._source = source
-        self._disc_hash = disc_hash
+        self._disc_hash = None
+        self._hash_epoch += 1  # invalidate any in-flight worker of a previous disc
+        self._start_hash_worker(source, self._hash_epoch)
 
     def play_pause(self) -> None:
         """Toggle pause for PLAYING/PAUSED; A selects inside menus."""
@@ -1038,8 +1070,14 @@ class DvdPlaybackEngine(QObject):
             self._fail(exc)
 
     def resume_disc(self, saved: dict) -> None:  # type: ignore[type-arg]
-        """Stage a saved resume entry, applied on the next PLAYING state."""
+        """Stage a saved resume entry, applied now when already PLAYING."""
         self._pending_resume = dict(saved) if saved else None
+        if (
+            self.state is PlayerState.PLAYING
+            and not self._menu_active
+            and self._player is not None
+        ):
+            self._apply_pending_resume()
 
     def capture_frame(self) -> tuple[int, int, bytes] | None:
         """Return (width, height, bgr0_bytes) of the current video frame, or
@@ -1083,6 +1121,7 @@ class DvdPlaybackEngine(QObject):
     def eject(self) -> None:
         """Save state, terminate mpv, eject the disc and enter EJECTED."""
         self._save_resume_now()
+        self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
         source = self._source
         player = self._player
         self._player = None
@@ -1112,6 +1151,7 @@ class DvdPlaybackEngine(QObject):
             return
         self._disposed = True
         self._load_watchdog.stop()
+        self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
         self._save_resume_now()
         player = self._player
         self._player = None
@@ -1246,6 +1286,50 @@ class DvdPlaybackEngine(QObject):
             )
         return self._player
 
+    def _reset_carryover_transport(self, player: Any) -> None:
+        """Clear transport state mpv carries over from the previous title/disc."""
+        for name, value in (
+            ("aid", "auto"),
+            ("sid", "auto"),
+            ("speed", 1.0),
+            ("pause", False),
+        ):
+            try:
+                setattr(player, name, value)
+            except (
+                MPVError,
+                OSError,
+                SystemError,
+                AttributeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                log.debug("could not reset mpv %s on load: %s", name, exc)
+        self._speed = 1.0
+
+    def _start_hash_worker(self, source: str, epoch: int) -> None:
+        """Compute the disc hash off the GUI thread; only raw signals cross."""
+        import threading
+
+        def _work() -> None:
+            payload: dict[str, object]
+            try:
+                payload = {
+                    "ok": True,
+                    "hash": DiscIdentity.compute(source),
+                    "epoch": epoch,
+                }
+            except Exception as exc:  # noqa: BLE001 - errors travel in the payload
+                payload = {"ok": False, "error": str(exc), "epoch": epoch}
+            try:
+                self._disc_hash_raw.emit(payload)
+            except RuntimeError:
+                log.debug("disc hash signal dropped: engine already destroyed")
+
+        worker = threading.Thread(target=_work, daemon=True, name="disc-hash")
+        self._hash_worker = worker
+        worker.start()
+
     def _discnav(self, *args: object) -> None:
         """Send a dvdnav command; failures are non-fatal and only logged."""
         player = self._player
@@ -1314,6 +1398,21 @@ class DvdPlaybackEngine(QObject):
         if self.state is PlayerState.PLAYING and self._pending_resume:
             self._apply_pending_resume()
         self.menu_active_changed.emit(self._menu_active)
+
+    def _apply_disc_hash(self, payload: object) -> None:
+        """Apply the worker's hash result on the GUI thread (stale epochs dropped)."""
+        if not isinstance(payload, dict):
+            return
+        if payload.get("epoch") != self._hash_epoch:
+            log.debug("stale disc hash dropped (epoch %s)", payload.get("epoch"))
+            return
+        if payload.get("ok"):
+            value = payload.get("hash")
+            if isinstance(value, str):
+                self._disc_hash = value
+                self.disc_hash_ready.emit(value)
+            return
+        log.warning("could not identify disc: %s", payload.get("error"))
 
     def _apply_pending_resume(self) -> None:
         """Best-effort restore of the staged resume entry."""
@@ -1544,6 +1643,13 @@ class Xbox360Osd(QWidget):
         self._scrub_pressed = False
         self._scrub_x = None
         super().hideEvent(event)  # type: ignore[arg-type]
+
+    def hide(self) -> None:
+        """Hide the strip and always drop preview/scrub state."""
+        self._preview = None
+        self._scrub_pressed = False
+        self._scrub_x = None
+        super().hide()
 
     def set_preview(self, image: QImage | None) -> None:
         """Store the snapshot shown above the bar while scrubbing."""
@@ -1885,6 +1991,7 @@ class Xbox360Osd(QWidget):
 #     _on_osd_button(self, action: str) -> None
 #     _on_video_mouse(self, obj, event: QMouseEvent) -> None
 #     _show_resume_prompt(self, disc_hash: str, saved: dict) -> None
+#     _on_disc_hash(self, disc_hash: str) -> None
 #     _sync_osd(self) -> None
 #     _on_scrub_pressed(self, fraction: float) -> None
 #     _on_scrub_moved(self, fraction: float) -> None
@@ -1995,15 +2102,26 @@ class Xbox360Osd(QWidget):
 #     the joined text (no modal, zero-click flow); not quiet:
 #     QMessageBox.warning joined text ('…\nProceeding anyway.') but ONLY
 #     when the source exists (a missing source skips the warning so the
-#     subsequent critical reads as one clear message).
-#     DiscIdentity.compute(source) -> on PlaybackError: quiet: self.status
-#     message; not quiet: QMessageBox.critical; return. saved =
-#     ResumeStore().get(hash): when saved: _show_resume_prompt(hash, saved)
-#     (modal in both modes — the console resume question) else
-#     engine.load(source).
+#     subsequent critical reads as one clear message). When the source does
+#     not exist (os.stat fails / os.path.exists false) and is not a block
+#     device (stat.S_ISBLK): quiet -> self.status 'cannot access disc
+#     source …'; not quiet -> QMessageBox.critical with the same text;
+#     return. The GUI NEVER computes a disc hash here: it then calls
+#     _play_source(source) directly so playback starts immediately.
+#   * _on_disc_hash(disc_hash): connected to engine.disc_hash_ready (the
+#     backend emits it from a worker thread once the hash is known).
+#     saved = ResumeStore().get(disc_hash); no entry -> nothing. Show the
+#     resume prompt ONLY while playback is still early: engine.state is
+#     PlayerState.LOADING, or less than 15 s elapsed since _load_source
+#     started (self._load_started_at — a slow hash arrival on USB still
+#     gets its prompt). Otherwise playback has moved on: silently skip.
+#     When shown, delegate to _show_resume_prompt(disc_hash, saved).
 #   * _show_resume_prompt: QMessageBox.question 'Resume playback from
-#     mm:ss?' (Yes -> engine.load(source) then engine.resume_disc(saved);
-#     No -> ResumeStore().forget(hash) then engine.load(source)).
+#     mm:ss?' (Yes -> ONLY engine.resume_disc(saved), applied immediately
+#     by the backend when PLAYING or staged otherwise; No -> ONLY
+#     ResumeStore().forget(hash)). The prompt NEVER loads: _load_source /
+#     _play_source is the only load path, since playback already started
+#     before the async hash arrived.
 #   * _on_osd_button: 'play_pause' -> play_pause; 'stop' -> stop;
 #     'ff' -> _cycle_speed(+1); 'rw' -> _cycle_speed(-1); 'prev' ->
 #     previous_chapter; 'next' -> next_chapter; 'audio' -> cycle_audio;
@@ -2040,6 +2158,7 @@ class MainWindow(QMainWindow):
         self._gamepad_unavailable = False
         self._disc_presence: dict[str, bool | None] = {}
         self._disc_gone_streak: dict[str, int] = {}
+        self._load_started_at = 0.0
         self._auto_detected = False
         self._scrub_active = False
         self._scrub_fraction: float | None = None
@@ -2100,6 +2219,9 @@ class MainWindow(QMainWindow):
         engine.tracks_changed.connect(self._on_tracks)
         engine.menu_active_changed.connect(self._on_menu_active)
         engine.error_occurred.connect(self._on_engine_error)
+        disc_hash_ready = getattr(engine, "disc_hash_ready", None)
+        if disc_hash_ready is not None:
+            disc_hash_ready.connect(self._on_disc_hash)
 
         self._gamepad_timer = QTimer(self)
         self._gamepad_timer.setInterval(GAMEPAD_POLL_MS)
@@ -2424,6 +2546,7 @@ class MainWindow(QMainWindow):
     def _load_source(self, source: str, quiet: bool = False) -> None:
         """Check the source, offer resume state and load it."""
         self._attach_engine()
+        self._load_started_at = time.monotonic()
         if source in list_dvd_devices():
             self._disc_presence[source] = True  # avoid a poller double-load
         problems = check_environment(source)
@@ -2440,19 +2563,19 @@ class MainWindow(QMainWindow):
                     joined + "\nProceeding anyway.",
                 )
         try:
-            disc_hash = DiscIdentity.compute(source)
-        except PlaybackError as exc:
+            info = os.stat(source)
+            is_block = stat.S_ISBLK(info.st_mode)
+        except OSError:
+            is_block = False
+        if not os.path.exists(source) and not is_block:
+            message = f"cannot access disc source {source!r}"
             if quiet:
-                self._set_status(str(exc))
+                self._set_status(message)
             else:
-                QMessageBox.critical(self, "Cannot read disc", str(exc))
+                QMessageBox.critical(self, "Cannot access source", message)
             return
         self._pending_source = source
-        saved = ResumeStore().get(disc_hash)
-        if saved:
-            self._show_resume_prompt(disc_hash, saved)
-        else:
-            self._play_source(source)
+        self._play_source(source)
 
     def _play_source(self, source: str) -> None:
         """Load ``source``; an illegal-state PlaybackError -> status only."""
@@ -2626,8 +2749,19 @@ class MainWindow(QMainWindow):
                 self.osd.show_osd()
 
     # ── resume & OSD sync ───────────────────────────────────────────
+    def _on_disc_hash(self, disc_hash: str) -> None:
+        """Offer resume state when the backend delivers the disc hash."""
+        saved = ResumeStore().get(disc_hash)
+        if not saved:
+            return
+        elapsed = time.monotonic() - self._load_started_at
+        early = self.engine.state is PlayerState.LOADING or elapsed < 15.0
+        if not early:
+            return
+        self._show_resume_prompt(disc_hash, saved)
+
     def _show_resume_prompt(self, disc_hash: str, saved: dict) -> None:  # type: ignore[type-arg]
-        """Ask whether to resume, then load the disc."""
+        """Offer to resume the already-loading disc; never load it again."""
         position = saved.get("pos")
         try:
             seconds = float(position) if isinstance(position, (int, float)) else 0.0
@@ -2642,13 +2776,10 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
-        source = self._pending_source or self.source.text().strip()
         if answer == QMessageBox.StandardButton.Yes:
-            self._play_source(source)
             self.engine.resume_disc(saved)
         else:
             ResumeStore().forget(disc_hash)
-            self._play_source(source)
 
     def _set_status(self, text: str) -> None:
         """Show status text, elided to fit (full text in the tooltip)."""
