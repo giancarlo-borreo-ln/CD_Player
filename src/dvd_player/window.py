@@ -1551,6 +1551,9 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     (>=320x180, window-scaled) rounded thumbnail painted by
 #     ScrubPreviewOverlay above the video, never clipped by the 64 px OSD
 #     strip, stamped with the frame position via Xbox360Osd._fmt_time.
+#     After the capture RETURNS, re-check _scrub_active and the current
+#     fraction: a release during grabFramebuffer/capture_frame drops the
+#     frame instead of resurrecting a cleared preview (Loki race).
 #     osd.set_preview(image) remains the capture hand-off/test seam.
 #     On release: final seek_to for the last fraction (no capture),
 #     osd.set_preview(None), scrub_preview.clear() and reset the
@@ -2722,19 +2725,23 @@ class MainWindow(QMainWindow):
         now = time.monotonic()
         if now - self._scrub_last_capture < self.SCRUB_CAPTURE_MS / 1000.0:
             return
+        fraction = self._scrub_fraction
+        if fraction is None:
+            return
         image = (
             self._render_scrub_frame()
             if self._render_mode
             else self._wid_scrub_frame()
         )
+        # A release can arrive while the frame grab runs. Re-check the
+        # scrub state and fraction AFTER the capture: never resurrect a
+        # preview that the release already cleared.
+        if not self._scrub_active or self._scrub_fraction != fraction:
+            return
         self._scrub_last_capture = now
         if image is None or image.isNull():
             return
-        seconds = (
-            self._scrub_seconds(self._scrub_fraction)
-            if self._scrub_fraction is not None
-            else None
-        )
+        seconds = self._scrub_seconds(fraction)
         snapshot = image.copy()
         self.osd.set_preview(snapshot)
         self.osd.set_preview_time(seconds)

@@ -887,6 +887,38 @@ check(
     scrub_window.osd._preview_seconds is None,
     "render release kept the preview timestamp",
 )
+
+# Loki release race: a release DURING grabFramebuffer must not resurrect
+# the preview after the capture returns.
+_release_grabs: list[int] = []
+
+
+def _releasing_grab() -> QImage:
+    _release_grabs.append(1)
+    scrub_window._on_scrub_released()
+    return _render_image
+
+
+scrub_window.video.grabFramebuffer = _releasing_grab  # type: ignore[method-assign]
+_seeks.clear()
+_preview_calls.clear()
+scrub_window._on_scrub_pressed(0.25)
+check(_release_grabs == [1], "release-race grab did not run")
+check(scrub_window.osd._preview is None, "release during grab resurrected preview")
+check(
+    scrub_window.scrub_preview._image is None,
+    "release during grab resurrected overlay preview",
+)
+check(
+    _preview_calls and _preview_calls[-1] is None,
+    "release during grab ended with a non-None preview",
+)
+check(
+    not scrub_window._scrub_active
+    and scrub_window._scrub_fraction is None
+    and scrub_window._scrub_last_capture == 0.0,
+    "release during grab did not reset scrub state",
+)
 scrub_window._render_mode = False
 scrub_engine._player = None
 scrub_window.close()
