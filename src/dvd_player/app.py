@@ -20,9 +20,17 @@ from .window import MainWindow, render_mode_requested
 def choose_platform(env: Mapping[str, str] | None = None) -> str | None:
     """Pick QT_QPA_PLATFORM for this session (None leaves it untouched).
 
-    R8: wid embedding needs xcb on Wayland (XWayland); the render API can
-    use native Wayland, so it is preferred there. An explicit xcb/wayland
-    choice is never overridden, and non-Wayland launches are untouched.
+    R8 precedence, highest first:
+    1. an explicit ``xcb``/``wayland`` choice in QT_QPA_PLATFORM is honored;
+    2. no WAYLAND_DISPLAY -> untouched (native X11/offscreen);
+    3. render API requested (DVD_PLAYER_RENDER_MODE/API) -> ``wayland``:
+       the GL surface owns its context, so no wid/XWayland is needed;
+    4. otherwise (wid embedding, with software fallback) -> ``xcb``.
+
+    wid embedding needs xcb on Wayland (XWayland); the render API can use
+    native Wayland, so it is preferred there. This decision must run before
+    QApplication exists and is never pre-empted by an import-time mutation:
+    a refused wid attach is handled at runtime by ``attach_widget``.
     """
     source = os.environ if env is None else env
     current = source.get("QT_QPA_PLATFORM", "").strip().lower()
@@ -40,7 +48,7 @@ def main() -> int:
     foreign-window (wid) embedding works via XWayland; embedding arbitrary
     native windows is not possible on the native Wayland Qt platform.
     The render API is the exception: it owns its GL surface, so native
-    Wayland is preferred there (R8).
+    Wayland is preferred there (R8). See choose_platform for precedence.
     """
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"

@@ -1099,29 +1099,6 @@ def wid_embedding_safe() -> bool:
     return bool(app.platformName() != "wayland")
 
 
-def _select_qt_platform() -> None:
-    """Pin wid embedding to xcb before QApplication exists (R8).
-
-    Imported by ``dvd_player.app`` before ``QApplication(sys.argv)``, so a
-    Wayland session (including the hybrid ``wayland;xcb`` value) is routed
-    through XWayland when the render API is not requested. Without this the
-    wid path would receive a Wayland surface id and mpv would kill the
-    process on the first disc load. Render mode keeps native Wayland.
-    """
-    if QApplication.instance() is not None or render_mode_requested():
-        return
-    current = os.environ.get("QT_QPA_PLATFORM", "").strip().lower()
-    if "wayland" not in current:
-        return
-    if not os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("DISPLAY"):
-        return
-    os.environ["QT_QPA_PLATFORM"] = "xcb"
-    log.debug("wid embedding needs X11: pinned QT_QPA_PLATFORM=xcb (was %r)", current)
-
-
-_select_qt_platform()
-
-
 class VideoGLWidget(QOpenGLWidget):
     """GL surface fed by the engine's render API (R6).
 
@@ -1660,13 +1637,15 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     _return_to_dashboard(): HomeMenu returns while the menu keeps running.
 #     _teardown_preview() clears all preview state on eject, loaded-disc
 #     removal (>=2 polls) and app close (stop guarded to preview states).
-#   * Platform gate (fix): window.py is imported before QApplication.main()
-#     creates the app. On a Wayland session without the render API it pins
-#     QT_QPA_PLATFORM=xcb (XWayland) because wid embedding needs a real X11
-#     window id. If native Wayland survives anyway (no DISPLAY), both
-#     initializeGL's wid fallback and _attach_engine refuse wid embedding
-#     instead of passing a wl_surface pointer to Xlib, which aborts the
-#     process with an uncatchable X BadWindow error on first load.
+#   * Platform gate (fix): app.choose_platform decides QT_QPA_PLATFORM
+#     before QApplication.main() creates the app — render mode on a Wayland
+#     session gets native Wayland; the wid path gets xcb (XWayland) because
+#     it needs a real X11 window id. window.py never mutates the environment
+#     at import time. If native Wayland survives anyway (no DISPLAY, or an
+#     explicit wayland choice), both initializeGL's wid fallback and
+#     _attach_engine refuse wid embedding at runtime instead of passing a
+#     wl_surface pointer to Xlib, which aborts the process with an
+#     uncatchable X BadWindow error on first load.
 #   * HomeMenu presentation (2026 redesign; paint-only, no QSS/assets):
 #     structured HomeEntry(title, subtitle, payload) rows (entries() stays
 #     the legacy (text, payload) projection). Frosted glassmorphism: a dark

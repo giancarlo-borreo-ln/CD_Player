@@ -903,6 +903,12 @@ check(
 )
 check(
     dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "DVD_PLAYER_RENDER_MODE": "wid"}
+    ) == "xcb",
+    "wid mode on Wayland did not select xcb",
+)
+check(
+    dp_app.choose_platform(
         {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": "xcb"}
     ) is None,
     "explicit xcb choice was overridden",
