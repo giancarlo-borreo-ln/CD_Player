@@ -28,6 +28,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -76,6 +77,9 @@ class HomeMenu(QWidget):
     labels_ready = pyqtSignal(object, arguments=())
 
     BLADES: ClassVar[tuple[str, ...]] = ("DVD", "USB", "Storage")
+    # A key repeat or a double tap must never re-enter the load flow while
+    # the first load is still in LOADING (Enter is edge-triggered).
+    SELECT_DEBOUNCE_S: ClassVar[float] = 0.35
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """Build the launcher; it starts hidden."""
@@ -84,6 +88,7 @@ class HomeMenu(QWidget):
         # so the Xbox-green border, label and entry rows always paint.
         self._blade = 0
         self._selection = 0
+        self._last_select_at = 0.0
         self._dvd_devices: list[str] = []
         self._dvd_present: dict[str, bool | None] = {}
         self._labels: dict[str, str] = {}
@@ -239,6 +244,9 @@ class HomeMenu(QWidget):
         self.update()
 
     def _select(self) -> None:
+        now = time.monotonic()
+        if now - self._last_select_at < self.SELECT_DEBOUNCE_S:
+            return  # key repeat / double tap: the first Enter is in charge
         entries = self.entries()
         if not entries:
             return
@@ -251,6 +259,7 @@ class HomeMenu(QWidget):
             return
         if self._blade == 0 and self._dvd_present.get(payload) is False:
             return
+        self._last_select_at = now
         self.entry_selected.emit(payload)
 
     def handle_key(self, key: int) -> bool:
@@ -708,6 +717,43 @@ def render_mode_active(
     return render_mode_requested(env)
 
 
+def wid_embedding_safe() -> bool:
+    """Whether the active Qt platform supplies real X11 window ids for mpv.
+
+    Native Wayland ``winId()`` is a wl_surface pointer, not an X Window:
+    handing it to mpv's x11 EGL video output makes Xlib abort the process
+    with ``BadWindow`` on ``X_DestroyWindow``. Only xcb (or a platform
+    without native windows, e.g. offscreen tests) may use the wid path.
+    """
+    app: QApplication | None = QApplication.instance()
+    if app is None:
+        return True
+    return bool(app.platformName() != "wayland")
+
+
+def _select_qt_platform() -> None:
+    """Pin wid embedding to xcb before QApplication exists (R8).
+
+    Imported by ``dvd_player.app`` before ``QApplication(sys.argv)``, so a
+    Wayland session (including the hybrid ``wayland;xcb`` value) is routed
+    through XWayland when the render API is not requested. Without this the
+    wid path would receive a Wayland surface id and mpv would kill the
+    process on the first disc load. Render mode keeps native Wayland.
+    """
+    if QApplication.instance() is not None or render_mode_requested():
+        return
+    current = os.environ.get("QT_QPA_PLATFORM", "").strip().lower()
+    if "wayland" not in current:
+        return
+    if not os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("DISPLAY"):
+        return
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
+    log.debug("wid embedding needs X11: pinned QT_QPA_PLATFORM=xcb (was %r)", current)
+
+
+_select_qt_platform()
+
+
 class VideoGLWidget(QOpenGLWidget):
     """GL surface fed by the engine's render API (R6).
 
@@ -763,6 +809,12 @@ class VideoGLWidget(QOpenGLWidget):
             self._render_attached = True
             return
         self._render_attached = False
+        if not wid_embedding_safe():
+            log.warning(
+                "render attach failed on native Wayland: wid embedding is "
+                "unavailable, refusing to pass a Wayland surface id to Xlib"
+            )
+            return
         fallback = getattr(self._engine, "attach_widget", None)
         if not callable(fallback):
             log.warning("render attach refused and no wid fallback exists")
@@ -1017,7 +1069,16 @@ class VideoGLWidget(QOpenGLWidget):
 #     VIDEO_TS (dir or ISO) then load; Storage entry -> _browse_for_source()
 #     then load (Ctrl+L flow). Escape closes the menu only; G opens it;
 #     M keeps toggling the OSD independently. Keys are captured by the menu
-#     while it is visible (no engine actions leak through).
+#     while it is visible (no engine actions leak through). Enter is
+#     edge-triggered: a repeat/double press inside HomeMenu.SELECT_DEBOUNCE_S
+#     (0.35 s) is ignored so one blade press starts exactly one load.
+#   * Platform gate (fix): window.py is imported before QApplication.main()
+#     creates the app. On a Wayland session without the render API it pins
+#     QT_QPA_PLATFORM=xcb (XWayland) because wid embedding needs a real X11
+#     window id. If native Wayland survives anyway (no DISPLAY), both
+#     initializeGL's wid fallback and _attach_engine refuse wid embedding
+#     instead of passing a wl_surface pointer to Xlib, which aborts the
+#     process with an uncatchable X BadWindow error on first load.
 #   * ChapterGrid overlay (C): key C in PLAYING/PAUSED opens it with
 #     engine.chapter_list; arrows navigate, Enter schedules ONE coalesced
 #     engine.seek_to(chapter time) after the grid's 350 ms settle; Escape or
@@ -1491,6 +1552,7 @@ class MainWindow(QMainWindow):
     # ── engine signal handlers ──────────────────────────────────────
     def _on_engine_state(self, state: PlayerState) -> None:
         """Reflect the new state in the status label and OSD."""
+        log.debug("state -> %s", state.name)
         self._set_status(state.name)
         self._update_window_title()
         self._sync_osd()
@@ -1565,6 +1627,7 @@ class MainWindow(QMainWindow):
 
     def _on_home_selected(self, path: str) -> None:
         """Load the entry chosen on the DVD/USB blade."""
+        log.debug("home select %r", path)
         source = path
         if path not in list_dvd_devices():
             resolved = self._resolve_dvd_source(path)
@@ -2030,6 +2093,16 @@ class MainWindow(QMainWindow):
         else:
             if isinstance(self.video, VideoGLWidget):
                 log.info("render API unavailable; falling back to wid embedding")
+            if not wid_embedding_safe():
+                log.error(
+                    "wid embedding cannot work on Qt platform %r: set "
+                    "DVD_PLAYER_RENDER_MODE=render or use xcb",
+                    QApplication.instance().platformName()
+                    if QApplication.instance() is not None
+                    else "?",
+                )
+                self._set_status("video surface unavailable on this platform")
+                return
             try:
                 self.engine.attach_widget(int(self.video.winId()))
             except PlaybackError as exc:

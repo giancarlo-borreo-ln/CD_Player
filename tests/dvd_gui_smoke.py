@@ -980,6 +980,21 @@ check(green_pixels > 100,
       f"active blade is not green at open: {green_pixels} px")
 launch_menu.deleteLater()
 
+# Enter is edge-triggered: a rapid double press selects exactly once, so
+# one blade press can never re-enter the load flow while LOADING.
+dedupe_menu = dp.HomeMenu()
+import dvd_player.window as _window_mod  # noqa: E402
+dedupe_menu._dvd_devices = ["/dev/sr0"]
+dedupe_menu._dvd_present = {"/dev/sr0": True}
+_picked: list[str] = []
+dedupe_menu.entry_selected.connect(_picked.append)
+dedupe_menu.handle_key(Qt.Key.Key_Return.value)
+dedupe_menu.handle_key(Qt.Key.Key_Return.value)
+check(_picked == ["/dev/sr0"], f"double Enter selected {_picked}")
+check(_window_mod.wid_embedding_safe() is True,
+      "wid path wrongly rejected on a non-Wayland platform")
+dedupe_menu.deleteLater()
+
 # ── (o) C1/C2: ChapterGrid fidelity + burst coalescing ─────────────
 class _ChapterPlayer:
     time_pos: float | None = 0.0
