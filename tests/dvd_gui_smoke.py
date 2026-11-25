@@ -1601,6 +1601,52 @@ finally:
     _engine_mod.RenderContext = _orig_render_context
     _engine_mod.mpv.MPV = _orig_mpv_factory
 
+# Regression: QOpenGLContext.getProcAddress() only accepts bytes, while the
+# render.py callback passes the GL name as str. The widget loader wrapper must
+# re-encode, or every lookup raises TypeError and the render create fails.
+import ctypes as _ctypes  # noqa: E402
+
+_render_mod = sys.modules["dvd_player.render"]
+_qt_proc_names: list[object] = []
+
+
+def _fake_qt_get_proc_address(name: object) -> int:
+    _qt_proc_names.append(name)
+    if not isinstance(name, (bytes, bytearray)):
+        raise TypeError(
+            f"getProcAddress(...): argument 1 has unexpected type "
+            f"'{type(name).__name__}'"
+        )
+    return 0x5EED
+
+
+_wrapped_proc = _winmod._bytes_proc_loader(_fake_qt_get_proc_address)
+check(_wrapped_proc("glGetString") == 0x5EED,
+      "wrapped GL proc loader did not forward the symbol")
+check(_qt_proc_names == [b"glGetString"],
+      f"getProcAddress received {_qt_proc_names!r}, not bytes")
+
+_orig_render_create = _render_mod.mpv._mpv_render_context_create
+try:
+    _render_mod.mpv._mpv_render_context_create = lambda buf, handle, params: 0
+    _proc_ctx = _render_mod.RenderContext(
+        type("_Handle", (), {"handle": "mpv"})(), _wrapped_proc
+    )
+    _init: dict[int, object] = {}
+    _idx = 0
+    while _proc_ctx.create_params[_idx].type_id != 0:
+        _init[_proc_ctx.create_params[_idx].type_id] = _proc_ctx.create_params[_idx]
+        _idx += 1
+    _gl_init = _ctypes.cast(
+        _init[2].data, _ctypes.POINTER(_render_mod.mpv.MpvOpenGLInitParams)
+    ).contents
+    check(_gl_init.get_proc_address(None, b"glGetString") == 0x5EED,
+          "render-context create path failed on the GL proc loader")
+    check(_qt_proc_names[-1] == b"glGetString",
+          f"render callback leaked a str to getProcAddress: {_qt_proc_names!r}")
+finally:
+    _render_mod.mpv._mpv_render_context_create = _orig_render_create
+
 # Regression: render/update exceptions never crash the paint loop or
 # corrupt the attached state; the driver still runs once per paint.
 render_engine._render_attached = True

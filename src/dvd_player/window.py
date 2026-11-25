@@ -1066,6 +1066,10 @@ class HelpOverlay(QWidget):
 # wid_embedding_safe() (xcb). On native Wayland render mode NEVER calls
 # attach_widget; software on Wayland still attempts attach_render once,
 # then shows the graceful renderer-unavailable status.
+# Proc seam: Qt's QOpenGLContext.getProcAddress() takes bytes (QByteArray),
+# while the render.py callback hands over the GL name as str. The loader
+# wrapper below re-encodes it, so every Qt lookup receives bytes and never a
+# str (a str argument raised TypeError and dropped every GL symbol).
 # B1/B2: DVD_PLAYER_RENDER is the single switch understood by both the
 # engine (auto = probe hardware, software = llvmpipe) and this dispatch.
 # ``auto``/``render`` ask for the GL render surface; ``software``/``wid``
@@ -1130,6 +1134,21 @@ def render_surface_required(
     handing a wl_surface id to Xlib.
     """
     return render_mode_active(engine, env) or not wid_embedding_safe()
+
+
+def _bytes_proc_loader(
+    loader: Callable[[bytes], int | None],
+) -> Callable[[str], int | None]:
+    """Adapt Qt's bytes-only ``getProcAddress`` to the str seam contract.
+
+    ``RenderContext`` decodes the C ``char *`` name to ``str`` before calling
+    its loader; Qt rejects that str, so encode it back to ASCII bytes here.
+    """
+
+    def get_proc(name: str) -> int | None:
+        return loader(name.encode("ascii"))
+
+    return get_proc
 
 
 class VideoGLWidget(QOpenGLWidget):
@@ -1242,7 +1261,7 @@ class VideoGLWidget(QOpenGLWidget):
             return False
         context = self.context()
         loader = getattr(context, "getProcAddress", None)
-        get_proc = loader if callable(loader) else None
+        get_proc = _bytes_proc_loader(loader) if callable(loader) else None
         fbo = self._fbo_source()
         try:
             return bool(attach(get_proc, fbo=fbo))
