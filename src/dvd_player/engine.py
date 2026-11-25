@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from .hardware import eject_device
 from .identity import DiscIdentity, ResumeStore, _coerce_track_id
+from .render import RenderContext
 from .state import LOAD_TIMEOUT_MS, PlaybackError, PlayerState, StateMachine, log
 
 # python-mpv >= 1.0 has no legacy ``mpv.MPVError``: C-API failures are
@@ -46,6 +47,10 @@ MPVError = ValueError
 #   Public API (signatures exact):
 #     __init__(self, parent: Optional[QObject] = None)
 #     attach_widget(self, wid: int) -> None
+#     attach_render(self, get_proc_address, wid: Optional[int] = None,
+#                   fbo: Optional[int | Callable[[], int]] = None) -> bool
+#     update(self) -> bool
+#     render_frame(self, width: int, height: int) -> bool
 #     load(self, source: str) -> None
 #     play_pause(self) -> None
 #     stop(self) -> None
@@ -106,6 +111,27 @@ MPVError = ValueError
 #     observers (python-mpv @self._player.property_observer decorator) for
 #     'time-pos', 'disc-menu-active', 'track-list', 'eof-reached' that emit
 #     the raw signals only (eof observer emits only when value is True).
+#   * attach_render(get_proc_address, wid=None, fbo=None) -> bool
+#     (R1-R5/R8): create mpv with vo='libmpv' plus the same GUI options as
+#     attach_widget, then a RenderContext from render.py whose create params
+#     are api_type OPENGL, the current GL context's get_proc_address, flip_y
+#     set and ``fbo`` as the target framebuffer. ``fbo`` defaults to the
+#     window backbuffer (0); a QOpenGLWidget caller passes a callable that
+#     re-reads defaultFramebufferObject() so every frame lands in the
+#     widget's own FBO. Record the calling (GUI) thread. On ANY create failure terminate
+#     the half-built player, log (non-fatal) and, when wid is given, fall
+#     back to attach_widget(wid); ALWAYS return False in that case so the
+#     caller can continue the ordered render -> wid -> software chain.
+#     attach_widget stays the fallback and is unchanged.
+#   * update()/render_frame(width, height): GUI-thread-only drivers for
+#     paintGL. update() reports whether a frame is ready; render_frame()
+#     rebinds the context's FBO (the callable is re-invoked per frame) with
+#     the current viewport and keeps flip_y. Both are
+#     no-ops returning False after free/dispose or off the GUI thread, and
+#     both swallow render errors (never ERROR, never abort).
+#   * Render-context lifetime (R1): free it exactly once, BEFORE the mpv
+#     player is terminated, in eject() and dispose(); _render_ctx=None
+#     afterwards blocks any late update/render call.
 #   * load(source): allowed from {IDLE, STOPPED, EJECTED, ERROR}, else
 #     PlaybackError. transition(LOADING); _ensure_player() — on failure
 #     _fail(exc) (LOADING->ERROR + error_occurred emitted) then raise.
@@ -315,6 +341,8 @@ class DvdPlaybackEngine(QObject):
         self._resume = ResumeStore()
         self._player: Any = None
         self._wid: int | None = None
+        self._render_ctx: RenderContext | None = None
+        self._render_thread: int | None = None
         self._source: str | None = None
         self._disc_hash: str | None = None
         self._disc_label: str | None = None
@@ -415,6 +443,103 @@ class DvdPlaybackEngine(QObject):
             raise PlaybackError(f"could not initialize mpv: {exc}") from exc
         self._wid = int(wid)
         self._player = player
+        self._attach_observers(player)
+
+    def attach_render(
+        self,
+        get_proc_address: Callable[[str], int | None],
+        wid: int | None = None,
+        fbo: int | Callable[[], int] | None = None,
+    ) -> bool:
+        """Attach through the libmpv render API; fall back to ``wid`` (R1-R5).
+
+        ``fbo`` is the target framebuffer: an id, or a callable that is
+        re-read on every rendered frame (a QOpenGLWidget passes
+        ``defaultFramebufferObject`` this way). None keeps the window
+        backbuffer (FBO 0), the historical behavior.
+
+        Returns True only when the render context exists. A failure is
+        non-fatal: the half-built libmpv core is terminated and, when a
+        native window id was supplied, the ordinary ``attach_widget`` path
+        takes over. Either way the caller keeps its ordered fallback chain.
+        """
+        if self._disposed:
+            return False
+        if self._render_ctx is not None:
+            return True
+        if self._player is not None and self._wid is not None:
+            return False  # already attached through the xcb/wid path
+        locale.setlocale(locale.LC_NUMERIC, "C")
+        options: dict[str, Any] = {
+            # Render API: libmpv never owns a native window; the widget's
+            # paintGL drives update()/render_frame().
+            "vo": "libmpv",
+            "input_default_bindings": False,
+            "input_cursor": False,
+            "cursor_autohide": "no",
+            "osc": False,
+            "osd_level": 0,
+            "keep_open": True,
+            "idle": True,
+        }
+        player: Any = None
+        try:
+            player = mpv.MPV(**options)
+            context = (
+                RenderContext(player, get_proc_address)
+                if fbo is None
+                else RenderContext(player, get_proc_address, fbo)
+            )
+        except Exception as exc:  # noqa: BLE001 - render fallback is non-fatal
+            log.warning("render API unavailable; falling back: %s", exc)
+            if player is not None:
+                try:
+                    player.terminate()
+                except Exception:  # noqa: BLE001 - teardown must not mask
+                    log.debug("could not terminate the failed render player")
+            self._player = None
+            if wid is not None:
+                try:
+                    self.attach_widget(int(wid))
+                except PlaybackError:
+                    log.exception("wid fallback after render failure also failed")
+            return False
+        self._player = player
+        self._wid = None
+        self._render_ctx = context
+        self._render_thread = threading.get_ident()
+        self._attach_observers(player)
+        return True
+
+    def update(self) -> bool:
+        """GUI-thread frame driver: report whether libmpv has a new frame."""
+        context = self._render_ctx
+        if context is None or self._disposed or not self._on_render_thread():
+            return False
+        try:
+            return context.update()
+        except (OSError, SystemError, AttributeError, RuntimeError, ValueError) as exc:
+            log.debug("render update failed: %s", exc)
+            return False
+
+    def render_frame(self, width: int, height: int) -> bool:
+        """GUI-thread frame driver: render into FBO 0 for this viewport."""
+        context = self._render_ctx
+        if context is None or self._disposed or not self._on_render_thread():
+            return False
+        try:
+            context.render(int(width), int(height))
+        except (OSError, SystemError, AttributeError, RuntimeError, ValueError) as exc:
+            log.debug("render frame failed: %s", exc)
+            return False
+        return True
+
+    def _on_render_thread(self) -> bool:
+        """R4: only the thread that created the context may drive it."""
+        return self._render_thread == threading.get_ident()
+
+    def _attach_observers(self, player: Any) -> None:
+        """Register the four property observers shared by both attach modes."""
 
         @player.property_observer("time-pos")  # type: ignore[untyped-decorator]
         def _observe_time_pos(_name: str, value: Any) -> None:
@@ -433,6 +558,14 @@ class DvdPlaybackEngine(QObject):
         def _observe_eof(_name: str, value: Any) -> None:
             if value is True:
                 self._eof_raw.emit()
+
+    def _release_render_context(self) -> None:
+        """R1: free the render context before libmpv/GL teardown, once."""
+        context = self._render_ctx
+        self._render_ctx = None
+        self._render_thread = None
+        if context is not None:
+            context.free()
 
     def load(self, source: str) -> None:
         """Open ``source`` (device, ISO or VIDEO_TS folder) through dvdnav."""
@@ -717,6 +850,7 @@ class DvdPlaybackEngine(QObject):
     def eject(self) -> None:
         """Save state, terminate mpv, eject the disc and enter EJECTED."""
         self._save_resume_now()
+        self._release_render_context()
         self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
         self._seek_settle.stop()
         self._pending_seek_pos = None
@@ -757,6 +891,7 @@ class DvdPlaybackEngine(QObject):
         self._menu_jump_settle.stop()
         self._menu_jump_done = True
         self._save_resume_now()
+        self._release_render_context()
         player = self._player
         self._player = None
         if player is not None:

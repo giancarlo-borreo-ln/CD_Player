@@ -1260,4 +1260,257 @@ window5.close()
 window6.close()
 app.processEvents()
 
+# ── (z) render-api surface: GL widget, mouse coords, overlay stacking ─
+# Documented test-edits for W2 (R6/R7): the render mode swaps in a
+# QOpenGLWidget while the wid path keeps the old plain widget.
+from dvd_player import window as _winmod  # noqa: E402
+
+check(not isinstance(window.video, _winmod.VideoGLWidget),
+      "wid window must not use the GL surface")
+check(_winmod.render_mode_active(dp.DvdPlaybackEngine()) is False,
+      "render mode active without an opt-in")
+check(_winmod.render_mode_active(object(), {"DVD_PLAYER_RENDER_MODE": "render"}),
+      "env render mode was not detected")
+check(not _winmod.render_mode_active(object(), {}),
+      "empty env wrongly selected render mode")
+
+render_engine = dp.DvdPlaybackEngine()
+render_engine.render_mode = "render"  # type: ignore[attr-defined]
+render_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+gl_window = dp.MainWindow(render_engine)
+gl_window._auto_detected = True
+check(isinstance(gl_window.video, _winmod.VideoGLWidget),
+      "render mode did not build VideoGLWidget")
+check(gl_window.video.parentWidget() is not gl_window,
+      "GL surface must sit inside the central widget, below the overlays")
+
+# R6: widget-space coordinates scale by the device pixel ratio.
+render_engine._menu_active = True
+render_calls: list[tuple[str, tuple[object, ...]]] = []
+render_engine.menu_mouse_move = (  # type: ignore[method-assign]
+    lambda x, y: render_calls.append(("menu_mouse_move", (x, y)))
+)
+gl_window.video.devicePixelRatioF = lambda: 2.0  # type: ignore[method-assign]
+gl_window._on_video_mouse(
+    gl_window.video,
+    QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(5, 7),
+        QPointF(5, 7),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    ),
+)
+check(render_calls == [("menu_mouse_move", (10, 14))],
+      f"GL mouse coords not DPR-scaled: {render_calls}")
+
+# Render hooks are optional and guarded; recorders prove the wiring.
+render_log: list[tuple[object, ...]] = []
+render_engine.attach_render = (  # type: ignore[method-assign]
+    lambda proc, fbo=None: (render_log.append(("attach", proc, fbo)), True)[1]
+)
+render_engine.update = lambda: render_log.append(("update",))  # type: ignore[method-assign]
+render_engine.render_frame = (  # type: ignore[method-assign]
+    lambda w, h: render_log.append(("frame", w, h))
+)
+render_engine.resize_render = lambda w, h: render_log.append(("size", w, h))  # type: ignore[method-assign]
+gl_window.video.resize(320, 180)
+gl_window.video.initializeGL()
+gl_window.video.paintGL()
+gl_window.video.resizeGL(640, 360)
+check(bool(render_log) and render_log[0][0] == "attach",
+      f"initializeGL did not call attach_render: {render_log}")
+check(gl_window.video._render_attached is True,
+      "successful attach_render did not mark the surface attached")
+gl_window.video.initializeGL()
+check(len([e for e in render_log if e[0] == "attach"]) == 1,
+      "initializeGL re-attached an already attached surface")
+check(render_log.count(("update",)) == 1,
+      f"paintGL must run exactly one update: {render_log}")
+# DPR is 2.0 on this surface: one render per paint with scaled size.
+check([entry for entry in render_log if entry[0] == "frame"] == [("frame", 640, 360)],
+      f"paintGL must render once at width*dpr, height*dpr: {render_log}")
+check(("size", 640, 360) in render_log, "resizeGL did not notify the engine")
+
+# Regression: a refused attach_render falls back to attach_widget(winId()).
+fallback_engine = dp.DvdPlaybackEngine()
+fallback_engine.render_mode = "render"  # type: ignore[attr-defined]
+fallback_attach: list[object] = []
+fallback_wid: list[int] = []
+fallback_engine.attach_render = (  # type: ignore[method-assign]
+    lambda proc, fbo=None: (fallback_attach.append(proc), False)[1]
+)
+fallback_engine.attach_widget = lambda wid: fallback_wid.append(wid)  # type: ignore[method-assign]
+fb_window = dp.MainWindow(fallback_engine)
+fb_window._auto_detected = True
+fb_widget = fb_window.video
+check(isinstance(fb_widget, _winmod.VideoGLWidget), "fallback needs a GL surface")
+expected_wid = int(fb_widget.winId())
+fb_widget.initializeGL()
+check(len(fallback_attach) == 1, "fallback path did not attempt attach_render")
+check(fallback_wid == [expected_wid],
+      f"failed attach_render did not fall back to winId(): {fallback_wid}")
+check(fb_widget._render_attached is False,
+      "failed attach_render must not mark the surface attached")
+fb_window.close()
+
+# Regression: when the wid fallback also fails, initializeGL stays quiet
+# (the engine's software path owns the last resort) and never corrupts state.
+broken_engine = dp.DvdPlaybackEngine()
+broken_engine.render_mode = "render"  # type: ignore[attr-defined]
+broken_engine.attach_render = lambda proc, fbo=None: False  # type: ignore[method-assign]
+
+
+def _broken_wid(wid: int) -> None:
+    raise dp.PlaybackError("wid unavailable")
+
+
+broken_engine.attach_widget = _broken_wid  # type: ignore[method-assign]
+broken_window = dp.MainWindow(broken_engine)
+broken_window._auto_detected = True
+broken_widget = broken_window.video
+check(isinstance(broken_widget, _winmod.VideoGLWidget), "broken fallback needs GL")
+broken_widget.initializeGL()
+check(broken_widget._render_attached is False,
+      "failed wid fallback marked the surface attached")
+broken_window.close()
+
+# FBO wiring: initializeGL hands the engine a callable that re-reads the
+# widget's live defaultFramebufferObject; the recorder proves it is invoked
+# on every paint and its current return value is what the frame uses.
+fbo_engine = dp.DvdPlaybackEngine()
+fbo_engine.render_mode = "render"  # type: ignore[attr-defined]
+fbo_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+fbo_attach: list[object] = []
+fbo_reads: list[int] = []
+
+
+def _attach_with_fbo(proc: object, fbo: object = None) -> bool:
+    fbo_attach.append(fbo)
+    return True
+
+
+def _render_with_fbo(width: int, height: int) -> bool:
+    del width, height
+    provider = fbo_attach[0]
+    if callable(provider):
+        fbo_reads.append(int(provider()))
+    return True
+
+
+fbo_engine.attach_render = _attach_with_fbo  # type: ignore[method-assign]
+fbo_engine.update = lambda: False  # type: ignore[method-assign]
+fbo_engine.render_frame = _render_with_fbo  # type: ignore[method-assign]
+fbo_window = dp.MainWindow(fbo_engine)
+fbo_window._auto_detected = True
+fbo_widget = fbo_window.video
+check(isinstance(fbo_widget, _winmod.VideoGLWidget), "FBO wiring needs GL")
+fbo_ids = iter([101, 202])
+fbo_widget.defaultFramebufferObject = lambda: next(fbo_ids)  # type: ignore[method-assign]
+fbo_widget.initializeGL()
+check(len(fbo_attach) == 1 and callable(fbo_attach[0]),
+      f"initializeGL did not pass an FBO callable: {fbo_attach}")
+fbo_widget.paintGL()
+fbo_widget.paintGL()
+check(fbo_reads == [101, 202],
+      f"FBO provider was not re-read per paint: {fbo_reads}")
+fbo_window.close()
+
+# Engine-level forwarding: attach_render hands the same FBO source to the
+# render context (positional third argument), not FBO 0.
+_engine_mod = sys.modules["dvd_player.engine"]
+_orig_render_context = _engine_mod.RenderContext
+_orig_mpv_factory = _engine_mod.mpv.MPV
+
+
+class _MiniRenderPlayer:
+    def __init__(self, **options: object) -> None:
+        self.options = options
+
+    def property_observer(self, name: str):  # noqa: ANN201 - mpv decorator
+        del name
+        return lambda fn: fn
+
+    def terminate(self) -> None:
+        return None
+
+
+class _RecordingRenderContext:
+    seen: list[object] = []
+
+    def __init__(self, player: object, proc: object, fbo: object = None) -> None:
+        del player, proc
+        self.fbo = fbo
+        _RecordingRenderContext.seen.append(fbo)
+
+    def update(self) -> bool:
+        return True
+
+    def render(self, width: int, height: int) -> None:
+        del width, height
+
+    def free(self) -> None:
+        return None
+
+
+try:
+    _engine_mod.RenderContext = _RecordingRenderContext  # type: ignore[assignment]
+    _engine_mod.mpv.MPV = _MiniRenderPlayer
+    fwd_engine = dp.DvdPlaybackEngine()
+    fbo_provider = lambda: 303  # noqa: E731 - tiny recorder
+    check(
+        fwd_engine.attach_render(lambda name: 0, fbo=fbo_provider) is True,
+        "engine attach_render did not accept an FBO source",
+    )
+    check(_RecordingRenderContext.seen == [fbo_provider],
+          f"engine did not forward the FBO source: {_RecordingRenderContext.seen}")
+    fwd_engine.dispose()
+finally:
+    _engine_mod.RenderContext = _orig_render_context
+    _engine_mod.mpv.MPV = _orig_mpv_factory
+
+# Regression: render/update exceptions never crash the paint loop or
+# corrupt the attached state; the driver still runs once per paint.
+render_engine._render_attached = True
+state_counts: list[str] = []
+
+
+def _boom_update() -> bool:
+    state_counts.append("update")
+    raise RuntimeError("update boom")
+
+
+def _boom_render(width: int, height: int) -> bool:
+    state_counts.append(f"render {width}x{height}")
+    raise RuntimeError("render boom")
+
+
+render_engine.update = _boom_update  # type: ignore[method-assign]
+render_engine.render_frame = _boom_render  # type: ignore[method-assign]
+gl_window.video.paintGL()
+check(state_counts == ["update", "render 640x360"],
+      f"faulty driver ran wrong calls: {state_counts}")
+check(gl_window.video._render_attached is True,
+      "render exception corrupted the attached state")
+gl_window.video.paintGL()
+check(state_counts == ["update", "render 640x360"] * 2,
+      f"paint loop stopped after a fault: {state_counts}")
+
+# R7: overlays stay siblings above the GL surface with full-window geometry.
+gl_window.resize(1280, 720)
+gl_window.resizeEvent(None)
+check(gl_window.home.parentWidget() is gl_window,
+      "home overlay is not a sibling above the video")
+check(gl_window.chapter_grid.parentWidget() is gl_window,
+      "chapter grid is not a sibling above the video")
+check(gl_window.help.parentWidget() is gl_window,
+      "help overlay is not a sibling above the video")
+for _overlay in (gl_window.home, gl_window.chapter_grid, gl_window.help):
+    check(_overlay.geometry().getRect() == (0, 0, 1280, 720),
+          f"overlay geometry {_overlay.geometry().getRect()}")
+check(gl_window.osd.geometry().getRect() == (0, 720 - 64, 1280, 64),
+      "OSD geometry wrong over the GL surface")
+gl_window.close()
+
 print(f"GUI SMOKE OK {_count} assertions")

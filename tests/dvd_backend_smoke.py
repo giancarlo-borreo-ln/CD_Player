@@ -1,10 +1,12 @@
 """Smoke tests for the dvd_player backend regions 1-4."""
 from __future__ import annotations
 
+import ctypes
 import json
 import locale
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -511,6 +513,250 @@ with tempfile.TemporaryDirectory() as tmp:
     check(resume_engine._pending_resume is None)
     resume_engine.dispose()
 
+
+# ── f8. render API wrapper + engine attach mode (R1-R5/R8/R9) ──────
+import dvd_player.engine as engine_mod
+import dvd_player.render as render_mod
+
+# (a) wrapper param structs: OPENGL api, GL proc loader, FBO 0, flip-y.
+raw = {
+    name: getattr(render_mod.mpv, name)
+    for name in (
+        "_mpv_render_context_create",
+        "_mpv_render_context_update",
+        "_mpv_render_context_render",
+        "_mpv_render_context_set_parameter",
+        "_mpv_render_context_free",
+    )
+}
+created: list[tuple[object, object]] = []
+rendered: list[object] = []
+updated: list[int] = []
+params_set: list[object] = []
+freed_ctx: list[object] = []
+
+
+def fake_create(buf, handle, params):
+    created.append((handle, params))
+    return 0
+
+
+def fake_update(_handle):
+    updated.append(1)
+    return 1
+
+
+def fake_render(_handle, params):
+    rendered.append(params)
+    return 0
+
+
+def fake_set_param(_handle, param):
+    params_set.append(param)
+    return 0
+
+
+def fake_free(handle):
+    freed_ctx.append(handle)
+    return 0
+
+
+class ProcHandle:
+    handle = "mpv-handle"
+
+
+render_mod.mpv._mpv_render_context_create = fake_create
+render_mod.mpv._mpv_render_context_update = fake_update
+render_mod.mpv._mpv_render_context_render = fake_render
+render_mod.mpv._mpv_render_context_set_parameter = fake_set_param
+render_mod.mpv._mpv_render_context_free = fake_free
+try:
+    proc_calls: list[str] = []
+
+    def gl_proc(name: str) -> int:
+        proc_calls.append(name)
+        return 0xABCD
+
+    ctx = render_mod.RenderContext(ProcHandle(), gl_proc)
+    check(len(created) == 1)
+    check(created[0][0] == "mpv-handle")
+    params = created[0][1]
+    found: dict[int, object] = {}
+    index = 0
+    while params[index].type_id != 0:
+        found[params[index].type_id] = params[index]
+        index += 1
+    check(ctypes.cast(found[1].data, ctypes.c_char_p).value == b"opengl")
+    init = ctypes.cast(
+        found[2].data, ctypes.POINTER(render_mod.mpv.MpvOpenGLInitParams)
+    ).contents
+    check(init.get_proc_address(None, b"glGenFramebuffers") == 0xABCD)
+    check(proc_calls == ["glGenFramebuffers"])
+    fbo0 = ctypes.cast(found[3].data, ctypes.POINTER(render_mod.mpv.MpvOpenGLFBO)).contents
+    check(fbo0.fbo == 0)
+    flip = ctypes.cast(found[4].data, ctypes.POINTER(ctypes.c_int)).contents
+    check(flip.value == 1)
+    check(ctx.update() is True and len(updated) == 1)
+    ctx.render(640, 360)
+    ctx.render(800, 600)  # R3: resize keeps flip-y and FBO 0
+    check(len(rendered) == 2)
+    for array, (want_w, want_h) in zip(rendered, ((640, 360), (800, 600))):
+        entries: dict[int, object] = {}
+        i = 0
+        while array[i].type_id != 0:
+            entries[array[i].type_id] = array[i]
+            i += 1
+        frame_fbo = ctypes.cast(
+            entries[3].data, ctypes.POINTER(render_mod.mpv.MpvOpenGLFBO)
+        ).contents
+        check(frame_fbo.fbo == 0)
+        check((frame_fbo.w, frame_fbo.h) == (want_w, want_h))
+        frame_flip = ctypes.cast(entries[4].data, ctypes.POINTER(ctypes.c_int)).contents
+        check(frame_flip.value == 1)
+    ctx.set_parameter("flip_y", True)
+    check(len(params_set) == 1 and params_set[0].type_id == 4)
+    ctx.free()
+    ctx.free()  # idempotent
+    check(len(freed_ctx) == 1)
+    check(ctx.freed is True)
+    check(ctx.update() is False and len(updated) == 1)
+    ctx.render(10, 10)
+    ctx.set_parameter("flip_y", True)
+    check(len(rendered) == 2 and len(params_set) == 1)  # no calls after free
+finally:
+    for name, func in raw.items():
+        setattr(render_mod.mpv, name, func)
+
+
+# (b) engine attach_render with a fake render context: exactly one
+# update + render per driver frame, on the GUI thread, never after free.
+class FakeRenderPlayer:
+    def __init__(self, **kwargs: object) -> None:
+        self.options = dict(kwargs)
+        self.handle = "fake-mpv"
+        self.terminated = 0
+        self.played = 0
+        self.dvd_device: str | None = None
+        self.aid: object = "auto"
+        self.sid: object = "auto"
+        self.speed = 1.0
+        self.pause = False
+
+    def property_observer(self, _name: str):
+        return lambda fn: fn
+
+    def play(self, _target: str) -> None:
+        self.played += 1
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+
+class FakeRenderContext:
+    fail = False
+    instances: list[FakeRenderContext] = []
+
+    def __init__(self, player: object, get_proc_address: object) -> None:
+        if FakeRenderContext.fail:
+            raise RuntimeError("no current GL context")
+        self.player = player
+        self.get_proc_address = get_proc_address
+        self.updates = 0
+        self.renders: list[tuple[int, int]] = []
+        self.freed = 0
+        self.threads: list[int] = []
+        FakeRenderContext.instances.append(self)
+
+    def update(self) -> bool:
+        self.updates += 1
+        self.threads.append(threading.get_ident())
+        return True
+
+    def render(self, width: int, height: int) -> None:
+        self.renders.append((width, height))
+        self.threads.append(threading.get_ident())
+
+    def free(self) -> None:
+        self.freed += 1
+
+
+players: list[FakeRenderPlayer] = []
+
+
+def fake_render_mpv(**kwargs: object) -> FakeRenderPlayer:
+    player = FakeRenderPlayer(**kwargs)
+    players.append(player)
+    return player
+
+
+engine_mod.mpv.MPV = fake_render_mpv
+engine_mod.RenderContext = FakeRenderContext
+try:
+    FakeRenderContext.fail = False
+    FakeRenderContext.instances.clear()
+    players.clear()
+    render_engine = DvdPlaybackEngine()
+    holder: list[int] = []
+
+    def get_proc(_name: str) -> int:
+        holder.append(1)
+        return 0x1234
+
+    check(render_engine.attach_render(get_proc) is True)
+    check(len(FakeRenderContext.instances) == 1)
+    check("wid" not in players[0].options)
+    check(players[0].options["vo"] == "libmpv")
+    fake_ctx = FakeRenderContext.instances[0]
+    check(render_engine._render_ctx is fake_ctx)
+    sizes = ((320, 240), (640, 480), (800, 600))
+    for width, height in sizes:
+        check(render_engine.update() is True)
+        check(render_engine.render_frame(width, height) is True)
+    check(fake_ctx.updates == 3)
+    check(fake_ctx.renders == list(sizes))
+    check(all(tid == threading.get_ident() for tid in fake_ctx.threads))
+    off_results: list[bool] = []
+
+    def drive_off_thread() -> None:
+        off_results.append(render_engine.update())
+        off_results.append(render_engine.render_frame(1, 1))
+
+    worker = threading.Thread(target=drive_off_thread)
+    worker.start()
+    worker.join(timeout=5.0)
+    check(off_results == [False, False])
+    check(fake_ctx.updates == 3 and len(fake_ctx.renders) == 3)
+    render_engine.dispose()
+    check(fake_ctx.freed == 1 and players[0].terminated == 1)
+    render_engine.dispose()
+    check(fake_ctx.freed == 1)
+    check(render_engine._render_ctx is None)
+    check(render_engine.update() is False)
+    check(render_engine.render_frame(5, 5) is False)
+    check(fake_ctx.updates == 3 and len(fake_ctx.renders) == 3)
+
+    # (c) R5: create failure is non-fatal -> wid fallback (recorder).
+    FakeRenderContext.fail = True
+    FakeRenderContext.instances.clear()
+    players.clear()
+    fallback_engine = DvdPlaybackEngine()
+    fallback_errors: list[str] = []
+    fallback_engine.error_occurred.connect(fallback_errors.append)
+    check(fallback_engine.attach_render(get_proc, wid=77) is False)
+    check(fallback_engine._render_ctx is None)
+    check(len(players) == 2)  # failed libmpv core + wid-attached one
+    check(players[0].terminated == 1)
+    check(players[1].options.get("wid") == "77")
+    check("vo" in players[1].options)
+    check(fallback_engine._wid == 77)
+    check(fallback_errors == [])
+    fallback_engine.load("/dev/nonexistent0")
+    check(fallback_engine.state is PlayerState.LOADING)
+    fallback_engine._hash_worker.join(timeout=30.0)
+    fallback_engine.dispose()
+finally:
+    engine_mod.RenderContext = render_mod.RenderContext
+    engine_mod.mpv.MPV = original_mpv  # type: ignore[assignment]
 
 # ── h. D1 disc label + stale epoch guard ───────────────────────────
 with tempfile.TemporaryDirectory() as tmp:

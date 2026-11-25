@@ -5,15 +5,32 @@ import locale
 import logging
 import os
 import sys
+from collections.abc import Mapping
 
 from PyQt6.QtWidgets import QApplication
 
 from .engine import DvdPlaybackEngine
 from .state import APP_NAME, log
-from .window import MainWindow
+from .window import MainWindow, render_mode_requested
 
 # SECTION 7 — main() entry point
 # ════════════════════════════════════════════════════════════════════
+
+
+def choose_platform(env: Mapping[str, str] | None = None) -> str | None:
+    """Pick QT_QPA_PLATFORM for this session (None leaves it untouched).
+
+    R8: wid embedding needs xcb on Wayland (XWayland); the render API can
+    use native Wayland, so it is preferred there. An explicit xcb/wayland
+    choice is never overridden, and non-Wayland launches are untouched.
+    """
+    source = os.environ if env is None else env
+    current = source.get("QT_QPA_PLATFORM", "").strip().lower()
+    if current.startswith(("xcb", "wayland")):
+        return None
+    if not source.get("WAYLAND_DISPLAY"):
+        return None
+    return "wayland" if render_mode_requested(source) else "xcb"
 
 
 def main() -> int:
@@ -22,17 +39,19 @@ def main() -> int:
     On Wayland without an explicit QT_QPA_PLATFORM, force xcb so libmpv's
     foreign-window (wid) embedding works via XWayland; embedding arbitrary
     native windows is not possible on the native Wayland Qt platform.
+    The render API is the exception: it owns its GL surface, so native
+    Wayland is preferred there (R8).
     """
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
-    if (
-        os.environ.get("WAYLAND_DISPLAY")
-        and not os.environ.get("QT_QPA_PLATFORM", "").startswith("xcb")
-    ):
-        os.environ["QT_QPA_PLATFORM"] = "xcb"
+    platform = choose_platform()
+    if platform is not None:
+        os.environ["QT_QPA_PLATFORM"] = platform
         log.info(
-            "Wayland session detected: forcing QT_QPA_PLATFORM=xcb for mpv embedding"
+            "Wayland session detected: forcing QT_QPA_PLATFORM=%s (%s)",
+            platform,
+            "render API" if platform == "wayland" else "mpv wid embedding",
         )
     app = QApplication(sys.argv)
     # Qt resets LC_NUMERIC at app init; libmpv requires the C locale

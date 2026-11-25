@@ -7,6 +7,7 @@ import os
 import stat
 import threading
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import ClassVar
 
@@ -25,6 +26,7 @@ from PyQt6.QtGui import (
     QResizeEvent,
     QShowEvent,
 )
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -672,10 +674,191 @@ class HelpOverlay(QWidget):
 # ── [AGENT2: SECTION 5 END] ──
 
 # ════════════════════════════════════════════════════════════════════
+# SECTION 5b — render-api surface (R6/R7)
+# ════════════════════════════════════════════════════════════════════
+
+# R6/R7: the render API draws into a QOpenGLWidget instead of mpv's native
+# wid surface. Overlays stay siblings above the GL widget (paint-only, no
+# native-window tricks); mouse coordinates are scaled by the device pixel
+# ratio so dvdnav sees the same widget-space points as the old wid path.
+RENDER_MODE_ENV = "DVD_PLAYER_RENDER_MODE"
+_RENDER_MODES: tuple[str, ...] = ("render", "gl", "opengl")
+
+
+def render_mode_requested(env: Mapping[str, str] | None = None) -> bool:
+    """Return True when the environment selects the GL render API."""
+    source = os.environ if env is None else env
+    mode = source.get(RENDER_MODE_ENV, "").strip().lower()
+    if mode in _RENDER_MODES:
+        return True
+    api = source.get("DVD_PLAYER_RENDER_API", "").strip().lower()
+    return api in ("1", "true", "yes", *_RENDER_MODES)
+
+
+def render_mode_active(
+    engine: object, env: Mapping[str, str] | None = None
+) -> bool:
+    """Whether MainWindow should build the GL video surface for ``engine``."""
+    mode = getattr(engine, "render_mode", None)
+    if isinstance(mode, str):
+        return mode.strip().lower() in _RENDER_MODES
+    active = getattr(engine, "render_active", None)
+    if isinstance(active, bool):
+        return active
+    return render_mode_requested(env)
+
+
+class VideoGLWidget(QOpenGLWidget):
+    """GL surface fed by the engine's render API (R6).
+
+    The engine may land in parallel, so every render hook is optional.
+    ``attach_render`` returning False is not success: the widget falls back
+    to the ordinary ``attach_widget(winId())`` path so a failed GL handshake
+    never leaves the surface silently unattached (black frame, no video).
+    On success the engine receives the widget's live framebuffer source
+    (``defaultFramebufferObject`` as a callable), so libmpv paints into this
+    widget's FBO instead of the window backbuffer (FBO 0).
+    """
+
+    def __init__(
+        self, engine: DvdPlaybackEngine, parent: QWidget | None = None
+    ) -> None:
+        """Create the GL surface and keep pointer tracking on."""
+        super().__init__(parent)
+        self._engine = engine
+        self._render_attached = False
+        self.setMouseTracking(True)
+
+    def initializeGL(self) -> None:
+        """Hand the GL proc-address loader to the engine, once.
+
+        On a refused attach the widget calls ``attach_widget(winId())`` so
+        the wid path takes over; if that also fails the engine's own
+        software path remains the last resort. The window is never left
+        unattached without a log trail.
+        """
+        if self._render_attached:
+            return
+        attach = getattr(self._engine, "attach_render", None)
+        if not callable(attach):
+            return
+        context = self.context()
+        loader = getattr(context, "getProcAddress", None)
+        get_proc = loader if callable(loader) else None
+        fbo = self._fbo_source()
+        try:
+            attached = bool(attach(get_proc, fbo=fbo))
+        except TypeError:
+            # Engines that still expose attach_render(proc) only: keep the
+            # wid path reachable rather than failing the handshake outright.
+            try:
+                attached = bool(attach(get_proc))
+            except Exception as exc:  # noqa: BLE001 - renderer must never kill
+                log.warning("render attach failed: %s", exc)
+                attached = False
+        except Exception as exc:  # noqa: BLE001 - renderer must never kill the GUI
+            log.warning("render attach failed: %s", exc)
+            attached = False
+        if attached:
+            self._render_attached = True
+            return
+        self._render_attached = False
+        fallback = getattr(self._engine, "attach_widget", None)
+        if not callable(fallback):
+            log.warning("render attach refused and no wid fallback exists")
+            return
+        try:
+            fallback(int(self.winId()))
+        except Exception as exc:  # noqa: BLE001 - wid fallback is best effort
+            log.warning("wid fallback after render failure failed: %s", exc)
+        else:
+            log.info("render attach refused; using the wid video path")
+
+    def _fbo_source(self) -> Callable[[], int]:
+        """Return a callable that re-reads this widget's FBO every frame.
+
+        QOpenGLWidget paints through its own framebuffer, so libmpv must be
+        told that id (not FBO 0). Re-reading per frame follows context
+        recreation (resize/device change).
+        """
+        return lambda: int(self.defaultFramebufferObject())
+
+    def _pixel_ratio(self) -> float:
+        """Return the device pixel ratio, clamped to a sane positive value."""
+        try:
+            ratio = float(self.devicePixelRatioF())
+        except (TypeError, ValueError):
+            ratio = 1.0
+        if not math.isfinite(ratio) or ratio <= 0.0:
+            ratio = 1.0
+        return ratio
+
+    def paintGL(self) -> None:
+        """Drive one update + one render per paint (no-op without a renderer)."""
+        update = getattr(self._engine, "update", None)
+        if callable(update):
+            try:
+                update()
+            except Exception as exc:  # noqa: BLE001 - never abort the paint loop
+                log.debug("render update failed: %s", exc)
+        render = getattr(self._engine, "render_frame", None)
+        if not callable(render):
+            return
+        ratio = self._pixel_ratio()
+        width = max(1, int(self.width() * ratio))
+        height = max(1, int(self.height() * ratio))
+        try:
+            render(width, height)
+        except Exception as exc:  # noqa: BLE001 - never abort the paint loop
+            log.debug("render_frame failed: %s", exc)
+
+    def resizeGL(self, width: int, height: int) -> None:
+        """Tell the engine the new device-pixel surface size."""
+        for name in ("resize_render", "render_resize", "notify_render_size"):
+            notify = getattr(self._engine, name, None)
+            if not callable(notify):
+                continue
+            try:
+                notify(int(width), int(height))
+            except Exception as exc:  # noqa: BLE001 - resize is best effort
+                log.debug("%s failed: %s", name, exc)
+            return
+
+    def widget_position(self, event: QMouseEvent) -> tuple[int, int]:
+        """Map an event to device-pixel widget coordinates for dvdnav."""
+        position = event.position()
+        try:
+            ratio = float(self.devicePixelRatioF())
+        except (TypeError, ValueError):
+            ratio = 1.0
+        if not math.isfinite(ratio) or ratio <= 0.0:
+            ratio = 1.0
+        return int(position.x() * ratio), int(position.y() * ratio)
+
+
+# ════════════════════════════════════════════════════════════════════
 # SECTION 6 — MainWindow (input mapping & wiring)
 # ════════════════════════════════════════════════════════════════════
 
 # SPEC for SECTION 6 (MainWindow) — contract, do not edit:
+#   R6/R7 (render-api addendum): when render_mode_active(engine) is true,
+#     self.video is a VideoGLWidget(QOpenGLWidget) whose initializeGL/
+#     paintGL/resizeGL bridge to engine.attach_render/update/render_frame/
+#     resize_render (all guarded with getattr). attach_render(proc, fbo=…)
+#     returns True only when libmpv paints into the widget's own FBO: the
+#     widget passes ``lambda: int(defaultFramebufferObject())`` so the live
+#     framebuffer is re-read on every frame. Returning False (or raising)
+#     leaves the surface unattached, so initializeGL then
+#     calls engine.attach_widget(int(winId())) — the wid path is the ordered
+#     fallback, and a failed fallback is logged (never a silent black frame).
+#     paintGL runs exactly one engine.update() followed by one
+#     engine.render_frame(width*dpr, height*dpr) per paint, swallowing
+#     exceptions so a render fault cannot abort or corrupt the paint loop.
+#     Otherwise self.video stays the plain QWidget/wid path. Mouse forwarding keeps the same
+#     _on_video_mouse handler; the GL surface additionally scales
+#     event.position() by devicePixelRatioF(). OSD/home/grid/help remain
+#     sibling widgets above the video (paint-only, never native hacks on
+#     the GL path).
 #   class MainWindow(QMainWindow) — top-level window:
 #     * central QWidget, QVBoxLayout margins 0 spacing 0:
 #       - self.video: plain QWidget (autoFillBackground black) stretch=1;
@@ -930,7 +1113,14 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        self.video = QWidget(central)
+        # R6: the render API gets a GL surface; the wid path keeps the
+        # plain native-child QWidget exactly as before.
+        self._render_mode = render_mode_active(self.engine)
+        self.video: QWidget = (
+            VideoGLWidget(self.engine, central)
+            if self._render_mode
+            else QWidget(central)
+        )
         self.video.setAutoFillBackground(True)
         video_palette = self.video.palette()
         video_palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0))
@@ -1731,6 +1921,9 @@ class MainWindow(QMainWindow):
         if event_type == QEvent.Type.MouseMove:
             if not self.engine.menu_active:
                 self.osd.show_osd()
+            elif isinstance(self.video, VideoGLWidget):
+                x, y = self.video.widget_position(event)
+                self.engine.menu_mouse_move(x, y)
             else:
                 position = event.position()
                 self.engine.menu_mouse_move(
@@ -1829,14 +2022,22 @@ class MainWindow(QMainWindow):
 
     def _attach_engine(self) -> None:
         """Bind mpv to the video widget, then honour an initial source."""
-        try:
-            self.engine.attach_widget(int(self.video.winId()))
-        except PlaybackError as exc:
-            log.exception("could not attach the video widget")
-            self._set_status("ERROR")
-            QMessageBox.critical(self, "Playback error", str(exc))
-            return
-        log.debug("mpv attached to video window %#x", int(self.video.winId()))
+        has_render = callable(getattr(self.engine, "attach_render", None))
+        if isinstance(self.video, VideoGLWidget) and has_render:
+            # The GL context is ready only after show(); initializeGL()
+            # performs the attach_render() handshake.
+            log.debug("render API surface armed for GL attach")
+        else:
+            if isinstance(self.video, VideoGLWidget):
+                log.info("render API unavailable; falling back to wid embedding")
+            try:
+                self.engine.attach_widget(int(self.video.winId()))
+            except PlaybackError as exc:
+                log.exception("could not attach the video widget")
+                self._set_status("ERROR")
+                QMessageBox.critical(self, "Playback error", str(exc))
+                return
+            log.debug("mpv attached to video window %#x", int(self.video.winId()))
         initial = self._initial_source
         self._initial_source = None
         if initial:

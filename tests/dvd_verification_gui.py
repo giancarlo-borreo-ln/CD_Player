@@ -724,5 +724,39 @@ for _y in range(launch_image.height()):
 check(_green > 100, f"active blade not green at open: {_green} px")
 launch_menu.deleteLater()
 
+# R8: platform gate — render API prefers native Wayland, wid keeps xcb,
+# non-Wayland and explicit choices are never touched.
+from dvd_player import app as dp_app  # noqa: E402
+
+check(dp_app.choose_platform({}) is None, "non-Wayland launch changed platform")
+check(
+    dp_app.choose_platform({"WAYLAND_DISPLAY": "wayland-0"}) == "xcb",
+    "Wayland wid launch did not force xcb",
+)
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "DVD_PLAYER_RENDER_API": "1"}
+    ) == "wayland",
+    "render API alias did not prefer native Wayland",
+)
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "DVD_PLAYER_RENDER_MODE": "render"}
+    ) == "wayland",
+    "render mode did not prefer native Wayland",
+)
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": "xcb"}
+    ) is None,
+    "explicit xcb choice was overridden",
+)
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": "wayland"}
+    ) is None,
+    "explicit wayland choice was overridden",
+)
+
 app.processEvents()
 print(f"VERIFICATION-GUI OK {_count}")
