@@ -13,7 +13,7 @@ sys.path.insert(
 )
 
 from PyQt6.QtCore import QEvent, QPointF, Qt
-from PyQt6.QtGui import QCloseEvent, QColor, QImage, QMouseEvent
+from PyQt6.QtGui import QCloseEvent, QColor, QImage, QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import dvd_player as dp
@@ -1472,6 +1472,85 @@ app.processEvents()
 check(not _cursor_window._cursor_timer.isActive(), "cursor timer survived close")
 check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
       "close left the cursor blank")
+
+# ── fullscreen Esc hides OSD and cursor (feat/cursor-fullscreen) ─────
+_fs_engine = dp.DvdPlaybackEngine()
+_fs_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+_fs_window = dp.MainWindow(_fs_engine)
+_fs_window._auto_detected = True
+_fs_window.resize(640, 360)
+_fs_window.showFullScreen()
+app.processEvents()
+check(_fs_window.isFullScreen(), "window did not enter fullscreen")
+
+
+def _escape_event() -> QKeyEvent:
+    return QKeyEvent(
+        QEvent.Type.KeyPress,
+        Qt.Key.Key_Escape.value,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
+# Idle timeout must blank the GL/video, OSD and home surfaces too, not just
+# the top-level window (the reported bug: the pointer stayed an arrow).
+_fs_window.osd.hide()
+_fs_window._cursor_timer.stop()
+_fs_window._cursor_timer.timeout.emit()
+for _surface in (_fs_window, _fs_window.video, _fs_window.osd, _fs_window.home):
+    check(_surface.cursor().shape() == Qt.CursorShape.BlankCursor,
+          f"idle hide missed surface {type(_surface).__name__}")
+check(QApplication.overrideCursor() is not None,
+      "idle hide installed no application override cursor")
+QApplication.sendEvent(_fs_window.video, _move_event())
+app.processEvents()
+for _surface in (_fs_window, _fs_window.video, _fs_window.osd, _fs_window.home):
+    check(_surface.cursor().shape() != Qt.CursorShape.BlankCursor,
+          f"movement did not restore surface {type(_surface).__name__}")
+check(QApplication.overrideCursor() is None,
+      "movement left the application override cursor installed")
+
+# Esc in fullscreen hides the OSD, blanks the cursor at once and leaves the
+# pointer hidden until movement (movement also reveals the OSD again).
+_fs_window.osd.show_osd()
+app.processEvents()
+check(_fs_window.osd.isVisible(), "OSD not visible before fullscreen Esc")
+_fs_window.keyPressEvent(_escape_event())
+check(not _fs_window.osd.isVisible(), "fullscreen Esc did not hide the OSD")
+for _surface in (_fs_window, _fs_window.video, _fs_window.osd, _fs_window.home):
+    check(_surface.cursor().shape() == Qt.CursorShape.BlankCursor,
+          f"fullscreen Esc did not blank surface {type(_surface).__name__}")
+QApplication.sendEvent(_fs_window.video, _move_event())
+app.processEvents()
+for _surface in (_fs_window, _fs_window.video, _fs_window.osd, _fs_window.home):
+    check(_surface.cursor().shape() != Qt.CursorShape.BlankCursor,
+          f"movement after fullscreen Esc did not restore {type(_surface).__name__}")
+check(_fs_window.osd.isVisible(), "movement after fullscreen Esc did not reveal OSD")
+
+# Normal mode keeps the old contract: Esc hides only the OSD.
+_fs_window.showNormal()
+app.processEvents()
+QApplication.sendEvent(_fs_window.video, _move_event())
+app.processEvents()
+_fs_window.osd.show_osd()
+app.processEvents()
+_fs_window.keyPressEvent(_escape_event())
+check(not _fs_window.osd.isVisible(), "normal Esc did not hide the OSD")
+check(_fs_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+      "normal-mode Esc blanked the cursor")
+
+# Close while hidden restores every surface and drops the override cursor.
+_fs_window._cursor_timer.stop()
+_fs_window._hide_idle_cursor()
+check(_fs_window.cursor().shape() == Qt.CursorShape.BlankCursor,
+      "cursor not hidden before fullscreen close")
+_fs_window.close()
+app.processEvents()
+for _surface in (_fs_window, _fs_window.video, _fs_window.osd, _fs_window.home):
+    check(_surface.cursor().shape() != Qt.CursorShape.BlankCursor,
+          f"close left surface {type(_surface).__name__} blank")
+check(QApplication.overrideCursor() is None,
+      "close left the application override cursor installed")
 
 dp.ResumeStore.get = _orig_get
 dp.check_environment = _orig_env

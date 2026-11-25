@@ -2185,7 +2185,11 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     MouseButtonPress delivered to the window or any descendant (an
 #     application event filter restricted to this window's subtree, plus
 #     the direct _on_video_mouse entry point so tests bypassing Qt notify
-#     still count). On timeout->_hide_idle_cursor: setCursor(BlankCursor).
+#     still count). On timeout->_hide_idle_cursor blanks the cursor on the
+#     window AND every video/OSD/home overlay surface (a GL child does not
+#     inherit the main window's cursor) and installs an application
+#     override cursor, which is what actually hides the pointer on a native
+#     fullscreen surface. _restore_cursor removes both.
 #     The guard is checked AT TIMEOUT: never hide while _scrub_active
 #     (seek-bar press..release), while QApplication.activeModalWidget()
 #     is not None, or while the boot/loading splash or home menu covers
@@ -2197,7 +2201,13 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     never stays blank. Scrubbing handlers also note activity
 #     (press/move/release). Timer activity is silent: no OSD reveal, no
 #     repaint, no mpv call. closeEvent stops the timer, removes the app
-#     filter and restores the cursor.
+#     filter, restores cursor targets and drops the override cursor.
+#     Esc in fullscreen (feat/cursor-fullscreen): hide the OSD and blank
+#     immediately via the same guarded _hide_idle_cursor path; the pointer
+#     stays blank until the next MouseMove/MouseButtonPress restores it
+#     (and, per existing behaviour, that movement also reveals the OSD).
+#     Leaving fullscreen (Ctrl+F) restores the cursor so normal mode never
+#     inherits a blank pointer.
 #   * closeEvent: engine.dispose(); event.accept().
 #   * _sync_osd: osd.set_transport(state=engine.state, speed=engine.speed,
 #     time_pos=engine.time_pos, duration=engine.duration,
@@ -2369,6 +2379,7 @@ class MainWindow(QMainWindow):
         # Idle cursor hiding is owned by the window (mpv's own auto-hide is
         # disabled): any pointer activity restarts this single-shot timer.
         self._cursor_hidden = False
+        self._cursor_override_active = False
         self._cursor_timer = QTimer(self)
         self._cursor_timer.setSingleShot(True)
         self._cursor_timer.setInterval(self.CURSOR_HIDE_MS)
@@ -2507,6 +2518,8 @@ class MainWindow(QMainWindow):
         ):
             if self.isFullScreen():
                 self.showNormal()
+                # Never carry a blank pointer back into normal mode.
+                self._note_mouse_activity()
             else:
                 self.showFullScreen()
             self.osd.show_osd()
@@ -2605,11 +2618,40 @@ class MainWindow(QMainWindow):
             self._on_video_mouse(a0, a1)
         return super().eventFilter(a0, a1)  # type: ignore[arg-type]
 
+    def _cursor_targets(self) -> list[QWidget]:
+        """Return every surface that must carry the hidden cursor."""
+        return [
+            self,
+            self.video,
+            self.osd,
+            self.home,
+            self.splash,
+            self.chapter_grid,
+            self.help,
+            self.scrub_preview,
+        ]
+
+    def _apply_cursor_state(self, hidden: bool) -> None:
+        """Blank or restore the cursor on all targets and the app override."""
+        shape = Qt.CursorShape.BlankCursor
+        for widget in self._cursor_targets():
+            if hidden:
+                widget.setCursor(shape)
+            else:
+                widget.unsetCursor()
+        if self._cursor_app is not None:
+            if hidden and not self._cursor_override_active:
+                self._cursor_app.setOverrideCursor(shape)
+                self._cursor_override_active = True
+            elif not hidden and self._cursor_override_active:
+                self._cursor_app.restoreOverrideCursor()
+                self._cursor_override_active = False
+        self._cursor_hidden = hidden
+
     def _note_mouse_activity(self) -> None:
         """Restore a hidden cursor and restart the idle-hide countdown."""
-        if self._cursor_hidden:
-            self.unsetCursor()
-            self._cursor_hidden = False
+        if self._cursor_hidden or self._cursor_override_active:
+            self._apply_cursor_state(False)
         if not self._window_closed:
             self._cursor_timer.start()
 
@@ -2627,8 +2669,7 @@ class MainWindow(QMainWindow):
             # countdown so the next expiry can hide once the guard clears.
             self._cursor_timer.start()
             return
-        self.setCursor(Qt.CursorShape.BlankCursor)
-        self._cursor_hidden = True
+        self._apply_cursor_state(True)
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
         """Release the engine before the window goes away."""
@@ -2638,12 +2679,11 @@ class MainWindow(QMainWindow):
         self._disc_timer.stop()
         self._splash_timer.stop()
         self._cursor_timer.stop()
+        if self._cursor_hidden or self._cursor_override_active:
+            self._apply_cursor_state(False)
         if self._cursor_app is not None:
             self._cursor_app.removeEventFilter(self)  # type: ignore[arg-type]
             self._cursor_app = None
-        if self._cursor_hidden:
-            self.unsetCursor()
-            self._cursor_hidden = False
         self.splash.dismiss()
         self.stop_mpris()
         self._teardown_preview()
@@ -2723,6 +2763,10 @@ class MainWindow(QMainWindow):
             return True
         elif key == codes.Key_Escape.value:
             self.osd.hide()
+            # In fullscreen Esc also blanks the pointer immediately; the
+            # next mouse movement restores it (and reveals the OSD).
+            if self.isFullScreen():
+                self._hide_idle_cursor()
             return True
         else:
             return False
