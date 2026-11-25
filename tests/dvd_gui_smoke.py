@@ -829,6 +829,65 @@ scrub_window._on_scrub_pressed(0.5)
 check(_seeks == [100.0], f"seek without capture_frame -> {_seeks}")
 check(scrub_window.osd._preview is None, "missing capture_frame still set a preview")
 scrub_window._on_scrub_released()
+
+# Render mode: the big live thumbnail comes from grabFramebuffer(), never
+# from engine.capture_frame(), and carries the frame timestamp.
+scrub_engine.capture_frame = lambda: (  # type: ignore[attr-defined]
+    _captures.append(1) or (2, 2, bytes([10, 20, 30, 0]) * 4)
+)
+_render_image = QImage(640, 360, QImage.Format.Format_RGB32)
+_render_image.fill(QColor(10, 20, 30))
+_grab_calls: list[int] = []
+
+
+def _fake_grab() -> QImage:
+    _grab_calls.append(1)
+    return _render_image
+
+
+scrub_window._render_mode = True
+scrub_window.resize(1280, 720)
+scrub_window.video.grabFramebuffer = _fake_grab  # type: ignore[method-assign]
+_seeks.clear()
+_captures.clear()
+_preview_calls.clear()
+scrub_window._on_scrub_pressed(0.25)
+check(_seeks == [50.0], f"render press seek -> {_seeks}")
+check(_grab_calls == [1], "render press did not grab the GL framebuffer")
+check(_captures == [], "render mode fell back to capture_frame")
+check(_preview_calls[-1] is not None, "render grab did not reach set_preview")
+_render_preview = scrub_window.osd._preview
+check(
+    _render_preview is not None
+    and (_render_preview.width(), _render_preview.height()) == (640, 360),
+    "render preview pixels are not the GL framebuffer image",
+)
+scrub_window._on_scrub_moved(0.5)
+check(_grab_calls == [1], "throttled move grabbed a frame")
+scrub_window._scrub_last_seek -= 0.3
+scrub_window._scrub_last_capture -= 0.2
+scrub_window._on_scrub_moved(0.5)
+check(_seeks == [50.0, 100.0], f"render throttled seek -> {_seeks}")
+check(_grab_calls == [1, 1], "render throttle did not grab after the seek")
+check(_preview_calls[-1] is not None, "throttled render grab missed set_preview")
+check(scrub_window.osd._preview_seconds == 100.0, "preview timestamp not recorded")
+check(scrub_window.osd._preview_rect().width() >= 320.0, "thumbnail width < 320")
+check(scrub_window.osd._preview_rect().height() >= 180.0, "thumbnail height < 180")
+check(
+    scrub_window.scrub_preview._preview_rect().width() >= 320.0
+    and scrub_window.scrub_preview._preview_rect().height() >= 180.0,
+    "overlay thumbnail smaller than 320x180",
+)
+check(scrub_window.scrub_preview.timestamp_text() == "01:40", "timestamp format")
+check(not scrub_window.scrub_preview._image is None, "overlay did not get the frame")
+scrub_window._on_scrub_released()
+check(scrub_window.osd._preview is None, "render release kept the preview")
+check(scrub_window.scrub_preview._image is None, "render release kept overlay preview")
+check(
+    scrub_window.osd._preview_seconds is None,
+    "render release kept the preview timestamp",
+)
+scrub_window._render_mode = False
 scrub_engine._player = None
 scrub_window.close()
 

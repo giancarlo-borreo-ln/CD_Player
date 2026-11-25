@@ -648,6 +648,60 @@ captures.clear()
 win_bar._on_scrub_pressed(0.5)
 win_bar._on_scrub_released()
 check(seeks == [] and captures == [], "scrub without duration touched engine")
+
+# Render mode: grabFramebuffer is the live frame source; the preview is a
+# big (>=320x180) above-video thumbnail with the OSD-formatted timestamp.
+eng_bar._player = _BarPlayer()
+eng_bar.capture_frame = lambda: (  # type: ignore[attr-defined]
+    captures.append(1) or (2, 2, bytes([1, 2, 3, 0]) * 4)
+)
+render_image = QImage(640, 360, QImage.Format.Format_RGB32)
+render_image.fill(0)
+grabs: list[int] = []
+
+
+def _grab_frame() -> QImage:
+    grabs.append(1)
+    return render_image
+
+
+win_bar._render_mode = True
+win_bar.resize(1280, 720)
+win_bar.video.grabFramebuffer = _grab_frame  # type: ignore[method-assign]
+seeks.clear()
+captures.clear()
+preview_calls.clear()
+win_bar._on_scrub_pressed(0.25)
+check(seeks == [50.0] and grabs == [1], "render press did not grab after seek")
+check(captures == [], "render mode called capture_frame")
+check(
+    preview_calls[-1] is not None
+    and preview_calls[-1].width() == 640
+    and preview_calls[-1].height() == 360,
+    "grabFramebuffer image did not reach set_preview",
+)
+win_bar._scrub_last_seek -= 0.3
+win_bar._scrub_last_capture -= 0.2
+win_bar._on_scrub_moved(0.5)
+check(seeks == [50.0, 100.0] and grabs == [1, 1], "render throttled seek/grab")
+check(win_bar.osd._preview_seconds == 100.0, "render preview timestamp")
+check(win_bar.osd._preview_rect().width() >= 320.0, "preview width < 320")
+check(win_bar.osd._preview_rect().height() >= 180.0, "preview height < 180")
+check(
+    win_bar.scrub_preview._preview_rect().width() >= 320.0
+    and win_bar.scrub_preview._preview_rect().height() >= 180.0,
+    "overlay preview smaller than 320x180",
+)
+check(win_bar.scrub_preview.timestamp_text() == "01:40", "preview timestamp text")
+win_bar._on_scrub_released()
+check(
+    win_bar.osd._preview is None
+    and win_bar.osd._preview_seconds is None
+    and win_bar.scrub_preview._image is None,
+    "render release did not clear the preview",
+)
+win_bar._render_mode = False
+eng_bar._player = None
 win_bar.close()
 
 # ════════════════════════════════════════════════════════════════════

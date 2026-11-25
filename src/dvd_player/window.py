@@ -23,6 +23,7 @@ from PyQt6.QtGui import (
     QLinearGradient,
     QMouseEvent,
     QPainter,
+    QPainterPath,
     QPaintEvent,
     QPalette,
     QResizeEvent,
@@ -1255,6 +1256,199 @@ class VideoGLWidget(QOpenGLWidget):
         return int(position.x() * ratio), int(position.y() * ratio)
 
 
+def _scrub_preview_size(window_width: float, window_height: float) -> tuple[float, float]:
+    """Return the live scrub thumbnail size (>= 320x180, window-scaled)."""
+    width = max(1.0, float(window_width))
+    height = max(1.0, float(window_height))
+    scale = min(width / 1280.0, height / 720.0)
+    scale = max(1.0, min(1.5, scale))
+    preview_width = max(320.0, 320.0 * scale)
+    preview_height = max(180.0, preview_width * 9.0 / 16.0)
+    margin = 16.0
+    room = max(0.0, width - 2.0 * margin)
+    if preview_width > room > 0.0:
+        preview_width = room
+        preview_height = preview_width * 9.0 / 16.0
+    return preview_width, preview_height
+
+
+def _scrub_preview_rect(
+    window_width: float,
+    window_height: float,
+    anchor_x: float,
+    bar_top: float,
+) -> QRectF:
+    """Place the thumbnail above the seek bar, clamped inside the window."""
+    width, height = _scrub_preview_size(window_width, window_height)
+    margin = 16.0
+    left = float(anchor_x) - width / 2.0
+    left = max(margin, min(left, max(margin, window_width - margin - width)))
+    gap = 12.0
+    top = float(bar_top) - height - gap
+    top = max(margin, min(top, max(margin, window_height - height - margin)))
+    return QRectF(left, top, width, height)
+
+
+class ScrubPreviewOverlay(QWidget):
+    """Full-window, mouse-transparent live scrub snapshot + timestamp.
+
+    Painted above the video surface (sibling raise order) so the big frame
+    is never clipped by the 64 px OSD strip. It exists only between
+    scrub press and release.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create a hidden, paint-only overlay."""
+        super().__init__(parent)  # type: ignore[arg-type]
+        self._image: QImage | None = None
+        self._seconds: float | None = None
+        self._anchor_x: float | None = None
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAutoFillBackground(False)
+        self.hide()
+
+    def set_frame(
+        self,
+        image: QImage,
+        seconds: float | None,
+        anchor_x: float | None = None,
+    ) -> None:
+        """Show ``image`` at the scrub anchor with its timestamp."""
+        self._image = image
+        self._seconds = seconds
+        self._anchor_x = anchor_x
+        self.show()
+        self.raise_()
+        self.update()
+
+    def clear(self) -> None:
+        """Drop the thumbnail and hide the overlay."""
+        self._image = None
+        self._seconds = None
+        self._anchor_x = None
+        self.update()
+        self.hide()
+
+    def timestamp_text(self) -> str:
+        """Return the thumbnail time readout using the OSD formatter."""
+        return Xbox360Osd._fmt_time(self._seconds)
+
+    def _preview_rect(self) -> QRectF:
+        """Return the window-space thumbnail rect above the OSD bar."""
+        parent = self.parentWidget()
+        window_width = float(parent.width()) if parent is not None else float(self.width())
+        window_height = (
+            float(parent.height()) if parent is not None else float(self.height())
+        )
+        anchor = self._anchor_x
+        if anchor is None:
+            anchor = window_width / 2.0
+        return _scrub_preview_rect(
+            window_width, window_height, float(anchor), window_height - 64.0 + 5.0
+        )
+
+    def paintEvent(self, event: QPaintEvent | None) -> None:
+        """Paint the snapshot, a green border and the time pill."""
+        del event
+        image = self._image
+        if image is None or image.isNull():
+            return
+        rect = self._preview_rect()
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            path = QPainterPath()
+            path.addRoundedRect(rect, 10.0, 10.0)
+            painter.save()
+            try:
+                painter.setClipPath(path)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(0, 0, 0, 235))
+                painter.drawRect(rect)
+                painter.drawImage(rect, image)
+            finally:
+                painter.restore()
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QColor(116, 195, 41))
+            painter.drawRoundedRect(rect, 10.0, 10.0)
+
+            text = self.timestamp_text()
+            font = QFont()
+            font.setPointSize(max(12, int(rect.height() * 0.085)))
+            font.setBold(True)
+            painter.setFont(font)
+            metrics = painter.fontMetrics()
+            text_width = float(metrics.horizontalAdvance(text)) + 24.0
+            text_height = float(metrics.height()) + 10.0
+            pill = QRectF(
+                rect.left() + 12.0,
+                rect.bottom() - text_height - 12.0,
+                min(text_width, max(0.0, rect.width() - 24.0)),
+                text_height,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 200))
+            painter.drawRoundedRect(pill, 7.0, 7.0)
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
+        finally:
+            painter.end()
+
+
+class ScrubPreviewOsd(Xbox360Osd):
+    """OSD strip whose preview geometry/reporting matches the big overlay."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Create the strip and add the preview timestamp state."""
+        super().__init__(parent)
+        self._preview_seconds: float | None = None
+
+    def set_preview(self, image: QImage | None) -> None:
+        """Store the snapshot and clear the timestamp with it."""
+        if image is None:
+            self._preview_seconds = None
+        super().set_preview(image)
+
+    def set_preview_time(self, seconds: float | None) -> None:
+        """Record the captured frame position for the timestamp label."""
+        self._preview_seconds = seconds
+        self.update()
+
+    def show_osd(self) -> None:
+        """Show the bar and drop any pending preview timestamp."""
+        self._preview_seconds = None
+        super().show_osd()
+
+    def hide(self) -> None:
+        """Hide the bar and drop any pending preview timestamp."""
+        self._preview_seconds = None
+        super().hide()
+
+    def _paint_preview(self, painter: QPainter) -> None:
+        """The big snapshot is painted by :class:`ScrubPreviewOverlay`."""
+        del painter
+
+    def _preview_rect(self) -> QRectF:
+        """Report the big window-scaled preview rect (painted by overlay)."""
+        parent = self.parentWidget()
+        window_width = (
+            float(parent.width()) if parent is not None else float(self.width())
+        )
+        window_height = (
+            float(parent.height()) if parent is not None else float(self.height())
+        )
+        track, _hit = self._seek_bar_rect()
+        anchor = track.center().x() if self._scrub_x is None else self._scrub_x
+        return _scrub_preview_rect(
+            window_width,
+            window_height,
+            float(anchor),
+            float(self.y()) + track.top(),
+        )
+
+
 # ════════════════════════════════════════════════════════════════════
 # SECTION 6 — MainWindow (input mapping & wiring)
 # ════════════════════════════════════════════════════════════════════
@@ -1347,15 +1541,21 @@ class VideoGLWidget(QOpenGLWidget):
 #     osd.scrub_released -> _on_scrub_released. On press/move compute
 #     seconds = fraction * engine.duration (skip when duration is None) and
 #     throttle seeks to one per 250 ms (SCRUB_THROTTLE_MS). A preview is
-#     captured lazily: after a seek, engine.capture_frame() (via getattr:
-#     absent backend -> no preview) runs only when at least 200 ms
-#     (SCRUB_CAPTURE_MS) elapsed since the previous capture, so dragging
-#     does not issue a capture on every throttle tick. When it returns
-#     (w, h, bytes), builds a QImage from the bgr0 bytes (Format_BGR888,
-#     w*4 stride, then mirrored as needed) and calls osd.set_preview(image).
+#     captured lazily: after a seek, one frame is read only when at least
+#     200 ms (SCRUB_CAPTURE_MS) elapsed since the previous capture, so
+#     dragging does not capture on every throttle tick. Render mode reads
+#     the GL widget's grabFramebuffer() (mpv screenshot-raw is black with
+#     vo=libmpv); the wid path falls back to engine.capture_frame() via
+#     getattr (absent backend -> no preview), building a QImage from the
+#     bgr0 bytes (Format_BGR888, w*4 stride). The snapshot is a BIG
+#     (>=320x180, window-scaled) rounded thumbnail painted by
+#     ScrubPreviewOverlay above the video, never clipped by the 64 px OSD
+#     strip, stamped with the frame position via Xbox360Osd._fmt_time.
+#     osd.set_preview(image) remains the capture hand-off/test seam.
 #     On release: final seek_to for the last fraction (no capture),
-#     osd.set_preview(None) and reset the throttle/capture clocks. The
-#     preview exists ONLY between press and release.
+#     osd.set_preview(None), scrub_preview.clear() and reset the
+#     throttle/capture clocks. The preview exists ONLY between press and
+#     release.
 #   * _handle_key mapping (return False when unmapped; a consumed key
 #     reveals the OSD ONLY while engine.menu_active is FALSE; Qt.Key enum
 #     from PyQt6.QtCore):
@@ -1624,8 +1824,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         # The OSD floats above the window so it can hug the bottom edge.
-        self.osd = Xbox360Osd(self)
+        self.osd = ScrubPreviewOsd(self)
         self.osd.hide()
+        # Big live scrub snapshot, stacked above the video (never clipped by
+        # the 64 px strip). Painted only between scrub press and release.
+        self.scrub_preview = ScrubPreviewOverlay(self)
+        self.scrub_preview.hide()
 
         # Full-window launcher and chapter grid overlays (paint-only).
         self.home = HomeMenu(self)
@@ -1682,12 +1886,15 @@ class MainWindow(QMainWindow):
         self.home.setGeometry(0, 0, self.width(), self.height())
         self.chapter_grid.setGeometry(0, 0, self.width(), self.height())
         self.help.setGeometry(0, 0, self.width(), self.height())
+        self.scrub_preview.setGeometry(0, 0, self.width(), self.height())
         if self.home.isVisible():
             self.home.raise_()
         if self.chapter_grid.isVisible():
             self.chapter_grid.raise_()
         if self.help.isVisible():
             self.help.raise_()
+        if self.scrub_preview.isVisible():
+            self.scrub_preview.raise_()
         self.osd.raise_()
 
     def keyPressEvent(self, event: QKeyEvent | None) -> None:
@@ -2459,36 +2666,44 @@ class MainWindow(QMainWindow):
         if fraction is not None:
             self._scrub_seek(fraction, preview=False)
         self.osd.set_preview(None)
+        self.scrub_preview.clear()
         self._scrub_last_seek = 0.0
         self._scrub_last_capture = 0.0
 
-    def _refresh_scrub_preview(self) -> None:
-        """Capture the current frame and show it as the scrub preview."""
-        if not self._scrub_active:
-            return
-        now = time.monotonic()
-        if now - self._scrub_last_capture < self.SCRUB_CAPTURE_MS / 1000.0:
-            return
+    def _render_scrub_frame(self) -> QImage | None:
+        """Return the live GL framebuffer after a render-mode seek."""
+        grab = getattr(self.video, "grabFramebuffer", None)
+        if not callable(grab):
+            return None
+        try:
+            image = grab()
+        except (RuntimeError, SystemError, ValueError):
+            return None
+        if not isinstance(image, QImage) or image.isNull():
+            return None
+        return image
+
+    def _wid_scrub_frame(self) -> QImage | None:
+        """Return the engine-captured frame for the wid video path."""
         capture = getattr(self.engine, "capture_frame", None)
-        if capture is None:
-            return
-        self._scrub_last_capture = now
+        if not callable(capture):
+            return None
         try:
             frame = capture()
         except (PlaybackError, OSError, RuntimeError, SystemError, ValueError):
-            return
+            return None
         if not isinstance(frame, tuple) or len(frame) != 3:
-            return
+            return None
         width, height, data = frame
         if not isinstance(width, int) or not isinstance(height, int):
-            return
+            return None
         if width <= 0 or height <= 0:
-            return
+            return None
         if not isinstance(data, (bytes, bytearray, memoryview)):
-            return
+            return None
         raw = bytes(data)
         if len(raw) < width * height * 4:
-            return
+            return None
         image = QImage(
             raw,
             width,
@@ -2497,8 +2712,35 @@ class MainWindow(QMainWindow):
             QImage.Format.Format_BGR888,
         )
         if image.isNull():
+            return None
+        return image
+
+    def _refresh_scrub_preview(self) -> None:
+        """Capture the current frame and show it as the scrub preview."""
+        if not self._scrub_active:
             return
-        self.osd.set_preview(image.copy())
+        now = time.monotonic()
+        if now - self._scrub_last_capture < self.SCRUB_CAPTURE_MS / 1000.0:
+            return
+        image = (
+            self._render_scrub_frame()
+            if self._render_mode
+            else self._wid_scrub_frame()
+        )
+        self._scrub_last_capture = now
+        if image is None or image.isNull():
+            return
+        seconds = (
+            self._scrub_seconds(self._scrub_fraction)
+            if self._scrub_fraction is not None
+            else None
+        )
+        snapshot = image.copy()
+        self.osd.set_preview(snapshot)
+        self.osd.set_preview_time(seconds)
+        self.scrub_preview.set_frame(
+            snapshot, seconds, anchor_x=self.osd._scrub_x
+        )
 
     def _on_osd_button(self, action: str) -> None:
         """Route an OSD transport click to the matching engine action."""
