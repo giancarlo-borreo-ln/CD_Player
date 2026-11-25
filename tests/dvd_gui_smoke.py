@@ -1822,6 +1822,27 @@ _press_enter(none_window)
 check(_dialogs["question"] == [], "ENTER without an entry opened a dialog")
 check(none_window.home.isHidden(), "ENTER without an entry did not reveal")
 none_window.close()
+
+# (d) a newer no-entry hash invalidates the previous preview stash.
+stale_window, stale_engine = _make_preview_window()
+_stale_resumes: list[dict] = []  # type: ignore[type-arg]
+_stale_forgets: list[str] = []
+stale_engine.resume_disc = lambda saved: _stale_resumes.append(saved)  # type: ignore[method-assign]
+dp.ResumeStore.get = (  # type: ignore[assignment]
+    lambda self, h: {"pos": 65.0} if h == "disc-a" else None
+)
+dp.ResumeStore.forget = lambda self, h: _stale_forgets.append(h)  # type: ignore[method-assign]
+stale_window._on_disc_hash("disc-a")
+check(stale_window._preview_saved == {"pos": 65.0}, "first hash not stashed")
+stale_window._on_disc_hash("disc-b")
+check(stale_window._preview_saved is None, "no-entry hash kept the stale stash")
+check(stale_window._preview_hash is None, "no-entry hash kept the stale hash")
+_dialogs["question"].clear()
+_press_enter(stale_window)
+check(_dialogs["question"] == [], "stale stash prompted for the previous disc")
+check(_stale_resumes == [], "stale stash resumed the previous disc")
+check(_stale_forgets == [], "stale stash forgot the previous disc")
+stale_window.close()
 dp.ResumeStore.get = _orig_resume_get  # type: ignore[assignment]
 dp.ResumeStore.forget = _orig_resume_forget  # type: ignore[assignment]
 

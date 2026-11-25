@@ -1855,9 +1855,11 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     eject/dispose.
 #   * _on_disc_hash(disc_hash): connected to engine.disc_hash_ready (the
 #     backend emits it from a worker thread once the hash is known).
-#     saved = ResumeStore().get(disc_hash); no entry -> nothing. PREVIEW GATE:
-#     while _preview_running and not _preview_revealed, stash
-#     _preview_hash/_preview_saved and return — a preview boot NEVER raises a
+#     EVERY new hash clears _preview_hash/_preview_saved FIRST, then
+#     saved = ResumeStore().get(disc_hash); no entry -> nothing (any older
+#     stash is gone, so ENTER can never resume/forget a previous disc).
+#     PREVIEW GATE: while _preview_running and not _preview_revealed, stash
+#     the current entry and return — a preview boot NEVER raises a
 #     dialog. Only after Enter selects the disc (_reveal_preview) may the
 #     prompt fire. Outside preview, show the resume prompt ONLY while
 #     playback is still early: engine.state is PlayerState.LOADING, or less
@@ -3126,6 +3128,10 @@ class MainWindow(QMainWindow):
     def _on_disc_hash(self, disc_hash: str) -> None:
         """Offer resume state when the backend delivers the disc hash."""
         self._update_window_title()
+        # A newer disc hash invalidates any preview stash immediately: a
+        # no-entry hash must never let ENTER resume/forget the previous disc.
+        self._preview_hash = None
+        self._preview_saved = None
         saved = ResumeStore().get(disc_hash)
         if not saved:
             return
