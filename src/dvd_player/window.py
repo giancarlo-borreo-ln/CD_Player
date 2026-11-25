@@ -8,6 +8,7 @@ import stat
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
@@ -68,6 +69,15 @@ def _sd_mounts() -> list[Path]:
     return mounts
 
 
+@dataclass(frozen=True)
+class HomeEntry:
+    """One dashboard row: a headline, a supporting line and its payload."""
+
+    title: str
+    subtitle: str
+    payload: str
+
+
 class HomeMenu(QWidget):
     """Full-window Xbox 360 dashboard over the still-playing video."""
 
@@ -77,6 +87,17 @@ class HomeMenu(QWidget):
     labels_ready = pyqtSignal(object, arguments=())
 
     BLADES: ClassVar[tuple[str, ...]] = ("DVD", "USB", "Storage")
+    BLADE_SUBTITLES: ClassVar[tuple[str, ...]] = (
+        "Optical drive",
+        "Removable media",
+        "Browse files",
+    )
+    FOOTER_HINTS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("Enter", "select"),
+        ("←/→", "blades"),
+        ("Esc", "back"),
+        ("Ctrl+H", "help"),
+    )
     # A key repeat or a double tap must never re-enter the load flow while
     # the first load is still in LOADING (Enter is edge-triggered).
     SELECT_DEBOUNCE_S: ClassVar[float] = 0.35
@@ -89,6 +110,8 @@ class HomeMenu(QWidget):
         self._blade = 0
         self._selection = 0
         self._last_select_at = 0.0
+        self._hover_blade = -1
+        self._hover_entry = -1
         self._dvd_devices: list[str] = []
         self._dvd_present: dict[str, bool | None] = {}
         self._labels: dict[str, str] = {}
@@ -138,22 +161,64 @@ class HomeMenu(QWidget):
         self.update()
 
     def entries(self) -> list[tuple[str, str]]:
-        """Return (display text, payload) for the active blade."""
+        """Return (display text, payload) for the active blade (compat view)."""
+        return [
+            (
+                f"{row.title}  ·  {row.subtitle}" if row.subtitle else row.title,
+                row.payload,
+            )
+            for row in self.entry_rows()
+        ]
+
+    def entry_rows(self) -> list[HomeEntry]:
+        """Return structured rows (title, subtitle, payload) for the blade."""
         if self._blade == 0:
-            entries: list[tuple[str, str]] = []
+            rows: list[HomeEntry] = []
+            reading = (
+                self._label_thread is not None and self._label_thread.is_alive()
+            )
             for device in self._dvd_devices:
                 present = self._dvd_present.get(device)
                 if present is True:
                     label = self._labels.get(device)
-                    entries.append((f"{device}  ·  {label or 'disc'}", device))
+                    title = label or ("Reading disc…" if reading else "DVD video")
+                    rows.append(HomeEntry(title, device, device))
                 elif present is False:
-                    entries.append((f"{device}  ·  empty", device))
+                    rows.append(HomeEntry("No disc", device, device))
                 else:
-                    entries.append((f"{device}  ·  unknown", device))
-            return entries
+                    rows.append(HomeEntry("Checking disc…", device, device))
+            return rows
         if self._blade == 1:
-            return list(self._usb_entries)
-        return [("Browse for a disc…", "")]
+            return [
+                HomeEntry(name, path, path) for name, path in self._usb_entries
+            ]
+        return [
+            HomeEntry(
+                "Browse for a disc…",
+                "Choose a VIDEO_TS folder or .iso",
+                "",
+            )
+        ]
+
+    def empty_state_text(self) -> str | None:
+        """Guidance shown when the active blade has no rows at all."""
+        if self._blade == 0 and not self._dvd_devices:
+            return "No disc — insert one"
+        if self._blade == 1 and not self._usb_entries:
+            return "No USB media — plug in a drive"
+        return None
+
+    def empty_state_hint(self) -> str:
+        """Supporting line under the empty-state headline."""
+        if self._blade == 0:
+            return "The dashboard refreshes automatically when a disc is ready."
+        return "Removable volumes appear here automatically."
+
+    def footer_text(self) -> str:
+        """Return the painted key-hint footer as plain text (test surface)."""
+        return "  ·  ".join(
+            f"{key} {action}" for key, action in self.FOOTER_HINTS
+        )
 
     def blade_name(self) -> str:
         """Return the active blade name."""
@@ -282,34 +347,271 @@ class HomeMenu(QWidget):
         return True
 
     # ── painting ────────────────────────────────────────────────────
+    def _layout(self) -> dict[str, float]:
+        """Return the shared spacing grid (blades 260-320 px, 16 px gaps)."""
+        width = float(self.width())
+        height = float(self.height())
+        margin = 24.0
+        content = max(0.0, width - 2.0 * margin)
+        blade_top = max(76.0, min(104.0, height * 0.14))
+        blade_h = max(84.0, min(132.0, height * 0.17))
+        entry_h = 56.0 if height >= 620.0 else 50.0
+        footer_h = 26.0
+        footer_top = height - margin - footer_h
+        return {
+            "margin": margin,
+            "content": content,
+            "blade_top": blade_top,
+            "blade_h": blade_h,
+            "blade_gap": 16.0,
+            "entry_top": blade_top + blade_h + 24.0,
+            "entry_h": entry_h,
+            "entry_gap": 10.0,
+            "list_w": min(content, 900.0),
+            "footer_top": footer_top,
+            "footer_h": footer_h,
+        }
+
     def _blade_rects(self) -> list[tuple[str, QRectF]]:
         """Return the three blade panel rectangles, left to right."""
-        margin = 48.0
-        gap = 18.0
-        width = max(0.0, (float(self.width()) - 2.0 * margin - 2.0 * gap) / 3.0)
-        top = max(28.0, float(self.height()) * 0.16)
-        height = min(86.0, max(56.0, float(self.height()) * 0.14))
+        m = self._layout()
+        gap = m["blade_gap"]
+        width = min(320.0, max(0.0, (m["content"] - 2.0 * gap) / 3.0))
         rects: list[tuple[str, QRectF]] = []
         for index, name in enumerate(self.BLADES):
-            left = margin + index * (width + gap)
-            rects.append((name, QRectF(left, top, width, height)))
+            left = m["margin"] + index * (width + gap)
+            rects.append(
+                (name, QRectF(left, m["blade_top"], width, m["blade_h"]))
+            )
         return rects
 
     def _entry_rects(self) -> list[QRectF]:
         """Return entry row rectangles under the blades."""
-        margin = 48.0
-        top = max(28.0, float(self.height()) * 0.16) + min(
-            86.0, max(56.0, float(self.height()) * 0.14)
-        ) + 28.0
-        width = max(0.0, float(self.width()) - 2.0 * margin)
-        height = 46.0
+        m = self._layout()
+        step = m["entry_h"] + m["entry_gap"]
         return [
-            QRectF(margin, top + index * (height + 10.0), width, height)
-            for index in range(len(self.entries()))
+            QRectF(m["margin"], m["entry_top"] + index * step, m["list_w"], m["entry_h"])
+            for index in range(len(self.entry_rows()))
         ]
 
+    def footer_rect(self) -> QRectF:
+        """Return the key-hint footer band (inside the widget)."""
+        m = self._layout()
+        return QRectF(m["margin"], m["footer_top"], m["content"], m["footer_h"])
+
+    @staticmethod
+    def _font(size: int, bold: bool = False, italic: bool = False) -> QFont:
+        """Build one dashboard font (no stylesheets, paint-only)."""
+        font = QFont()
+        font.setPointSize(size)
+        font.setBold(bold)
+        font.setItalic(italic)
+        return font
+
+    def _paint_header(self, painter: QPainter, m: dict[str, float]) -> None:
+        """Paint the title band: product name, brand mark and accent rule."""
+        painter.setFont(self._font(20, True))
+        painter.setPen(QColor(230, 234, 227))
+        painter.drawText(
+            QRectF(m["margin"], m["margin"], m["content"], 30.0),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            "DVD PLAYER",
+        )
+        painter.setFont(self._font(10, True))
+        painter.setPen(QColor(116, 195, 41))
+        painter.drawText(
+            QRectF(m["margin"], m["margin"], m["content"], 30.0),
+            int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            "X B O X  3 6 0",
+        )
+        rule_y = m["margin"] + 34.0
+        painter.setPen(QColor(42, 49, 42))
+        painter.drawLine(
+            int(m["margin"]), int(rule_y),
+            int(m["margin"] + m["content"]), int(rule_y),
+        )
+        painter.setPen(QColor(116, 195, 41))
+        painter.drawLine(
+            int(m["margin"]), int(rule_y),
+            int(m["margin"] + 64.0), int(rule_y),
+        )
+
+    def _paint_blades(self, painter: QPainter) -> None:
+        """Paint the three blade cards with selected/hover/muted states."""
+        for index, (name, rect) in enumerate(self._blade_rects()):
+            active = index == self._blade
+            hover = index == self._hover_blade and not active
+            border = (
+                QColor(116, 195, 41)
+                if active
+                else QColor(58, 90, 31) if hover else QColor(42, 49, 42)
+            )
+            fill = (
+                QColor(32, 48, 31)
+                if active
+                else QColor(38, 46, 38) if hover else QColor(27, 33, 29)
+            )
+            painter.setPen(border)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 10.0, 10.0)
+            if active:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(116, 195, 41, 46))
+                painter.drawRoundedRect(rect, 10.0, 10.0)
+                painter.setBrush(QColor(116, 195, 41))
+                painter.drawRect(
+                    QRectF(rect.left() + 16.0, rect.bottom() - 6.0, 40.0, 3.0)
+                )
+                painter.drawEllipse(
+                    QRectF(rect.right() - 24.0, rect.center().y() - 4.0, 8.0, 8.0)
+                )
+            painter.setFont(self._font(15, True))
+            painter.setPen(
+                QColor(159, 232, 85)
+                if active
+                else QColor(230, 234, 227) if hover else QColor(154, 163, 154)
+            )
+            painter.drawText(
+                QRectF(rect.left() + 18.0, rect.top() + 14.0, rect.width() - 36.0, 26.0),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                name.upper(),
+            )
+            painter.setFont(self._font(9))
+            painter.setPen(
+                QColor(154, 163, 154) if active else QColor(92, 101, 92)
+            )
+            painter.drawText(
+                QRectF(rect.left() + 18.0, rect.top() + 44.0, rect.width() - 36.0, 20.0),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                self.BLADE_SUBTITLES[index],
+            )
+
+    def _paint_empty(self, painter: QPainter, m: dict[str, float]) -> None:
+        """Paint a helpful empty card instead of leaving the area blank."""
+        headline = self.empty_state_text()
+        if headline is None:
+            return
+        panel = QRectF(
+            m["margin"], m["entry_top"], m["list_w"], min(150.0, m["entry_h"] * 2.4)
+        )
+        painter.setPen(QColor(42, 49, 42))
+        painter.setBrush(QColor(27, 33, 29))
+        painter.drawRoundedRect(panel, 10.0, 10.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(116, 195, 41, 40))
+        painter.drawEllipse(
+            QRectF(panel.left() + 22.0, panel.top() + 32.0, 34.0, 34.0)
+        )
+        painter.setPen(QColor(116, 195, 41))
+        painter.setFont(self._font(15, True))
+        painter.drawText(
+            QRectF(panel.left() + 26.0, panel.top() + 36.0, 26.0, 26.0),
+            int(Qt.AlignmentFlag.AlignCenter),
+            "◎",
+        )
+        painter.setPen(QColor(154, 163, 154))
+        painter.setFont(self._font(13, False, True))
+        painter.drawText(
+            QRectF(panel.left() + 74.0, panel.top() + 30.0, panel.width() - 96.0, 24.0),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            headline,
+        )
+        painter.setPen(QColor(92, 101, 92))
+        painter.setFont(self._font(9, False, True))
+        painter.drawText(
+            QRectF(panel.left() + 74.0, panel.top() + 56.0, panel.width() - 96.0, 22.0),
+            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+            self.empty_state_hint(),
+        )
+
+    def _paint_entries(self, painter: QPainter) -> None:
+        """Paint two-line entry rows with selected and hover states."""
+        rows = self.entry_rows()
+        limit = self._layout()["footer_top"] - 8.0
+        for index, (row, rect) in enumerate(
+            zip(rows, self._entry_rects(), strict=False)
+        ):
+            if rect.bottom() > limit:
+                break  # never paint rows over the key-hint footer
+            chosen = index == self._selection
+            hover = index == self._hover_entry and not chosen
+            border = (
+                QColor(116, 195, 41)
+                if chosen
+                else QColor(58, 90, 31) if hover else QColor(42, 49, 42)
+            )
+            fill = (
+                QColor(32, 48, 31)
+                if chosen
+                else QColor(38, 46, 38) if hover else QColor(27, 33, 29)
+            )
+            painter.setPen(border)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 8.0, 8.0)
+            if chosen:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(116, 195, 41, 46))
+                painter.drawRoundedRect(rect, 8.0, 8.0)
+                painter.setBrush(QColor(116, 195, 41))
+                painter.drawRect(
+                    QRectF(rect.left() + 12.0, rect.top() + 12.0, 3.0, rect.height() - 24.0)
+                )
+            painter.setFont(self._font(13, chosen))
+            painter.setPen(
+                QColor(159, 232, 85) if chosen else QColor(230, 234, 227)
+            )
+            painter.drawText(
+                QRectF(
+                    rect.left() + 24.0,
+                    rect.top() + 6.0,
+                    rect.width() - 68.0,
+                    rect.height() * 0.5 - 4.0,
+                ),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                row.title,
+            )
+            painter.setFont(self._font(11))
+            painter.setPen(QColor(154, 163, 154) if chosen else QColor(92, 101, 92))
+            painter.drawText(
+                QRectF(
+                    rect.left() + 24.0,
+                    rect.top() + rect.height() * 0.5 - 2.0,
+                    rect.width() - 68.0,
+                    rect.height() * 0.5 - 4.0,
+                ),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                row.subtitle,
+            )
+            actionable = bool(row.payload) and row.title != "No disc"
+            if actionable:
+                painter.setFont(self._font(15, chosen))
+                painter.setPen(
+                    QColor(116, 195, 41) if chosen else QColor(92, 101, 92)
+                )
+                painter.drawText(
+                    QRectF(rect.right() - 42.0, rect.top(), 26.0, rect.height()),
+                    int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                    "›",
+                )
+
+    def _paint_footer(self, painter: QPainter, m: dict[str, float]) -> None:
+        """Paint the separator and the centered 9 pt muted key hints."""
+        footer = self.footer_rect()
+        painter.setPen(QColor(42, 49, 42))
+        painter.drawLine(
+            int(m["margin"]), int(footer.top() - 8.0),
+            int(m["margin"] + m["content"]), int(footer.top() - 8.0),
+        )
+        painter.setFont(self._font(9))
+        painter.setPen(QColor(92, 101, 92))
+        painter.drawText(
+            footer,
+            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+            self.footer_text(),
+        )
+
     def paintEvent(self, event: QPaintEvent | None) -> None:
-        """Draw the dim veil, 360 blades and the active blade's entries."""
+        """Draw the 360 dashboard: title band, blades, rows and hints."""
         del event
         if not self._painted_once:
             self._painted_once = True
@@ -318,85 +620,61 @@ class HomeMenu(QWidget):
                 self.geometry(),
                 int(self.winId()),
             )
+        m = self._layout()
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            veil = QLinearGradient(0.0, 0.0, 0.0, float(self.height()))
-            veil.setColorAt(0.0, QColor(4, 10, 5, 210))
-            veil.setColorAt(1.0, QColor(0, 0, 0, 215))
-            painter.fillRect(self.rect(), veil)
-
-            title_font = QFont()
-            title_font.setPointSize(18)
-            title_font.setBold(True)
-            painter.setFont(title_font)
-            painter.setPen(QColor(255, 255, 255))
-            painter.drawText(48, 34, "DVD PLAYER")
-
-            for index, (name, rect) in enumerate(self._blade_rects()):
-                active = index == self._blade
-                painter.setPen(
-                    QColor(116, 195, 41)
-                    if active
-                    else QColor(255, 255, 255, 55)
-                )
-                painter.setBrush(
-                    QColor(22, 28, 22, 235) if active else QColor(26, 30, 26, 220)
-                )
-                painter.drawRoundedRect(rect, 8.0, 8.0)
-                blade_font = QFont()
-                blade_font.setPointSize(14)
-                blade_font.setBold(active)
-                painter.setFont(blade_font)
-                painter.setPen(
-                    QColor(116, 195, 41) if active else QColor(200, 200, 200)
-                )
-                painter.drawText(
-                    rect.adjusted(18.0, 0.0, -8.0, 0.0),
-                    int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                    name,
-                )
-
-            entries = self.entries()
-            row_font = QFont()
-            row_font.setPointSize(12)
-            painter.setFont(row_font)
-            if not entries:
-                painter.setPen(QColor(180, 180, 180))
-                painter.drawText(48, int(self.height() * 0.55), "No entries")
-            for index, ((display, _payload), rect) in enumerate(
-                zip(entries, self._entry_rects(), strict=False)
-            ):
-                chosen = index == self._selection
-                painter.setPen(
-                    QColor(116, 195, 41)
-                    if chosen
-                    else QColor(255, 255, 255, 35)
-                )
-                painter.setBrush(
-                    QColor(28, 38, 24, 230) if chosen else QColor(16, 18, 16, 200)
-                )
-                painter.drawRoundedRect(rect, 6.0, 6.0)
-                painter.setPen(
-                    QColor(116, 195, 41) if chosen else QColor(220, 220, 220)
-                )
-                painter.drawText(
-                    rect.adjusted(18.0, 0.0, -8.0, 0.0),
-                    int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
-                    display,
-                )
-
-            hint_font = QFont()
-            hint_font.setPointSize(9)
-            painter.setFont(hint_font)
-            painter.setPen(QColor(160, 160, 160))
-            painter.drawText(
-                48,
-                self.height() - 20,
-                "←/→ Blade    ↑/↓ Select    A Play    B Back    G Guide",
+            painter.fillRect(self.rect(), QColor(6, 10, 7, 220))
+            band = QLinearGradient(0.0, 0.0, 0.0, float(self.height()) * 0.42)
+            band.setColorAt(0.0, QColor(116, 195, 41, 24))
+            band.setColorAt(0.6, QColor(11, 14, 12, 10))
+            band.setColorAt(1.0, QColor(11, 14, 12, 0))
+            painter.fillRect(
+                QRectF(0.0, 0.0, float(self.width()), float(self.height()) * 0.42),
+                band,
             )
+            self._paint_header(painter, m)
+            self._paint_blades(painter)
+            self._paint_empty(painter, m)
+            self._paint_entries(painter)
+            self._paint_footer(painter, m)
         finally:
             painter.end()
+
+    # ── pointer states ──────────────────────────────────────────────
+    def mouseMoveEvent(self, event: QMouseEvent | None) -> None:
+        """Track hover over blades and rows; repaint only on change."""
+        if event is not None:
+            pos = event.position()
+            blade = next(
+                (
+                    index
+                    for index, (_name, rect) in enumerate(self._blade_rects())
+                    if rect.contains(pos)
+                ),
+                -1,
+            )
+            entry = next(
+                (
+                    index
+                    for index, rect in enumerate(self._entry_rects())
+                    if rect.contains(pos)
+                ),
+                -1,
+            )
+            if (blade, entry) != (self._hover_blade, self._hover_entry):
+                self._hover_blade = blade
+                self._hover_entry = entry
+                self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QEvent | None) -> None:
+        """Clear hover states when the pointer leaves the dashboard."""
+        if self._hover_blade != -1 or self._hover_entry != -1:
+            self._hover_blade = -1
+            self._hover_entry = -1
+            self.update()
+        super().leaveEvent(event)
 
 
 class ChapterGrid(QWidget):
@@ -1079,6 +1357,19 @@ class VideoGLWidget(QOpenGLWidget):
 #     initializeGL's wid fallback and _attach_engine refuse wid embedding
 #     instead of passing a wl_surface pointer to Xlib, which aborts the
 #     process with an uncatchable X BadWindow error on first load.
+#   * HomeMenu presentation (paint-only, no QSS/assets): structured
+#     HomeEntry(title, subtitle, payload) rows (entries() stays the legacy
+#     (text, payload) projection). Palette #0B0E0C veil 220, panels #1B211D,
+#     selected #20301F + green 18% tint, green #74C329, bright #9FE855,
+#     borders #2A312A/#3A5A1F, text #E6EAE3/#9AA39A/#5C655C. Title band 20 pt
+#     bold with green underline; three 260-320 px blades, 16 px gaps, 24 px
+#     margins, 10 px radius; blades uppercase 15 pt; entry rows 8 px radius,
+#     13 pt title + 11 pt subtitle, selected = tint + 3 px green bar + bright
+#     text; hover = lighter fill. Empty blades paint muted italic guidance
+#     ("No disc — insert one"); a disc whose label is still loading shows a
+#     muted "Reading disc…" placeholder, never a blank row. Footer: centered
+#     9 pt muted hints "Enter select · ←/→ blades · Esc back · Ctrl+H help".
+#     Hover is pointer-only; navigation/selection/load contracts unchanged.
 #   * ChapterGrid overlay (C): key C in PLAYING/PAUSED opens it with
 #     engine.chapter_list; arrows navigate, Enter schedules ONE coalesced
 #     engine.seek_to(chapter time) after the grid's 350 ms settle; Escape or

@@ -993,6 +993,31 @@ dedupe_menu.handle_key(Qt.Key.Key_Return.value)
 check(_picked == ["/dev/sr0"], f"double Enter selected {_picked}")
 check(_window_mod.wid_embedding_safe() is True,
       "wid path wrongly rejected on a non-Wayland platform")
+dedupe_menu.resize(1280, 720)
+rows = dedupe_menu.entry_rows()
+check(len(rows) == 1 and rows[0].title == "DVD video",
+      f"DVD row title -> {rows}")
+check(rows[0].subtitle == "/dev/sr0", f"DVD row subtitle -> {rows[0].subtitle}")
+dedupe_menu._dvd_present = {"/dev/sr0": False}
+empty_row = dedupe_menu.entry_rows()[0]
+check(empty_row.title == "No disc" and empty_row.subtitle == "/dev/sr0",
+      f"empty disc row -> {empty_row}")
+dedupe_menu._dvd_devices = []
+dedupe_menu._dvd_present = {}
+check(dedupe_menu.empty_state_text() == "No disc — insert one",
+      f"DVD empty state -> {dedupe_menu.empty_state_text()!r}")
+check("automatic" in dedupe_menu.empty_state_hint(),
+      "empty state lost its guidance line")
+check(dedupe_menu.footer_text() ==
+      "Enter select  ·  ←/→ blades  ·  Esc back  ·  Ctrl+H help",
+      f"footer text -> {dedupe_menu.footer_text()!r}")
+footer = dedupe_menu.footer_rect()
+check(footer.height() > 0 and footer.bottom() <= 720,
+      f"footer band outside the menu -> {footer}")
+dedupe_menu._blade = 2
+storage_row = dedupe_menu.entry_rows()[0]
+check(storage_row.subtitle == "Choose a VIDEO_TS folder or .iso"
+      and storage_row.payload == "", f"storage row -> {storage_row}")
 dedupe_menu.deleteLater()
 
 # ── (o) C1/C2: ChapterGrid fidelity + burst coalescing ─────────────

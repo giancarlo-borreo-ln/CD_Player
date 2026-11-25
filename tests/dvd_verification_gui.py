@@ -722,6 +722,25 @@ for _y in range(launch_image.height()):
         ):
             _green += 1
 check(_green > 100, f"active blade not green at open: {_green} px")
+# Brief structure: titled rows + subtitles, guidance and a painted footer.
+check(launch_menu.entry_rows()[0].title == "DVD video",
+      "DVD row is not titled")
+check(launch_menu.entry_rows()[0].subtitle == "/dev/sr0",
+      "DVD row lost its device subtitle")
+check(launch_menu.footer_text() ==
+      "Enter select  ·  ←/→ blades  ·  Esc back  ·  Ctrl+H help",
+      f"footer text drifted: {launch_menu.footer_text()!r}")
+_footer = launch_menu.footer_rect()
+check(0 < _footer.height() and _footer.bottom() <= 720,
+      f"footer not painted inside the menu: {_footer}")
+launch_menu._dvd_devices = []
+launch_menu._dvd_present = {}
+check(launch_menu.empty_state_text() == "No disc — insert one",
+      "DVD empty-state guidance missing")
+check(len(launch_menu.entry_rows()) == 0, "empty blade still has rows")
+launch_image.fill(QColor(0, 0, 0))
+launch_menu.render(launch_image)
+check(not launch_image.isNull(), "empty-state repaint failed")
 launch_menu.deleteLater()
 
 # R8: platform gate — render API prefers native Wayland, wid keeps xcb,
