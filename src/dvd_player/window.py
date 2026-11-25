@@ -1061,8 +1061,21 @@ class HelpOverlay(QWidget):
 # wid surface. Overlays stay siblings above the GL widget (paint-only, no
 # native-window tricks); mouse coordinates are scaled by the device pixel
 # ratio so dvdnav sees the same widget-space points as the old wid path.
-RENDER_MODE_ENV = "DVD_PLAYER_RENDER_MODE"
-_RENDER_MODES: tuple[str, ...] = ("render", "gl", "opengl")
+# Dispatch contract: DVD_PLAYER_RENDER=auto|render -> GL surface and
+# attach_render(get_proc, fbo); wid embedding is only chosen when
+# wid_embedding_safe() (xcb). On native Wayland render mode NEVER calls
+# attach_widget; software on Wayland still attempts attach_render once,
+# then shows the graceful renderer-unavailable status.
+# B1/B2: DVD_PLAYER_RENDER is the single switch understood by both the
+# engine (auto = probe hardware, software = llvmpipe) and this dispatch.
+# ``auto``/``render`` ask for the GL render surface; ``software``/``wid``
+# keep the native-window path whenever the platform can embed it.
+RENDER_MODE_ENV = "DVD_PLAYER_RENDER"
+_RENDER_MODES: tuple[str, ...] = ("render", "gl", "opengl", "auto")
+# Legacy spellings stay accepted so older launch scripts do not silently
+# fall back to wid embedding.
+_RENDER_MODE_ENV_ALIAS = "DVD_PLAYER_RENDER_MODE"
+_RENDER_API_ENV_ALIAS = "DVD_PLAYER_RENDER_API"
 
 
 def render_mode_requested(env: Mapping[str, str] | None = None) -> bool:
@@ -1071,7 +1084,10 @@ def render_mode_requested(env: Mapping[str, str] | None = None) -> bool:
     mode = source.get(RENDER_MODE_ENV, "").strip().lower()
     if mode in _RENDER_MODES:
         return True
-    api = source.get("DVD_PLAYER_RENDER_API", "").strip().lower()
+    legacy = source.get(_RENDER_MODE_ENV_ALIAS, "").strip().lower()
+    if legacy in _RENDER_MODES:
+        return True
+    api = source.get(_RENDER_API_ENV_ALIAS, "").strip().lower()
     return api in ("1", "true", "yes", *_RENDER_MODES)
 
 
@@ -1100,6 +1116,20 @@ def wid_embedding_safe() -> bool:
     if app is None:
         return True
     return bool(app.platformName() != "wayland")
+
+
+def render_surface_required(
+    engine: object, env: Mapping[str, str] | None = None
+) -> bool:
+    """Whether MainWindow must build the GL render surface.
+
+    ``DVD_PLAYER_RENDER=auto``/``render`` always asks for it. On a platform
+    where wid embedding is unsafe (native Wayland) the GL surface is the
+    only viable path even for ``software``, so the window still attempts
+    ``attach_render`` and then degrades to the graceful status instead of
+    handing a wl_surface id to Xlib.
+    """
+    return render_mode_active(engine, env) or not wid_embedding_safe()
 
 
 class VideoGLWidget(QOpenGLWidget):
@@ -1510,22 +1540,27 @@ class ScrubPreviewOsd(Xbox360Osd):
 # ════════════════════════════════════════════════════════════════════
 
 # SPEC for SECTION 6 (MainWindow) — contract, do not edit:
-#   R6/R7 (render-api addendum): when render_mode_active(engine) is true,
-#     self.video is a VideoGLWidget(QOpenGLWidget) whose initializeGL/
-#     paintGL/resizeGL bridge to engine.attach_render/update/render_frame/
-#     resize_render (all guarded with getattr). attach_render(proc, fbo=…)
+#   R6/R7 (render-api addendum): when render_surface_required(engine) is
+#     true (DVD_PLAYER_RENDER=auto|render, or any platform where wid
+#     embedding is unsafe), self.video is a VideoGLWidget(QOpenGLWidget)
+#     whose initializeGL/paintGL/resizeGL bridge to engine.attach_render/
+#     update/render_frame/resize_render (all guarded with getattr).
+#     attach_render(proc, fbo=…)
 #     returns True only when libmpv paints into the widget's own FBO: the
 #     widget passes ``lambda: int(defaultFramebufferObject())`` so the live
 #     framebuffer is re-read on every frame. Returning False (or raising)
 #     triggers one software-GL retry on native Wayland (LIBGL_ALWAYS_SOFTWARE
-#     set before the re-init, only when the flag was absent); if that also
-#     fails the widget calls engine.attach_widget(int(winId())) once — the
-#     wid path is the ordered fallback. initializeGL then ALWAYS emits
+#     set before the re-init, only when the flag was absent). On xcb the
+#     failed handshake may then call engine.attach_widget(int(winId())) once
+#     (the wid path is the ordered fallback); on native Wayland wid is NEVER
+#     attempted. initializeGL then ALWAYS emits
 #     attach_complete(attached); failures are logged, never a silent black
 #     frame. MainWindow holds one pending-load slot until that signal: no
 #     preview/user load reaches engine.load before it fires. A False result
 #     (or an attach-related PlaybackError) clears the queue and shows
 #     'renderer unavailable — falling back…', never the raw PlaybackError.
+#     A software request on native Wayland is routed through this same GL
+#     attempt, then the graceful status when the render handshake fails.
 #     paintGL runs exactly one engine.update() followed by one
 #     engine.render_frame(width*dpr, height*dpr) per paint, swallowing
 #     exceptions so a render fault cannot abort or corrupt the paint loop.
@@ -1874,9 +1909,10 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # R6: the render API gets a GL surface; the wid path keeps the
-        # plain native-child QWidget exactly as before.
-        self._render_mode = render_mode_active(self.engine)
+        # R6: DVD_PLAYER_RENDER=auto/render asks for the GL surface; so does
+        # any platform where wid embedding is unsafe (native Wayland), where
+        # attach_render is the only alternative to the graceful status.
+        self._render_mode = render_surface_required(self.engine)
         self.video: QWidget = (
             VideoGLWidget(self.engine, central)
             if self._render_mode
@@ -3151,12 +3187,11 @@ class MainWindow(QMainWindow):
         """Bind mpv to the video widget, then honour an initial source."""
         started = time.monotonic()
         has_render = callable(getattr(self.engine, "attach_render", None))
+        platform = VideoGLWidget._platform_name()
         log.info(
             "milestone attach attempt: mode=%s platform=%s",
-            "render" if has_render else "wid",
-            QApplication.instance().platformName()
-            if QApplication.instance() is not None
-            else "?",
+            "render" if isinstance(self.video, VideoGLWidget) else "wid",
+            platform,
         )
         if isinstance(self.video, VideoGLWidget) and has_render:
             # The GL context is ready only after show(); initializeGL()
@@ -3172,10 +3207,8 @@ class MainWindow(QMainWindow):
             if not wid_embedding_safe():
                 log.error(
                     "wid embedding cannot work on Qt platform %r: set "
-                    "DVD_PLAYER_RENDER_MODE=render or use xcb",
-                    QApplication.instance().platformName()
-                    if QApplication.instance() is not None
-                    else "?",
+                    "DVD_PLAYER_RENDER=auto or use xcb",
+                    platform,
                 )
                 self._attach_failed = True
                 self._engine_attached = False

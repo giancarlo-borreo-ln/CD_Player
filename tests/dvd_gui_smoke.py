@@ -1926,4 +1926,111 @@ dp.list_dvd_devices = _orig_startup_devices  # type: ignore[assignment]
 dp.disc_present = _orig_startup_present  # type: ignore[assignment]
 startup_window.close()
 
+# ── (z2) render dispatch matrix: DVD_PLAYER_RENDER -> attach path ────
+# Env naming and the platform gate must agree: auto/render on Wayland
+# reaches attach_render(proc, fbo) and never touches attach_widget; xcb
+# keeps the wid path; software on Wayland attempts render then degrades.
+check(_winmod.RENDER_MODE_ENV == "DVD_PLAYER_RENDER",
+      f"render env name drifted: {_winmod.RENDER_MODE_ENV}")
+for _value in ("auto", "render"):
+    check(_winmod.render_mode_requested({"DVD_PLAYER_RENDER": _value}),
+          f"DVD_PLAYER_RENDER={_value} did not select render mode")
+check(not _winmod.render_mode_requested({"DVD_PLAYER_RENDER": "software"}),
+      "DVD_PLAYER_RENDER=software wrongly selected render mode")
+check(_winmod.render_mode_requested({"DVD_PLAYER_RENDER_MODE": "render"}),
+      "legacy render-mode spelling stopped working")
+
+_orig_wid_safe = _winmod.wid_embedding_safe
+_orig_platform = _winmod.VideoGLWidget._platform_name
+_orig_render_env = os.environ.pop("DVD_PLAYER_RENDER", None)
+_orig_software = os.environ.get("LIBGL_ALWAYS_SOFTWARE")
+_dispatch_windows: list[dp.MainWindow] = []
+try:
+    # (1) DVD_PLAYER_RENDER=auto on native Wayland -> attach_render.
+    _winmod.wid_embedding_safe = lambda: False
+    _winmod.VideoGLWidget._platform_name = staticmethod(lambda: "wayland")
+    os.environ["DVD_PLAYER_RENDER"] = "auto"
+    auto_engine = dp.DvdPlaybackEngine()
+    auto_render: list[tuple[object, object]] = []
+    auto_wid: list[int] = []
+    auto_engine.attach_render = (  # type: ignore[method-assign]
+        lambda proc, fbo=None: (auto_render.append((proc, fbo)), True)[1]
+    )
+    auto_engine.attach_widget = lambda wid: auto_wid.append(wid)  # type: ignore[method-assign]
+    auto_window = dp.MainWindow(auto_engine)
+    auto_window._auto_detected = True
+    _dispatch_windows.append(auto_window)
+    check(isinstance(auto_window.video, _winmod.VideoGLWidget),
+          "DVD_PLAYER_RENDER=auto on Wayland did not build the GL surface")
+    auto_widget = auto_window.video
+    auto_widget.initializeGL()
+    check(len(auto_render) == 1,
+          f"auto/Wayland did not call attach_render once: {auto_render}")
+    check(callable(auto_render[0][1]),
+          f"attach_render did not receive an FBO callable: {auto_render[0]}")
+    check(auto_wid == [], f"auto/Wayland wrongly used attach_widget: {auto_wid}")
+    check(auto_widget._render_attached is True,
+          "auto/Wayland attach_render success was not recorded")
+
+    # (2) software on xcb -> wid path, never attach_render.
+    _winmod.wid_embedding_safe = lambda: True
+    _winmod.VideoGLWidget._platform_name = staticmethod(lambda: "xcb")
+    os.environ["DVD_PLAYER_RENDER"] = "software"
+    xcb_engine = dp.DvdPlaybackEngine()
+    xcb_render: list[object] = []
+    xcb_wid: list[int] = []
+    xcb_engine.attach_render = (  # type: ignore[method-assign]
+        lambda proc, fbo=None: (xcb_render.append(proc), True)[1]
+    )
+    xcb_engine.attach_widget = lambda wid: xcb_wid.append(wid)  # type: ignore[method-assign]
+    xcb_window = dp.MainWindow(xcb_engine)
+    xcb_window._auto_detected = True
+    _dispatch_windows.append(xcb_window)
+    check(not isinstance(xcb_window.video, _winmod.VideoGLWidget),
+          "software on xcb mistakenly built the GL surface")
+    xcb_window._attach_engine()
+    check(xcb_wid == [int(xcb_window.video.winId())],
+          f"software/xcb did not take the wid path: {xcb_wid}")
+    check(xcb_render == [], f"software/xcb wrongly called attach_render: {xcb_render}")
+
+    # (3) software on Wayland -> one render attempt, no wid fallback,
+    #     then the graceful status (wid embedding is impossible).
+    _winmod.wid_embedding_safe = lambda: False
+    _winmod.VideoGLWidget._platform_name = staticmethod(lambda: "wayland")
+    os.environ["DVD_PLAYER_RENDER"] = "software"
+    os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"  # skip the one-shot retry
+    soft_engine = dp.DvdPlaybackEngine()
+    soft_render: list[object] = []
+    soft_wid: list[int] = []
+    soft_engine.attach_render = (  # type: ignore[method-assign]
+        lambda proc, fbo=None: (soft_render.append(proc), False)[1]
+    )
+    soft_engine.attach_widget = lambda wid: soft_wid.append(wid)  # type: ignore[method-assign]
+    soft_window = dp.MainWindow(soft_engine)
+    soft_window._auto_detected = True
+    _dispatch_windows.append(soft_window)
+    check(isinstance(soft_window.video, _winmod.VideoGLWidget),
+          "software on Wayland did not attempt the GL surface")
+    soft_window.video.initializeGL()
+    check(len(soft_render) == 1,
+          f"software/Wayland did not attempt attach_render: {soft_render}")
+    check(soft_wid == [], f"software/Wayland wrongly fell back to wid: {soft_wid}")
+    check(soft_window._attach_failed is True,
+          "software/Wayland failure was not recorded")
+    check("renderer unavailable" in soft_window.status.text(),
+          f"software/Wayland missed the graceful status: {soft_window.status.text()!r}")
+finally:
+    for _window in _dispatch_windows:
+        _window.close()
+    _winmod.wid_embedding_safe = _orig_wid_safe  # type: ignore[method-assign]
+    _winmod.VideoGLWidget._platform_name = staticmethod(_orig_platform)  # type: ignore[method-assign]
+    if _orig_render_env is None:
+        os.environ.pop("DVD_PLAYER_RENDER", None)
+    else:
+        os.environ["DVD_PLAYER_RENDER"] = _orig_render_env
+    if _orig_software is None:
+        os.environ.pop("LIBGL_ALWAYS_SOFTWARE", None)
+    else:
+        os.environ["LIBGL_ALWAYS_SOFTWARE"] = _orig_software
+
 print(f"GUI SMOKE OK {_count} assertions")
