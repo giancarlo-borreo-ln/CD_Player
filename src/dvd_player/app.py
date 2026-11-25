@@ -21,7 +21,8 @@ def choose_platform(env: Mapping[str, str] | None = None) -> str | None:
     """Pick QT_QPA_PLATFORM for this session (None leaves it untouched).
 
     R8 precedence, highest first:
-    1. an explicit ``xcb``/``wayland`` choice in QT_QPA_PLATFORM is honored;
+    1. any non-empty QT_QPA_PLATFORM is honored verbatim (xcb, wayland,
+       offscreen, minimal, vnc, foo, ...): the user/CI override wins;
     2. no WAYLAND_DISPLAY -> untouched (native X11/offscreen);
     3. render API requested (DVD_PLAYER_RENDER_MODE/API) -> ``wayland``:
        the GL surface owns its context, so no wid/XWayland is needed;
@@ -33,8 +34,7 @@ def choose_platform(env: Mapping[str, str] | None = None) -> str | None:
     a refused wid attach is handled at runtime by ``attach_widget``.
     """
     source = os.environ if env is None else env
-    current = source.get("QT_QPA_PLATFORM", "").strip().lower()
-    if current.startswith(("xcb", "wayland")):
+    if source.get("QT_QPA_PLATFORM", "").strip():
         return None
     if not source.get("WAYLAND_DISPLAY"):
         return None

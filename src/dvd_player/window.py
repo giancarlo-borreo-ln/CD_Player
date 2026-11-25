@@ -1642,7 +1642,7 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     session gets native Wayland; the wid path gets xcb (XWayland) because
 #     it needs a real X11 window id. window.py never mutates the environment
 #     at import time. If native Wayland survives anyway (no DISPLAY, or an
-#     explicit wayland choice), both initializeGL's wid fallback and
+#     explicit QT_QPA_PLATFORM choice), both initializeGL's wid fallback and
 #     _attach_engine refuse wid embedding at runtime instead of passing a
 #     wl_surface pointer to Xlib, which aborts the process with an
 #     uncatchable X BadWindow error on first load.

@@ -919,6 +919,25 @@ check(
     ) is None,
     "explicit wayland choice was overridden",
 )
+for _override in ("offscreen", "minimal", "vnc", "foo"):
+    check(
+        dp_app.choose_platform(
+            {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": _override}
+        ) is None,
+        f"explicit {_override} override was rewritten",
+    )
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": ""}
+    ) == "xcb",
+    "empty QT_QPA_PLATFORM did not fall through to the matrix",
+)
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": "  "}
+    ) == "xcb",
+    "blank QT_QPA_PLATFORM did not fall through to the matrix",
+)
 
 app.processEvents()
 print(f"VERIFICATION-GUI OK {_count}")
