@@ -6,9 +6,12 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 import threading
+import types
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -28,7 +31,9 @@ from dvd_player import (
     PlayerState,
     ResumeStore,
     StateMachine,
+    check_environment,
 )
+from dvd_player import hardware
 
 COUNT = 0
 
@@ -252,5 +257,27 @@ with tempfile.TemporaryDirectory() as tmp:
     engine.resume_disc({"aid": 99, "sid": 99})
     check(player.aid == 3 and player.sid == 4)
     engine.dispose()
+
+# ── 11. check_environment tells the truth about ACL-readable drives ─
+block_stat = types.SimpleNamespace(st_mode=stat.S_IFBLK | 0o660)
+with (
+    mock.patch.object(hardware.os, "stat", return_value=block_stat),
+    mock.patch.object(hardware.os, "open", return_value=99),
+    mock.patch.object(hardware.os, "close"),
+    mock.patch.object(hardware, "_sg_loaded", return_value=False),
+    mock.patch.object(hardware.ctypes.util, "find_library", return_value="libdvdcss.so.2"),
+):
+    readable = check_environment("/dev/fake-sr0")
+    check(not any("optical" in p.lower() for p in readable))
+    check(not any("'sg'" in p for p in readable))  # healthy ACL: no false alarm
+with (
+    mock.patch.object(hardware.os, "stat", return_value=block_stat),
+    mock.patch.object(hardware.os, "open", side_effect=PermissionError),
+    mock.patch.object(hardware, "_sg_loaded", return_value=False),
+    mock.patch.object(hardware.ctypes.util, "find_library", return_value="libdvdcss.so.2"),
+):
+    denied = check_environment("/dev/fake-sr0")
+    check(any("optical" in p.lower() for p in denied))
+    check(any("'sg'" in p for p in denied))
 
 print(f"VERIFICATION OK {COUNT} assertions")

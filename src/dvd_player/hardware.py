@@ -4,8 +4,6 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import fcntl
-import getpass
-import grp
 import os
 import shutil
 import stat
@@ -45,12 +43,16 @@ CDS_DISC_OK = 4
 #       1. source must exist and be a block device (stat.S_ISBLK), a
 #          regular file, or a directory containing VIDEO_TS/ (a dir with
 #          neither VIDEO_TS.IFO nor VIDEO_TS.BUP -> "not a DVD layout").
-#       2. block device only: probe-open O_RDONLY (EACCES -> message naming
-#          the `optical` group); warn when the current user
-#          (getpass.getuser()) is not in grp.getgrnam("optical").gr_mem
-#          (skip when the group does not exist).
-#       3. warn when the sg kernel module is absent: neither /sys/module/sg
-#          nor "sg" in Path("/proc/modules") (best effort, no raise).
+#       2. block device only: probe-open O_RDONLY|O_NONBLOCK. Only a
+#          PermissionError (EACCES) warns, naming the `optical` group; any
+#          other OSError reports "cannot open". A successful open means
+#          access is already granted (udev ACL/session), so no group or
+#          group-membership warning is emitted.
+#       3. warn when the sg kernel module is absent AND the block-device
+#          probe-open failed (a possible cause of that failure). Never warn
+#          when the device is readable or the source is not a block device.
+#          Absence check: neither /sys/module/sg nor "sg" in
+#          Path("/proc/modules") (best effort, no raise).
 #       4. warn when libdvdcss is missing: ctypes.util.find_library("dvdcss")
 #          is None.
 #       Preserve order 1..4. GUI may proceed despite warnings.
@@ -140,26 +142,17 @@ def eject_device(device: str) -> None:
     )
 
 
-def _check_block_device(device: str) -> list[str]:
-    """Report access and 'optical' group problems for a block device."""
-    problems: list[str] = []
+def _check_block_device(device: str) -> tuple[list[str], bool]:
+    """Report access problems; the flag says whether the probe-open failed."""
     try:
         os.close(os.open(device, os.O_RDONLY | os.O_NONBLOCK))
     except PermissionError:
-        problems.append(
+        return [
             f"no read permission on {device}: add the user to the 'optical' group"
-        )
+        ], True
     except OSError as exc:
-        problems.append(f"cannot open {device}: {exc}")
-    try:
-        members = grp.getgrnam("optical").gr_mem
-    except KeyError:
-        members = None
-    if members is not None:
-        user = getpass.getuser()
-        if user not in members:
-            problems.append(f"user {user!r} is not in the 'optical' group")
-    return problems
+        return [f"cannot open {device}: {exc}"], True
+    return [], False
 
 
 def _sg_loaded() -> bool:
@@ -196,9 +189,11 @@ def check_environment(source: str) -> list[str]:
             problems.append(
                 f"not a DVD layout: {source!r} has no VIDEO_TS/VIDEO_TS.IFO"
             )
+    open_failed = False
     if is_block:
-        problems.extend(_check_block_device(source))
-    if not _sg_loaded():
+        block_problems, open_failed = _check_block_device(source)
+        problems.extend(block_problems)
+    if open_failed and not _sg_loaded():
         problems.append(
             "kernel module 'sg' is not loaded: SCSI passthrough may be unavailable"
         )

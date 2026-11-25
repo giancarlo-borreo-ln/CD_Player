@@ -5,10 +5,13 @@ import ctypes
 import json
 import locale
 import os
+import stat
 import tempfile
 import threading
 import time
+import types
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -34,6 +37,7 @@ from dvd_player import (
     disc_present,
     eject_device,
 )
+from dvd_player import hardware
 
 COUNT = 0
 
@@ -148,6 +152,58 @@ with tempfile.TemporaryDirectory() as tmp:
     not_dvd = Path(tmp) / "plain"
     not_dvd.mkdir()
     check(any("not a DVD layout" in p for p in check_environment(str(not_dvd))))
+
+# Truthful warnings: a readable (ACL-accessible) block device must produce
+# neither an 'optical' group message nor an 'sg' message, even when sg is
+# absent and the user is not in the group.
+block_stat = types.SimpleNamespace(st_mode=stat.S_IFBLK | 0o660)
+with (
+    mock.patch.object(hardware.os, "stat", return_value=block_stat),
+    mock.patch.object(hardware.os, "open", return_value=99),
+    mock.patch.object(hardware.os, "close"),
+    mock.patch.object(hardware, "_sg_loaded", return_value=False),
+    mock.patch.object(hardware.ctypes.util, "find_library", return_value="libdvdcss.so.2"),
+):
+    readable = check_environment("/dev/fake-sr0")
+    check(not any("optical" in p.lower() for p in readable))
+    check(not any("'sg'" in p for p in readable))
+
+# PermissionError on the probe-open: optical group message AND sg message.
+with (
+    mock.patch.object(hardware.os, "stat", return_value=block_stat),
+    mock.patch.object(hardware.os, "open", side_effect=PermissionError),
+    mock.patch.object(hardware, "_sg_loaded", return_value=False),
+    mock.patch.object(hardware.ctypes.util, "find_library", return_value="libdvdcss.so.2"),
+):
+    denied = check_environment("/dev/fake-sr0")
+    check(any("optical" in p.lower() for p in denied))
+    check(any("'sg'" in p for p in denied))
+
+# Other open failures also allow the sg hint, but a regular file does not.
+with (
+    mock.patch.object(hardware.os, "stat", return_value=block_stat),
+    mock.patch.object(hardware.os, "open", side_effect=OSError(19, "No such device")),
+    mock.patch.object(hardware, "_sg_loaded", return_value=False),
+    mock.patch.object(hardware.ctypes.util, "find_library", return_value="libdvdcss.so.2"),
+):
+    broken = check_environment("/dev/fake-sr0")
+    check(any("cannot open" in p for p in broken))
+    check(any("'sg'" in p for p in broken))
+
+with tempfile.TemporaryDirectory() as tmp:
+    plain = Path(tmp) / "movie.iso"
+    plain.write_bytes(b"x")
+    with mock.patch.object(hardware, "_sg_loaded", return_value=False):
+        file_problems = check_environment(str(plain))
+    check(not any("'sg'" in p for p in file_problems))
+
+# libdvdcss check is unchanged: still reported when missing.
+with mock.patch.object(hardware.ctypes.util, "find_library", return_value=None):
+    with tempfile.TemporaryDirectory() as tmp:
+        plain = Path(tmp) / "movie.iso"
+        plain.write_bytes(b"x")
+        no_dvdcss = check_environment(str(plain))
+    check(any("libdvdcss" in p for p in no_dvdcss))
 
 # ── e. device helpers ──────────────────────────────────────────────
 check(disc_present("/dev/nonexistent0") is None)
