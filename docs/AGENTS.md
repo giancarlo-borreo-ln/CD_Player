@@ -1,5 +1,16 @@
 # Multi-Agent Development Pipeline
 
+> ## ⚖️ THE LAW — WRITTEN ON STONE
+>
+> **Only Thanos invokes agents.** No agent — Tony Stark, Spider-Man,
+> Dr. Strange, Loki, Nick Fury, Captain America — may ever be spawned by
+> anyone else, under any circumstance.
+>
+> **Every invocation is minimized first.** Thanos compresses the task
+> (folded context, static prefix, token budget, binary exit) before ANY
+> agent is launched. No agent receives a context Thanos has not
+> minimized. These rules are permanent and may not be overridden.
+
 `dvd_player` is built by a multi-agent pipeline orchestrated by a Lead Systems
 Architect. Every agent runs on **DeepSeek V4 Flash (Low Focus Mode)** except the
 architect (orchestration, Agent 5 duties). This file documents the agent roster,
