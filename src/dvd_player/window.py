@@ -2179,6 +2179,20 @@ class ScrubPreviewOsd(Xbox360Osd):
 #   * _on_browse_clicked: QFileDialog.getOpenFileName('.iso (*.iso)');
 #     when canceled try getExistingDirectory ('folder with VIDEO_TS');
 #     set self.source text when picked (no load — Ctrl+L loads directly).
+#   * Idle cursor (feat/cursor-autohide): MainWindow owns hiding because
+#     mpv is pinned to cursor_autohide="no" (engine.py). One single-shot
+#     QTimer (CURSOR_HIDE_MS=5000) is restarted by any MouseMove or
+#     MouseButtonPress delivered to the window or any descendant (an
+#     application event filter restricted to this window's subtree, plus
+#     the direct _on_video_mouse entry point so tests bypassing Qt notify
+#     still count). On timeout->_hide_idle_cursor: setCursor(BlankCursor).
+#     The guard is checked AT TIMEOUT: never hide while _scrub_active
+#     (seek-bar press..release) or while QApplication.activeModalWidget()
+#     is not None. The next activity restores unsetCursor immediately and
+#     restarts the countdown, so the pointer never stays blank. Scrubbing
+#     handlers also note activity (press/move/release). Timer activity is
+#     silent: no OSD reveal, no repaint, no mpv call. closeEvent stops the
+#     timer, removes the app filter and restores the cursor.
 #   * closeEvent: engine.dispose(); event.accept().
 #   * _sync_osd: osd.set_transport(state=engine.state, speed=engine.speed,
 #     time_pos=engine.time_pos, duration=engine.duration,
@@ -2191,6 +2205,7 @@ class MainWindow(QMainWindow):
 
     SCRUB_THROTTLE_MS = 250
     SCRUB_CAPTURE_MS = 200
+    CURSOR_HIDE_MS = 5000
 
     def __init__(self, engine: DvdPlaybackEngine, source: str | None = None) -> None:
         """Build the window and connect engine signals and timers."""
@@ -2345,6 +2360,19 @@ class MainWindow(QMainWindow):
         self._disc_timer.setInterval(DISC_POLL_MS)
         self._disc_timer.timeout.connect(self._poll_disc_insertion)
         self._disc_timer.start()
+
+        # Idle cursor hiding is owned by the window (mpv's own auto-hide is
+        # disabled): any pointer activity restarts this single-shot timer.
+        self._cursor_hidden = False
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.setInterval(self.CURSOR_HIDE_MS)
+        self._cursor_timer.timeout.connect(self._hide_idle_cursor)
+        self._cursor_timer.start()
+        app: QApplication | None = QApplication.instance()
+        self._cursor_app = app if isinstance(app, QApplication) else None
+        if self._cursor_app is not None:
+            self._cursor_app.installEventFilter(self)  # type: ignore[arg-type]
 
         # Startup work is scheduled from showEvent: boot the dashboard, then
         # probe hardware only after its first frame (see showEvent).
@@ -2551,10 +2579,38 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def eventFilter(self, a0: QObject | None, a1: QEvent | None) -> bool:
-        """Forward mouse activity on the video surface."""
+        """Forward mouse activity on the video surface and reset the cursor."""
+        if a1 is not None and a1.type() in (
+            QEvent.Type.MouseMove,
+            QEvent.Type.MouseButtonPress,
+        ) and (
+            a0 is self
+            or (
+                isinstance(a0, QWidget)
+                and self.isAncestorOf(a0)  # type: ignore[arg-type]
+            )
+        ):
+            self._note_mouse_activity()
         if a0 is self.video and isinstance(a1, QMouseEvent):
             self._on_video_mouse(a0, a1)
         return super().eventFilter(a0, a1)  # type: ignore[arg-type]
+
+    def _note_mouse_activity(self) -> None:
+        """Restore a hidden cursor and restart the idle-hide countdown."""
+        if self._cursor_hidden:
+            self.unsetCursor()
+            self._cursor_hidden = False
+        if not self._window_closed:
+            self._cursor_timer.start()
+
+    def _hide_idle_cursor(self) -> None:
+        """Blank the cursor after idleness; never during scrub or a modal."""
+        if self._window_closed or not self.isVisible():
+            return
+        if self._scrub_active or QApplication.activeModalWidget() is not None:
+            return
+        self.setCursor(Qt.CursorShape.BlankCursor)
+        self._cursor_hidden = True
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
         """Release the engine before the window goes away."""
@@ -2563,6 +2619,13 @@ class MainWindow(QMainWindow):
         self._gamepad_timer.stop()
         self._disc_timer.stop()
         self._splash_timer.stop()
+        self._cursor_timer.stop()
+        if self._cursor_app is not None:
+            self._cursor_app.removeEventFilter(self)  # type: ignore[arg-type]
+            self._cursor_app = None
+        if self._cursor_hidden:
+            self.unsetCursor()
+            self._cursor_hidden = False
         self.splash.dismiss()
         self.stop_mpris()
         self._teardown_preview()
@@ -3332,6 +3395,7 @@ class MainWindow(QMainWindow):
 
     def _on_scrub_pressed(self, fraction: float) -> None:
         """Begin a scrub: seek immediately and show the preview."""
+        self._note_mouse_activity()
         self._scrub_active = True
         self._scrub_fraction = max(0.0, min(1.0, float(fraction)))
         self._scrub_seek(self._scrub_fraction, preview=True)
@@ -3340,6 +3404,7 @@ class MainWindow(QMainWindow):
         """Continue a scrub, throttling engine seeks to one per 250 ms."""
         if not self._scrub_active:
             return
+        self._note_mouse_activity()
         self._scrub_fraction = max(0.0, min(1.0, float(fraction)))
         elapsed = time.monotonic() - self._scrub_last_seek
         if elapsed < self.SCRUB_THROTTLE_MS / 1000.0:
@@ -3349,6 +3414,7 @@ class MainWindow(QMainWindow):
     def _on_scrub_released(self) -> None:
         """Finish a scrub: final seek, then drop the preview."""
         self._scrub_active = False
+        self._note_mouse_activity()
         fraction = self._scrub_fraction
         self._scrub_fraction = None
         if fraction is not None:
@@ -3468,6 +3534,7 @@ class MainWindow(QMainWindow):
     def _on_video_mouse(self, obj: object, event: QMouseEvent) -> None:
         """Reveal the OSD on pointer activity; forward menu clicks."""
         del obj
+        self._note_mouse_activity()
         event_type = event.type()
         if event_type == QEvent.Type.MouseMove:
             if not self.engine.menu_active:

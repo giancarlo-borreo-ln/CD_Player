@@ -1379,6 +1379,79 @@ for _keys, _action in dp.HelpOverlay.bindings():
 home_window.close()
 grid_window.close()
 
+# ── idle cursor auto-hide (feat/cursor-autohide) ────────────────────
+# Fake-clock style: drive the single-shot timeout by emitting its signal
+# instead of sleeping 5 s. Mouse events are delivered through Qt notify so
+# the window-wide application filter is exercised (OSD is a descendant).
+_cursor_engine = dp.DvdPlaybackEngine()
+_cursor_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+_cursor_window = dp.MainWindow(_cursor_engine)
+_cursor_window._auto_detected = True
+_cursor_window.resize(640, 360)
+_cursor_window.show()
+app.processEvents()
+check(_cursor_window._cursor_timer.isSingleShot(), "cursor timer not single-shot")
+check(_cursor_window._cursor_timer.interval() == 5000, "cursor timer is not 5 s")
+check(_cursor_window._cursor_timer.isActive(), "cursor timer not running")
+
+
+def _move_event() -> QMouseEvent:
+    return QMouseEvent(
+        QEvent.Type.MouseMove,
+        QPointF(11, 9),
+        QPointF(11, 9),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+
+
+_cursor_window._cursor_timer.stop()
+QApplication.sendEvent(_cursor_window.osd, _move_event())
+app.processEvents()
+check(_cursor_window._cursor_timer.isActive(), "OSD mouse move did not restart timer")
+
+# Timeout blanks the cursor; no OSD flash from timer activity.
+_cursor_window.osd.hide()
+_cursor_window._cursor_timer.timeout.emit()
+check(_cursor_window.cursor().shape() == Qt.CursorShape.BlankCursor,
+      "idle cursor not hidden after timeout")
+check(not _cursor_window.osd.isVisible(), "cursor timeout flashed the OSD")
+
+# Any movement restores instantly and restarts the countdown.
+QApplication.sendEvent(_cursor_window.video, _move_event())
+app.processEvents()
+check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+      "movement did not restore the cursor")
+check(_cursor_window._cursor_timer.isActive(), "movement did not restart timer")
+
+# Never hide while scrubbing (mouse held on the seek bar).
+_cursor_window._on_scrub_pressed(0.5)
+_cursor_window._cursor_timer.timeout.emit()
+check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+      "cursor hidden during an active scrub")
+_cursor_window._on_scrub_released()
+
+# Never hide while a modal dialog is up.
+_orig_modal = QApplication.activeModalWidget
+QApplication.activeModalWidget = staticmethod(lambda: object())  # type: ignore[method-assign]
+try:
+    _cursor_window._cursor_timer.timeout.emit()
+    check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+          "cursor hidden over a modal dialog")
+finally:
+    QApplication.activeModalWidget = _orig_modal  # type: ignore[method-assign]
+
+# Close stops the timer and restores the cursor.
+_cursor_window._cursor_timer.timeout.emit()
+check(_cursor_window.cursor().shape() == Qt.CursorShape.BlankCursor,
+      "cursor not hidden before close")
+_cursor_window.close()
+app.processEvents()
+check(not _cursor_window._cursor_timer.isActive(), "cursor timer survived close")
+check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+      "close left the cursor blank")
+
 dp.ResumeStore.get = _orig_get
 dp.check_environment = _orig_env
 dp.list_dvd_devices = _orig_devices
