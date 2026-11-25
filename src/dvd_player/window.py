@@ -1177,6 +1177,7 @@ class VideoGLWidget(QOpenGLWidget):
         super().__init__(parent)
         self._engine = engine
         self._render_attached = False
+        self._closed = False
         self.setMouseTracking(True)
         # A GL surface only repaints when asked, so a rendered video would
         # freeze on its first frame. This driver asks again every ~33 ms
@@ -1359,8 +1360,13 @@ class VideoGLWidget(QOpenGLWidget):
         return name not in self.IDLE_STATES
 
     def _ensure_repaint_driver(self) -> None:
-        """Start the continuous repaint timer once a source is loaded."""
-        if not self._render_active():
+        """Start the continuous repaint timer once a source is loaded.
+
+        A closed or hidden surface must never be re-armed: closeEvent can
+        run from inside render_frame (mid-paint), and paintGL still calls
+        this afterwards.
+        """
+        if self._closed or not self.isVisible() or not self._render_active():
             self._repaint_timer.stop()
             return
         if not self._repaint_timer.isActive():
@@ -1379,6 +1385,7 @@ class VideoGLWidget(QOpenGLWidget):
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
         """Stop driving repaints before the surface goes away."""
+        self._closed = True
         self.stop_render_loop()
         super().closeEvent(event)
 
@@ -1634,7 +1641,10 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     once, producing the next single update+render paint. The timer stops
 #     when the engine is idle (IDLE/STOPPED/EJECTED/ERROR), when the
 #     widget is hidden, and on closeEvent/stop_render_loop before dispose;
-#     there is never a second update() inside one paint.
+#     there is never a second update() inside one paint. Re-arming requires
+#     a visible, not-closed surface: a closeEvent raised mid-render sets
+#     _closed, so the paintGL that follows that same frame cannot restart
+#     the timer and no orphan driver survives teardown.
 #     Otherwise self.video stays the plain QWidget/wid path. Mouse forwarding keeps the same
 #     _on_video_mouse handler; the GL surface additionally scales
 #     event.position() by devicePixelRatioF(). OSD/home/grid/help remain

@@ -13,7 +13,7 @@ sys.path.insert(
 )
 
 from PyQt6.QtCore import QEvent, QPointF, Qt
-from PyQt6.QtGui import QColor, QImage, QMouseEvent
+from PyQt6.QtGui import QCloseEvent, QColor, QImage, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import dvd_player as dp
@@ -1472,6 +1472,7 @@ check(not gl_window.video._repaint_timer.isActive(),
       "repaint driver must stay idle without a source")
 render_engine._transition(dp.PlayerState.LOADING)
 before_tick = render_log.count(("update",))
+gl_window.video.isVisible = lambda: True  # type: ignore[method-assign]
 gl_window.video.paintGL()
 check(gl_window.video._repaint_timer.isActive(),
       "paintGL did not start the continuous repaint driver")
@@ -1480,6 +1481,29 @@ check(render_log.count(("update",)) == before_tick + 1,
 gl_window.video.stop_render_loop()
 check(not gl_window.video._repaint_timer.isActive(),
       "stop_render_loop left the repaint driver running")
+
+# Loki d: hidden surfaces never re-arm, and a close raised during a render
+# cannot be undone by the paintGL that follows in the same frame.
+gl_window.video.isVisible = lambda: False  # type: ignore[method-assign]
+gl_window.video.paintGL()
+check(not gl_window.video._repaint_timer.isActive(),
+      "hidden surface re-armed the repaint driver")
+gl_window.video.isVisible = lambda: True  # type: ignore[method-assign]
+gl_window.video.paintGL()
+check(gl_window.video._repaint_timer.isActive(),
+      "visible surface failed to arm the repaint driver")
+_render_before = render_engine.render_frame
+render_engine.render_frame = (  # type: ignore[method-assign]
+    lambda w, h: gl_window.video.closeEvent(QCloseEvent())
+)
+gl_window.video.paintGL()
+check(not gl_window.video._repaint_timer.isActive(),
+      "close mid-render restarted the repaint driver")
+check(gl_window.video._closed is True, "closeEvent did not latch _closed")
+render_engine.render_frame = _render_before  # type: ignore[method-assign]
+gl_window.video.paintGL()
+check(not gl_window.video._repaint_timer.isActive(),
+      "paint after close re-armed the repaint driver")
 
 # Regression: a refused attach_render falls back to attach_widget(winId()).
 fallback_engine = dp.DvdPlaybackEngine()
