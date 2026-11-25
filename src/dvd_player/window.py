@@ -1051,6 +1051,223 @@ class HelpOverlay(QWidget):
             )
         finally:
             painter.end()
+
+
+class BootSplash(QWidget):
+    """2026 360-homage boot splash: paint-only, never blocks the loop.
+
+    It is a native sibling above the video/home menu, so it can cover mpv's
+    native window. A single 50 ms shimmer timer animates the ring and the
+    progress band; it is stopped by ``hide``/``dismiss`` and when the widget
+    is not visible, so no orphan timer outlives the splash. The splash never
+    calls exec()/sleep() and never waits on I/O.
+    """
+
+    ACCENT: ClassVar[QColor] = QColor(116, 195, 41)
+    ACCENT_BRIGHT: ClassVar[QColor] = QColor(159, 232, 85)
+    TEXT: ClassVar[QColor] = QColor(234, 238, 231)
+    MUTED: ClassVar[QColor] = QColor(158, 169, 158)
+    TICK_MS: ClassVar[int] = 50
+    PHASES: ClassVar[int] = 120
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        """Build the hidden splash and its stopped shimmer timer."""
+        super().__init__(parent)  # type: ignore[arg-type]
+        self._mode = "boot"
+        self._label: str | None = None
+        self._phase = 0
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAutoFillBackground(False)
+        self._shimmer = QTimer(self)
+        self._shimmer.setInterval(self.TICK_MS)
+        self._shimmer.timeout.connect(self._tick)
+        self.hide()
+
+    # ── lifecycle ───────────────────────────────────────────────────
+    def show_boot(self) -> None:
+        """Present the startup splash (wordmark only)."""
+        self._present("boot", None)
+
+    def show_loading(self, label: str | None = None) -> None:
+        """Present the disc-load state with an optional disc label."""
+        text = label.strip() if isinstance(label, str) else ""
+        self._present("loading", text or None)
+
+    def _present(self, mode: str, label: str | None) -> None:
+        """Place, show and animate the splash; never blocks."""
+        self._mode = mode
+        self._label = label
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(0, 0, parent.width(), parent.height())
+        self.show()
+        self.raise_()
+        if not self._shimmer.isActive():
+            self._shimmer.start()
+        self.update()
+
+    def dismiss(self) -> None:
+        """Fade out immediately: stop every timer, then hide."""
+        self._shimmer.stop()
+        self.hide()
+
+    def hide(self) -> None:
+        """Hide and always stop the shimmer timer (no orphan driver)."""
+        self._shimmer.stop()
+        super().hide()
+
+    def _tick(self) -> None:
+        """Advance the shimmer only while the splash is on screen."""
+        if not self.isVisible():
+            self._shimmer.stop()
+            return
+        self._phase = (self._phase + 1) % self.PHASES
+        self.update()
+
+    # ── test surface ────────────────────────────────────────────────
+    def mode(self) -> str:
+        """Return ``boot`` or ``loading``."""
+        return self._mode
+
+    def status_text(self) -> str:
+        """Return the painted loading headline (empty outside load)."""
+        return "Loading disc…" if self._mode == "loading" else ""
+
+    def disc_label(self) -> str | None:
+        """Return the optional disc label painted under the headline."""
+        return self._label
+
+    def is_animating(self) -> bool:
+        """Whether the shimmer timer is currently driving repaints."""
+        return self._shimmer.isActive()
+
+    # ── painting ────────────────────────────────────────────────────
+    def paintEvent(self, event: QPaintEvent | None) -> None:
+        """Paint the near-black stage, green ring/swirl and wordmark."""
+        del event
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.fillRect(self.rect(), QColor(3, 6, 4, 252))
+            width = float(self.width())
+            height = float(self.height())
+            band = QLinearGradient(0.0, 0.0, 0.0, height)
+            band.setColorAt(0.0, QColor(9, 15, 10, 255))
+            band.setColorAt(0.55, QColor(4, 8, 5, 255))
+            band.setColorAt(1.0, QColor(2, 4, 3, 255))
+            painter.fillRect(self.rect(), band)
+
+            center_x = width / 2.0
+            center_y = height * 0.42
+            radius = max(52.0, min(110.0, min(width, height) * 0.16))
+            # Soft glow: concentric translucent rings behind the mark.
+            painter.setPen(Qt.PenStyle.NoPen)
+            for step in range(6, 0, -1):
+                grow = radius * 0.16 * step
+                painter.setBrush(QColor(116, 195, 41, max(6, 22 - step * 3)))
+                painter.drawEllipse(
+                    QRectF(
+                        center_x - radius - grow,
+                        center_y - radius - grow,
+                        (radius + grow) * 2.0,
+                        (radius + grow) * 2.0,
+                    )
+                )
+            # Dim track + rotating green arc (the 360 ring).
+            track = QRectF(
+                center_x - radius, center_y - radius, radius * 2.0, radius * 2.0
+            )
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QColor(46, 66, 38, 230))
+            painter.drawEllipse(track)
+            pen = painter.pen()
+            pen.setWidthF(max(3.0, radius * 0.06))
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setColor(self.ACCENT)
+            painter.setPen(pen)
+            start = (self._phase * 3) % 360
+            painter.drawArc(track, int((90 - start) * 16), 112 * 16)
+            # Brighter leading dot on the swirl.
+            angle = math.radians(90 - start)
+            dot_r = max(5.0, radius * 0.09)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(self.ACCENT_BRIGHT)
+            painter.drawEllipse(
+                QRectF(
+                    center_x + math.cos(angle) * radius - dot_r,
+                    center_y - math.sin(angle) * radius - dot_r,
+                    dot_r * 2.0,
+                    dot_r * 2.0,
+                )
+            )
+
+            word_top = center_y + radius + 34.0
+            word_font = QFont()
+            word_font.setPointSize(max(18, int(min(width, height) * 0.045)))
+            word_font.setBold(True)
+            painter.setFont(word_font)
+            painter.setPen(self.TEXT)
+            painter.drawText(
+                QRectF(0.0, word_top, width, word_font.pointSize() * 2.4),
+                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                "DVD PLAYER",
+            )
+            # Moving shimmer band under the wordmark: a subtle progress cue.
+            bar_width = min(300.0, max(160.0, width * 0.26))
+            bar = QRectF(
+                center_x - bar_width / 2.0,
+                word_top + word_font.pointSize() * 2.9,
+                bar_width,
+                3.0,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(255, 255, 255, 22))
+            painter.drawRoundedRect(bar, 1.5, 1.5)
+            offset = self._phase / float(self.PHASES)
+            shimmer = QLinearGradient(bar.left(), 0.0, bar.right(), 0.0)
+            shimmer.setColorAt(0.0, QColor(116, 195, 41, 0))
+            shimmer.setColorAt(max(0.0, min(0.98, offset)), QColor(116, 195, 41, 0))
+            shimmer.setColorAt(
+                min(1.0, offset + 0.12), QColor(159, 232, 85, 230)
+            )
+            shimmer.setColorAt(1.0, QColor(116, 195, 41, 0))
+            painter.setBrush(QBrush(shimmer))
+            painter.drawRoundedRect(bar, 1.5, 1.5)
+
+            if self._mode == "loading":
+                painter.setFont(self._font(11, bold=True))
+                painter.setPen(self.ACCENT)
+                painter.drawText(
+                    QRectF(0.0, bar.bottom() + 16.0, width, 24.0),
+                    int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                    self.status_text(),
+                )
+                if self._label:
+                    metrics = painter.fontMetrics()
+                    label = metrics.elidedText(
+                        self._label,
+                        Qt.TextElideMode.ElideRight,
+                        max(80, int(width) - 120),
+                    )
+                    painter.setFont(self._font(9))
+                    painter.setPen(self.MUTED)
+                    painter.drawText(
+                        QRectF(0.0, bar.bottom() + 42.0, width, 20.0),
+                        int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop),
+                        label,
+                    )
+        finally:
+            painter.end()
+
+    @staticmethod
+    def _font(size: int, bold: bool = False) -> QFont:
+        """Build one splash font (paint-only, no stylesheets)."""
+        font = QFont()
+        font.setPointSize(size)
+        font.setBold(bold)
+        return font
 # ── [AGENT2: SECTION 5 END] ──
 
 # ════════════════════════════════════════════════════════════════════
@@ -1877,6 +2094,22 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     glass key-hint capsules "Enter select · ←/→ blades · Esc back ·
 #     Ctrl+H help". Hover is pointer-only; navigation/selection/load/debounce
 #     contracts unchanged.
+#   * Boot splash (2026 360 homage; paint-only, no QSS/assets):
+#     BootSplash is a full-window native sibling above the video/home menu,
+#     near-black with the Xbox-green #74C329 ring/swirl + soft glow, a
+#     'DVD PLAYER' wordmark and a moving green shimmer band. On startup it
+#     appears BEFORE the home menu paints (showEvent shows home, then the
+#     splash; skipped entirely when the dashboard was already painted or
+#     startup is done, i.e. a warm/fast app). HomeMenu.first_paint dismisses
+#     it immediately (fade-free hide) BEFORE deferred startup is scheduled,
+#     and the 250 ms safety net also ends it. During a disc load (preview or
+#     user selection) show_loading paints 'Loading disc…' plus the disc
+#     label when known; the splash is dismissed on the first non-LOADING
+#     engine state, on a load error/attach failure, on eject and on close.
+#     A single 50 ms QTimer animates the shimmer; hide()/dismiss() always
+#     stop it (no orphan timer after hide) and a 4 s one-shot dismiss timer
+#     is stopped with it. The splash never sleeps, calls exec() or waits on
+#     I/O, so the Qt event loop keeps ticking underneath.
 #   * ChapterGrid overlay (C): key C in PLAYING/PAUSED opens it with
 #     engine.chapter_list; arrows navigate, Enter schedules ONE coalesced
 #     engine.seek_to(chapter time) after the grid's 350 ms settle; Escape or
@@ -2064,6 +2297,14 @@ class MainWindow(QMainWindow):
         # Full-window launcher and chapter grid overlays (paint-only).
         self.home = HomeMenu(self)
         self.home.hide()
+        self.splash = BootSplash(self)
+        self.splash.hide()
+        # Safety net only: a load whose engine never reports a state still
+        # gets its splash dismissed, and the timer never outlives the splash.
+        self._splash_timer = QTimer(self)
+        self._splash_timer.setSingleShot(True)
+        self._splash_timer.setInterval(4000)
+        self._splash_timer.timeout.connect(self._dismiss_splash)
         self.chapter_grid = ChapterGrid(self)
         self.chapter_grid.hide()
         self.help = HelpOverlay(self)
@@ -2129,14 +2370,51 @@ class MainWindow(QMainWindow):
         self._startup_scheduled = True
         if not self._auto_detected and self._initial_source is None:
             self._show_boot_home()
+            # Boot splash sits above the just-shown dashboard; its first
+            # paint hides it. A warm app (dashboard already painted) skips
+            # the splash entirely.
+            if not self.home._painted_once:
+                self._show_boot_splash()
             # Safety net for headless platforms that coalesce paints: never
             # leave startup hanging if no paintEvent is ever delivered.
             QTimer.singleShot(250, self._startup_after_first_frame)
         else:
             QTimer.singleShot(0, self._startup_after_first_frame)
 
+    def _show_boot_splash(self) -> None:
+        """Show the startup splash; skipped when the app is already warm."""
+        if self._startup_done or self.home._painted_once:
+            return
+        self._splash_timer.stop()
+        self.splash.show_boot()
+        log.info("milestone boot splash shown")
+
+    def _show_loading_splash(self, source: str) -> None:
+        """Show 'Loading disc…' with the best non-blocking label we have."""
+        if self._window_closed:
+            return
+        label = getattr(self.engine, "disc_label", None)
+        if not (isinstance(label, str) and label.strip()):
+            try:
+                is_block = stat.S_ISBLK(os.stat(source).st_mode)
+            except (OSError, ValueError):
+                is_block = False
+            candidate = "" if is_block else os.path.basename(source.rstrip("/"))
+            label = candidate or None
+        self.splash.show_loading(label if isinstance(label, str) else None)
+        self._splash_timer.start()
+        log.info("milestone loading splash shown: %r", source)
+
+    def _dismiss_splash(self) -> None:
+        """Hide the splash and stop all of its timers (idempotent)."""
+        self._splash_timer.stop()
+        self.splash.dismiss()
+
     def _on_home_first_paint(self) -> None:
         """The dashboard is on screen: let startup proceed after this frame."""
+        if self.splash.mode() == "boot":
+            self._dismiss_splash()
+            log.info("milestone boot splash hidden")
         if self._startup_scheduled and not self._startup_done:
             log.info("milestone first frame: scheduling deferred startup")
             QTimer.singleShot(0, self._startup_after_first_frame)
@@ -2168,6 +2446,7 @@ class MainWindow(QMainWindow):
         self.chapter_grid.setGeometry(0, 0, self.width(), self.height())
         self.help.setGeometry(0, 0, self.width(), self.height())
         self.scrub_preview.setGeometry(0, 0, self.width(), self.height())
+        self.splash.setGeometry(0, 0, self.width(), self.height())
         if self.home.isVisible():
             self.home.raise_()
         if self.chapter_grid.isVisible():
@@ -2177,6 +2456,8 @@ class MainWindow(QMainWindow):
         if self.scrub_preview.isVisible():
             self.scrub_preview.raise_()
         self.osd.raise_()
+        if self.splash.isVisible():
+            self.splash.raise_()
 
     def keyPressEvent(self, event: QKeyEvent | None) -> None:
         """Route keys through the console mapping."""
@@ -2281,6 +2562,8 @@ class MainWindow(QMainWindow):
         self._pending_load = None  # a late attach must never flush after close
         self._gamepad_timer.stop()
         self._disc_timer.stop()
+        self._splash_timer.stop()
+        self.splash.dismiss()
         self.stop_mpris()
         self._teardown_preview()
         self._close_help()
@@ -2470,6 +2753,8 @@ class MainWindow(QMainWindow):
     def _on_engine_state(self, state: PlayerState) -> None:
         """Reflect the new state in the status label and OSD."""
         log.debug("state -> %s", state.name)
+        if self.splash.isVisible() and state is not PlayerState.LOADING:
+            self._dismiss_splash()
         self._set_status(state.name)
         self._update_window_title()
         self._sync_osd()
@@ -2498,6 +2783,7 @@ class MainWindow(QMainWindow):
 
     def _on_engine_error(self, message: str) -> None:
         """Show a critical dialog for backend failures."""
+        self._dismiss_splash()
         self._set_status("ERROR")
         if self._preview_running and not self._preview_revealed:
             # No modal may interrupt the behind-the-glass preview.
@@ -2549,6 +2835,8 @@ class MainWindow(QMainWindow):
         self.home.setGeometry(0, 0, self.width(), self.height())
         self.home.show()
         self.home.raise_()
+        if self.splash.isVisible():
+            self.splash.raise_()
         self.osd.hide()
         self._preview_revealed = False
         self._preview_session = preview
@@ -2614,6 +2902,7 @@ class MainWindow(QMainWindow):
         self._pending_source = source
         self._load_started_at = time.monotonic()
         self.home.set_preview_live(True)
+        self._show_loading_splash(source)
         if not self._engine_attached:
             self._queue_load(source, quiet=True, preview=True)
             return
@@ -2943,6 +3232,7 @@ class MainWindow(QMainWindow):
 
     def _status_for_load_error(self, exc: PlaybackError) -> None:
         """Map an attach-related PlaybackError to the graceful status."""
+        self._dismiss_splash()
         if self._attach_failed or "not attached" in str(exc):
             self._renderer_unavailable()
         else:
@@ -2952,13 +3242,18 @@ class MainWindow(QMainWindow):
         """Run one already-authorized load for either the menu or the user."""
         log.info("milestone load started: %r preview=%s", source, preview)
         if preview:
+            self._show_loading_splash(source)
             try:
                 self.engine.load(source)
             except PlaybackError as exc:
                 self._preview_running = False
                 self.home.set_preview_live(False)
+                self._dismiss_splash()
                 log.debug("preview load failed: %s", exc)
                 self._status_for_load_error(exc)
+            else:
+                if self.engine.state is not PlayerState.LOADING:
+                    self._dismiss_splash()
             return
         self._play_source(source)
 
@@ -2971,10 +3266,15 @@ class MainWindow(QMainWindow):
                 self._queue_load(source, quiet=False, preview=False)
             return
         self._loaded_source = source
+        self._show_loading_splash(source)
         try:
             self.engine.load(source)
         except PlaybackError as exc:
+            self._dismiss_splash()
             self._status_for_load_error(exc)
+        else:
+            if self.engine.state is not PlayerState.LOADING:
+                self._dismiss_splash()
 
     def _browse_for_source(self) -> str | None:
         """Pick an ISO image (or VIDEO_TS folder); return None on cancel."""
@@ -2995,6 +3295,7 @@ class MainWindow(QMainWindow):
 
     def _on_eject_clicked(self) -> None:
         """Eject the disc and show the new state."""
+        self._dismiss_splash()
         self._teardown_preview()
         self.engine.eject()
         self._loaded_source = None  # tray-close with a disc may then auto-boot

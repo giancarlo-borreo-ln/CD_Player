@@ -2186,4 +2186,76 @@ finally:
     else:
         os.environ["LIBGL_ALWAYS_SOFTWARE"] = _orig_software
 
+# ── (z3) 2026 boot splash: startup, loading state, no orphan timers ──
+splash_engine = dp.DvdPlaybackEngine()
+splash_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+splash_window = dp.MainWindow(splash_engine)
+splash_window._attach_engine = lambda: None  # type: ignore[method-assign]
+splash_window.resize(960, 540)
+check(isinstance(splash_window.splash, _winmod.BootSplash),
+      "MainWindow did not build a BootSplash")
+check(splash_window.splash.isHidden() and not splash_window.splash.is_animating(),
+      "splash is visible/animating before startup")
+splash_window.show()
+# showEvent shows the dashboard then the splash: the splash must be on
+# screen BEFORE the first home paint.
+check(not splash_window.home._painted_once,
+      "home painted before the boot splash could appear")
+check(splash_window.splash.isVisible(), "boot splash was not shown at startup")
+check(splash_window.splash.is_animating(),
+      "boot splash shimmer is not ticking while visible")
+splash_image = splash_window.splash.grab().toImage()
+check(not splash_image.isNull(), "boot splash paint produced no image")
+_green_px = 0
+for _y in range(0, splash_image.height(), 4):
+    for _x in range(0, splash_image.width(), 4):
+        _px = splash_image.pixelColor(_x, _y)
+        if (
+            abs(_px.red() - 116) <= 35
+            and abs(_px.green() - 195) <= 35
+            and abs(_px.blue() - 41) <= 35
+        ):
+            _green_px += 1
+check(_green_px > 20, f"boot splash has no Xbox-green ring: {_green_px} px")
+_splash_deadline = time.monotonic() + 3.0
+while time.monotonic() < _splash_deadline and not splash_window.home._painted_once:
+    app.processEvents()
+    time.sleep(0.01)
+app.processEvents()
+check(splash_window.home._painted_once, "home menu never painted")
+check(not splash_window.splash.isVisible(),
+      "boot splash survived the home menu's first paint")
+check(not splash_window.splash.is_animating(),
+      "boot splash left its shimmer timer running after hide")
+
+# Disc load: 'Loading disc…' (+ label when known) until playback advances.
+splash_window._show_loading_splash("/dev/sr0")
+check(splash_window.splash.isVisible(), "loading splash did not appear")
+check(splash_window.splash.status_text() == "Loading disc…",
+      f"wrong loading headline: {splash_window.splash.status_text()!r}")
+check(splash_window.splash.disc_label() is None,
+      "a raw block device leaked as a disc label")
+splash_window.splash.show_loading("TEST DISC")
+check(splash_window.splash.disc_label() == "TEST DISC",
+      "known disc label was not shown on the loading splash")
+_ticks_before = splash_window.splash._phase
+_splash_tick_deadline = time.monotonic() + 0.25
+while time.monotonic() < _splash_tick_deadline:
+    app.processEvents()
+    time.sleep(0.01)
+app.processEvents()
+check(splash_window.splash._phase != _ticks_before,
+      "shimmer did not advance: the event loop was blocked")
+splash_window._on_engine_state(dp.PlayerState.LOADING)
+check(splash_window.splash.isVisible(),
+      "loading splash hid while the disc was still LOADING")
+splash_window._on_engine_state(dp.PlayerState.PLAYING)
+check(not splash_window.splash.isVisible(),
+      "loading splash stayed over the video after playback started")
+check(not splash_window.splash.is_animating(),
+      "loading splash left its shimmer timer running")
+check(not splash_window._splash_timer.isActive(),
+      "loading splash left its safety timer running")
+splash_window.close()
+
 print(f"GUI SMOKE OK {_count} assertions")
