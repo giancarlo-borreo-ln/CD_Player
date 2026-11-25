@@ -87,6 +87,8 @@ class HomeMenu(QWidget):
     browse_requested = pyqtSignal(arguments=())
     close_requested = pyqtSignal(arguments=())
     labels_ready = pyqtSignal(object, arguments=())
+    # Fired exactly once, from the first paintEvent: startup probes wait on it.
+    first_paint = pyqtSignal(arguments=())
     # Blade highlights drive the MainWindow title preview lifecycle.
     blade_changed = pyqtSignal(int, arguments=())
 
@@ -146,8 +148,8 @@ class HomeMenu(QWidget):
     def showEvent(self, event: QShowEvent | None) -> None:
         """Log the first live show so a missing overlay is diagnosable."""
         super().showEvent(event)
-        log.debug(
-            "home menu shown: geom=%s parent=%r",
+        log.info(
+            "milestone home menu shown: geom=%s parent=%r",
             self.geometry(),
             self.parentWidget(),
         )
@@ -692,11 +694,12 @@ class HomeMenu(QWidget):
         del event
         if not self._painted_once:
             self._painted_once = True
-            log.debug(
-                "home menu first paint: geom=%s native=%#x",
+            log.info(
+                "milestone home first paint: geom=%s native=%#x",
                 self.geometry(),
                 int(self.winId()),
             )
+            self.first_paint.emit()
         m = self._layout()
         painter = QPainter(self)
         try:
@@ -1137,10 +1140,14 @@ class VideoGLWidget(QOpenGLWidget):
         """
         if self._render_attached:
             return
-        log.debug("attach chain start: platform=%s", self._platform_name())
+        started = time.monotonic()
+        log.info("milestone attach attempt: render api platform=%s", self._platform_name())
         if self._try_attach_render():
             self._render_attached = True
-            log.debug("attach chain: render API attached")
+            log.info(
+                "milestone attach result: render api attached duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             self._emit_attach_complete(True)
             return
         self._render_attached = False
@@ -1149,7 +1156,10 @@ class VideoGLWidget(QOpenGLWidget):
             log.warning("render attach failed; retrying once with software GL")
             if self._try_attach_render():
                 self._render_attached = True
-                log.debug("attach chain: software render API attached")
+                log.info(
+                    "milestone attach result: software render api attached duration=%.1fms",
+                    (time.monotonic() - started) * 1000.0,
+                )
                 self._emit_attach_complete(True)
                 return
         else:
@@ -1163,20 +1173,36 @@ class VideoGLWidget(QOpenGLWidget):
                 "render attach failed on native Wayland: wid embedding is "
                 "unavailable, refusing to pass a Wayland surface id to Xlib"
             )
+            log.info(
+                "milestone attach result: failed wayland duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             self._emit_attach_complete(False)
             return
         fallback = getattr(self._engine, "attach_widget", None)
         if not callable(fallback):
             log.warning("render attach refused and no wid fallback exists")
+            log.info(
+                "milestone attach result: failed duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             self._emit_attach_complete(False)
             return
         try:
             fallback(int(self.winId()))
         except Exception as exc:  # noqa: BLE001 - wid fallback is best effort
             log.warning("wid fallback after render failure failed: %s", exc)
+            log.info(
+                "milestone attach result: failed duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             self._emit_attach_complete(False)
         else:
             log.info("render attach refused; using the wid video path")
+            log.info(
+                "milestone attach result: wid duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             self._emit_attach_complete(True)
 
     def _try_attach_render(self) -> bool:
@@ -1563,6 +1589,16 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     back…' (no modal); then when
 #     __init__ received a non-empty source: set self.source text and
 #     _load_source(source, quiet=False); otherwise _auto_detect_disc().
+#     STARTUP ORDER (fix-startup): the first visible frame is the dashboard.
+#     showEvent paints HomeMenu from cached state (no list_dvd_devices/
+#     disc_present call), then the menu's first_paint signal schedules
+#     _startup_after_first_frame through QTimer.singleShot(0). Only that
+#     deferred pass shows a hidden GL surface, attaches the engine and runs
+#     the device probes, so a spun-down USB drive or slow GL init can never
+#     delay the menu. Milestone lines (app start, window shown, first paint,
+#     home menu shown, per-device probe duration, attach attempt/result/
+#     duration, load request/queued/drained) go to the capped debug log at
+#     ~/.cache/dvd-player/dvd-player.log (DVD_PLAYER_LOG_PATH overrides).
 #     _attach_engine() is also called at the start of _load_source so a
 #     fresh mpv is rebuilt after eject() (attach_widget no-ops while
 #     already attached).
@@ -1814,6 +1850,8 @@ class MainWindow(QMainWindow):
         self._disc_gone_streak: dict[str, int] = {}
         self._load_started_at = 0.0
         self._auto_detected = False
+        self._startup_scheduled = False
+        self._startup_done = False
         self._scrub_active = False
         self._scrub_fraction: float | None = None
         self._scrub_last_seek = 0.0
@@ -1850,6 +1888,11 @@ class MainWindow(QMainWindow):
         self.video.setPalette(video_palette)
         self.video.installEventFilter(self)
         layout.addWidget(self.video, 1)
+        # The GL surface must not initialize (a possibly slow probe of the
+        # driver) before the menu paints. Keep it hidden until the dashboard
+        # has produced its first frame; _startup_after_first_frame shows it.
+        if isinstance(self.video, VideoGLWidget):
+            self.video.hide()
         # Load gate: a GL surface is attached only after initializeGL has
         # settled; until then loads wait in one window-level slot. The wid
         # path attaches synchronously in _attach_engine, so it starts ready.
@@ -1903,6 +1946,7 @@ class MainWindow(QMainWindow):
         self.home.browse_requested.connect(self._on_home_browse)
         self.home.close_requested.connect(self._close_home)
         self.home.blade_changed.connect(self._on_home_blade_changed)
+        self.home.first_paint.connect(self._on_home_first_paint)
         self.chapter_grid.chapter_chosen.connect(self._on_chapter_chosen)
         self.chapter_grid.close_requested.connect(self._close_chapter_grid)
         self.help.close_requested.connect(self._close_help)
@@ -1935,11 +1979,61 @@ class MainWindow(QMainWindow):
         self._disc_timer.timeout.connect(self._poll_disc_insertion)
         self._disc_timer.start()
 
-        QTimer.singleShot(0, self._attach_engine)
-        QTimer.singleShot(0, self.start_mpris)
+        # Startup work is scheduled from showEvent: boot the dashboard, then
+        # probe hardware only after its first frame (see showEvent).
         self._update_window_title()
 
     # ── Qt events ───────────────────────────────────────────────────
+    def showEvent(self, event: QShowEvent | None) -> None:
+        """Boot the dashboard first; defer every device probe and attach.
+
+        The menu paints from cached (empty) state on this first frame, so a
+        spun-down USB optical drive or a slow GL driver can never delay the
+        dashboard. The probe/attach pass runs from ``first_paint`` through a
+        zero-delay timer, i.e. strictly after the first frame.
+        """
+        super().showEvent(event)
+        log.info(
+            "milestone window shown: geom=%sx%s",
+            self.width(),
+            self.height(),
+        )
+        if self._startup_scheduled:
+            return
+        self._startup_scheduled = True
+        if not self._auto_detected and self._initial_source is None:
+            self._show_boot_home()
+            # Safety net for headless platforms that coalesce paints: never
+            # leave startup hanging if no paintEvent is ever delivered.
+            QTimer.singleShot(250, self._startup_after_first_frame)
+        else:
+            QTimer.singleShot(0, self._startup_after_first_frame)
+
+    def _on_home_first_paint(self) -> None:
+        """The dashboard is on screen: let startup proceed after this frame."""
+        if self._startup_scheduled and not self._startup_done:
+            log.info("milestone first frame: scheduling deferred startup")
+            QTimer.singleShot(0, self._startup_after_first_frame)
+
+    def _startup_after_first_frame(self) -> None:
+        """Attach the video surface and probe devices (never before paint)."""
+        if self._startup_done:
+            return
+        self._startup_done = True
+        if isinstance(self.video, VideoGLWidget) and not self.video.isVisible():
+            # The GL context initializes now, behind the already-painted menu.
+            self.video.show()
+        self._attach_engine()
+        self.start_mpris()
+
+    def _show_boot_home(self) -> None:
+        """Paint the dashboard from cached state, without touching devices."""
+        self._preview_next_open = False
+        try:
+            self._open_home(preview=False, probe=False)
+        finally:
+            self._preview_next_open = True
+
     def resizeEvent(self, event: QResizeEvent | None) -> None:
         """Pin the overlays to the window and keep the OSD topmost."""
         super().resizeEvent(event)
@@ -2298,13 +2392,19 @@ class MainWindow(QMainWindow):
         self.help.hide()
 
     # ── HomeMenu overlay (A1/A3) ────────────────────────────────────
-    def _open_home(self, preview: bool = True) -> None:
-        """Show the dashboard over the still-playing video."""
+    def _open_home(self, preview: bool = True, probe: bool = True) -> None:
+        """Show the dashboard over the still-playing video.
+
+        ``probe=False`` is the startup path: it refreshes from the cached
+        presence snapshot only, so opening the menu never waits on an ioctl.
+        """
         if not preview:
             self._preview_next_open = False
         preview = self._preview_next_open
         self._preview_next_open = True
-        devices = list_dvd_devices()
+        devices = (
+            list_dvd_devices() if probe else list(self._disc_presence)
+        )
         present: dict[str, bool | None] = {}
         for device in devices:
             present[device] = self._disc_presence.get(device)
@@ -2558,23 +2658,49 @@ class MainWindow(QMainWindow):
                 return
         self._load_source(text, quiet=False)
 
+    def _probe_device(self, device: str, *, milestone: bool) -> bool | None:
+        """Probe one drive, logging its duration for startup diagnosis."""
+        started = time.monotonic()
+        try:
+            present = disc_present(device)
+        except Exception:  # noqa: BLE001 - hotplug/ioctl weirdness
+            present = None
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+        if milestone:
+            log.info(
+                "milestone device probe %s: present=%s duration=%.1fms",
+                device,
+                present,
+                elapsed_ms,
+            )
+        else:
+            log.debug(
+                "device poll %s: present=%s duration=%.1fms",
+                device,
+                present,
+                elapsed_ms,
+            )
+        return present
+
     def _auto_detect_disc(self) -> None:
         """Prime the poller snapshot and open the dashboard (never auto-load)."""
+        started = time.monotonic()
         devices = list_dvd_devices()
         for device in devices:
-            try:
-                self._disc_presence[device] = disc_present(device)
-            except Exception:  # noqa: BLE001 - hotplug/ioctl weirdness
-                self._disc_presence[device] = None
+            self._disc_presence[device] = self._probe_device(
+                device, milestone=True
+            )
+        log.info(
+            "milestone device probe total: devices=%d duration=%.1fms",
+            len(devices),
+            (time.monotonic() - started) * 1000.0,
+        )
         self._summon_home()
 
     def _poll_disc_insertion(self) -> None:
         """Summon the dashboard on insertion and report removal."""
         for device in list_dvd_devices():
-            try:
-                present = disc_present(device)
-            except Exception:  # noqa: BLE001 - hotplug/ioctl weirdness
-                present = None
+            present = self._probe_device(device, milestone=False)
             previous = self._disc_presence.get(device)
             # Commit the edge BEFORE acting: the dashboard re-enters the
             # event loop and this poller must then see the edge as consumed
@@ -2607,6 +2733,7 @@ class MainWindow(QMainWindow):
 
     def _load_source(self, source: str, quiet: bool = False) -> None:
         """Check the source, offer resume state and load it."""
+        log.info("milestone load request: %r quiet=%s", source, quiet)
         self._attach_engine()
         self._load_started_at = time.monotonic()
         if source in list_dvd_devices():
@@ -2655,6 +2782,7 @@ class MainWindow(QMainWindow):
             self._attach_failed = True
             pending = self._pending_load
             self._pending_load = None
+            log.info("milestone load dropped: attach failed")
             if pending is not None and pending[2]:
                 self._preview_running = False
                 self.home.set_preview_live(False)
@@ -2668,6 +2796,7 @@ class MainWindow(QMainWindow):
             return
         source, _quiet, preview = pending
         log.debug("releasing queued load after attach: %r preview=%s", source, preview)
+        log.info("milestone load drained: %r preview=%s", source, preview)
         self._perform_load(source, preview=preview)
 
     def _queue_load(self, source: str, quiet: bool, preview: bool) -> None:
@@ -2676,6 +2805,7 @@ class MainWindow(QMainWindow):
             log.debug("dropping load queued after window close: %r", source)
             return
         log.debug("load queued until attach: %r preview=%s", source, preview)
+        log.info("milestone load queued: %r preview=%s", source, preview)
         self._pending_load = (source, quiet, preview)
 
     def _renderer_unavailable(self) -> None:
@@ -2692,6 +2822,7 @@ class MainWindow(QMainWindow):
 
     def _perform_load(self, source: str, preview: bool) -> None:
         """Run one already-authorized load for either the menu or the user."""
+        log.info("milestone load started: %r preview=%s", source, preview)
         if preview:
             try:
                 self.engine.load(source)
@@ -3018,10 +3149,22 @@ class MainWindow(QMainWindow):
 
     def _attach_engine(self) -> None:
         """Bind mpv to the video widget, then honour an initial source."""
+        started = time.monotonic()
         has_render = callable(getattr(self.engine, "attach_render", None))
+        log.info(
+            "milestone attach attempt: mode=%s platform=%s",
+            "render" if has_render else "wid",
+            QApplication.instance().platformName()
+            if QApplication.instance() is not None
+            else "?",
+        )
         if isinstance(self.video, VideoGLWidget) and has_render:
             # The GL context is ready only after show(); initializeGL()
             # performs the attach_render() handshake.
+            log.info(
+                "milestone attach result: render surface armed duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             log.debug("render API surface armed for GL attach")
         else:
             if isinstance(self.video, VideoGLWidget):
@@ -3036,6 +3179,10 @@ class MainWindow(QMainWindow):
                 )
                 self._attach_failed = True
                 self._engine_attached = False
+                log.info(
+                    "milestone attach result: failed wayland duration=%.1fms",
+                    (time.monotonic() - started) * 1000.0,
+                )
                 self._renderer_unavailable()
                 return
             try:
@@ -3044,10 +3191,18 @@ class MainWindow(QMainWindow):
                 log.exception("could not attach the video widget: %s", exc)
                 self._attach_failed = True
                 self._engine_attached = False
+                log.info(
+                    "milestone attach result: failed duration=%.1fms",
+                    (time.monotonic() - started) * 1000.0,
+                )
                 self._renderer_unavailable()
                 return
             self._engine_attached = True
             self._attach_failed = False
+            log.info(
+                "milestone attach result: wid attached duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
             log.debug("mpv attached to video window %#x", int(self.video.winId()))
         initial = self._initial_source
         self._initial_source = None

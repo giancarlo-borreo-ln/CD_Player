@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication
 
@@ -15,6 +16,104 @@ from .window import MainWindow, render_mode_requested
 
 # SECTION 7 — main() entry point
 # ════════════════════════════════════════════════════════════════════
+
+# Startup milestones are appended here so a slow launch (spun-down USB
+# optical drive, GL attach retry) can be diagnosed after the fact. The
+# file is capped so it never grows without bound.
+DEBUG_LOG_MAX_LINES = 200
+_LOG_HANDLER_FLAG = "_dvd_player_debug_handler"
+
+
+def debug_log_path() -> Path:
+    """Return the milestone log path (``DVD_PLAYER_LOG_PATH`` overrides)."""
+    override = os.environ.get("DVD_PLAYER_LOG_PATH", "").strip()
+    if override:
+        return Path(override)
+    cache = Path(os.environ.get("XDG_CACHE_HOME", str(Path.home() / ".cache")))
+    return cache / "dvd-player" / "dvd-player.log"
+
+
+class _CappedFileHandler(logging.FileHandler):
+    """Append-only handler that trims the oldest lines past ``max_lines``."""
+
+    def __init__(self, filename: str, max_lines: int) -> None:
+        """Open ``filename`` for appending and count the current lines."""
+        Path(filename).parent.mkdir(parents=True, exist_ok=True)
+        super().__init__(filename, mode="a", encoding="utf-8")
+        self._max_lines = max_lines
+        self._line_count = self._count_lines()
+
+    def _count_lines(self) -> int:
+        try:
+            with open(self.baseFilename, encoding="utf-8", errors="replace") as handle:
+                return sum(1 for _ in handle)
+        except OSError:
+            return 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Append one record, trimming the file when it exceeds the cap."""
+        super().emit(record)
+        self._line_count += 1
+        if self._line_count > self._max_lines:
+            self._trim()
+
+    def _trim(self) -> None:
+        self.acquire()
+        try:
+            self.flush()
+            path = Path(self.baseFilename)
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return
+            keep = lines[-self._max_lines:]
+            path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            self._line_count = len(keep)
+            if self.stream is not None:
+                self.stream.close()
+            self.stream = self._open()
+        finally:
+            self.release()
+
+
+def configure_debug_log(path: str | os.PathLike[str] | None = None) -> Path:
+    """Attach the capped milestone log and return its resolved path.
+
+    Safe to call more than once: an existing handler is replaced only when
+    the target path changes (tests use a temp path per run). A read-only
+    cache directory must never prevent the app from starting.
+    """
+    target = Path(path) if path is not None else debug_log_path()
+    existing = next(
+        (
+            handler
+            for handler in log.handlers
+            if getattr(handler, _LOG_HANDLER_FLAG, False)
+        ),
+        None,
+    )
+    if isinstance(existing, _CappedFileHandler) and existing.baseFilename == str(target):
+        return target
+    if existing is not None:
+        log.removeHandler(existing)
+        existing.close()
+    try:
+        handler = _CappedFileHandler(str(target), DEBUG_LOG_MAX_LINES)
+    except OSError as exc:
+        log.warning("cannot open debug log %s: %s", target, exc)
+        return target
+    setattr(handler, _LOG_HANDLER_FLAG, True)
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    )
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+    log.info("milestone app start: log=%s", target)
+    return target
 
 
 def choose_platform(env: Mapping[str, str] | None = None) -> str | None:
@@ -53,6 +152,7 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(levelname)s %(name)s: %(message)s"
     )
+    configure_debug_log()
     platform = choose_platform()
     if platform is not None:
         os.environ["QT_QPA_PLATFORM"] = platform

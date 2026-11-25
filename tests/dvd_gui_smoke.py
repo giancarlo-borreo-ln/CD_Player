@@ -1833,4 +1833,83 @@ close_window.close()
 close_window.video.initializeGL()
 check(close_loads == [], f"late attach flushed a load after close: {close_loads}")
 
+# ── (s) startup: dashboard paints before any device probe + debug log ──
+import tempfile as _startup_tmp
+from pathlib import Path as _StartupPath
+
+import dvd_player.app as _dvd_app
+
+_log_dir = _startup_tmp.mkdtemp(prefix="dvd-player-log-")
+_log_path = _StartupPath(_log_dir) / "dvd-player.log"
+check(_dvd_app.configure_debug_log(_log_path) == _log_path,
+      "configure_debug_log returned the wrong path")
+check(_log_path.is_file(), "startup debug log was not created")
+
+# Other windows from earlier sections own disc timers; stop them so the
+# ordering recorder below only sees this window's startup probe.
+for _widget in app.topLevelWidgets():
+    if isinstance(_widget, dp.MainWindow) and _widget is not None:
+        _timer = getattr(_widget, "_disc_timer", None)
+        if _timer is not None:
+            _timer.stop()
+
+_startup_order: list[str] = []
+_orig_startup_devices = dp.list_dvd_devices
+_orig_startup_present = dp.disc_present
+
+
+def _probe_recorder(device: str) -> bool:
+    check(startup_window.home._painted_once,
+          "device probe ran before the dashboard's first paint")
+    check(not startup_window.home.isHidden(),
+          "device probe ran while the dashboard was hidden")
+    _startup_order.append(device)
+    return True
+
+
+def _devices_recorder() -> list[str]:
+    check(startup_window.home._painted_once,
+          "device enumeration ran before the dashboard's first paint")
+    return ["/dev/sr0"]
+
+
+startup_engine = dp.DvdPlaybackEngine()
+startup_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+startup_window = dp.MainWindow(startup_engine)
+startup_window.resize(1280, 720)
+dp.list_dvd_devices = _devices_recorder  # type: ignore[assignment]
+dp.disc_present = _probe_recorder  # type: ignore[assignment]
+startup_window.show()
+_deadline = time.monotonic() + 3.0
+while time.monotonic() < _deadline:
+    app.processEvents()
+    if startup_window._startup_done and startup_window.home._painted_once:
+        break
+    time.sleep(0.01)
+app.processEvents()
+check(startup_window.home._painted_once, "dashboard never painted")
+check(not startup_window.home.isHidden(),
+      "dashboard was not visible on the first frame")
+check(startup_window._startup_done, "deferred startup never ran")
+check(_startup_order == ["/dev/sr0"],
+      f"startup probe order drifted: {_startup_order}")
+
+_log_text = _log_path.read_text(encoding="utf-8")
+for _needle in (
+    "app start",
+    "window shown",
+    "first paint",
+    "home menu shown",
+    "device probe /dev/sr0",
+    "attach attempt",
+    "attach result",
+):
+    check(_needle in _log_text, f"debug log missing {_needle!r}: {_log_text!r}")
+check(len(_log_text.splitlines()) <= _dvd_app.DEBUG_LOG_MAX_LINES + 1,
+      "debug log is not capped")
+
+dp.list_dvd_devices = _orig_startup_devices  # type: ignore[assignment]
+dp.disc_present = _orig_startup_present  # type: ignore[assignment]
+startup_window.close()
+
 print(f"GUI SMOKE OK {_count} assertions")
