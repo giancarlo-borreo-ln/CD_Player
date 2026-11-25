@@ -1178,6 +1178,18 @@ class VideoGLWidget(QOpenGLWidget):
         self._engine = engine
         self._render_attached = False
         self.setMouseTracking(True)
+        # A GL surface only repaints when asked, so a rendered video would
+        # freeze on its first frame. This driver asks again every ~33 ms
+        # (~30 fps) while a source is loaded, and stops itself when idle.
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setInterval(self.REPAINT_INTERVAL_MS)
+        self._repaint_timer.timeout.connect(self._on_repaint_tick)
+
+    REPAINT_INTERVAL_MS: ClassVar[int] = 33
+    # States with no picture to advance: the driver must not spin here.
+    IDLE_STATES: ClassVar[frozenset[str]] = frozenset(
+        {"IDLE", "STOPPED", "EJECTED", "ERROR"}
+    )
 
     def initializeGL(self) -> None:
         """Hand the GL proc-address loader to the engine, once.
@@ -1336,6 +1348,39 @@ class VideoGLWidget(QOpenGLWidget):
             render(width, height)
         except Exception as exc:  # noqa: BLE001 - never abort the paint loop
             log.debug("render_frame failed: %s", exc)
+        self._ensure_repaint_driver()
+
+    def _render_active(self) -> bool:
+        """Whether the engine currently has a picture that must advance."""
+        state = getattr(self._engine, "state", None)
+        name = getattr(state, "name", "")
+        if not name:
+            return True
+        return name not in self.IDLE_STATES
+
+    def _ensure_repaint_driver(self) -> None:
+        """Start the continuous repaint timer once a source is loaded."""
+        if not self._render_active():
+            self._repaint_timer.stop()
+            return
+        if not self._repaint_timer.isActive():
+            self._repaint_timer.start()
+
+    def _on_repaint_tick(self) -> None:
+        """Request the next frame, or stop the driver when idle/closed."""
+        if not self.isVisible() or not self._render_active():
+            self._repaint_timer.stop()
+            return
+        self.update()
+
+    def stop_render_loop(self) -> None:
+        """Stop the repaint driver (window close / engine teardown)."""
+        self._repaint_timer.stop()
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        """Stop driving repaints before the surface goes away."""
+        self.stop_render_loop()
+        super().closeEvent(event)
 
     def resizeGL(self, width: int, height: int) -> None:
         """Tell the engine the new device-pixel surface size."""
@@ -1583,6 +1628,13 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     paintGL runs exactly one engine.update() followed by one
 #     engine.render_frame(width*dpr, height*dpr) per paint, swallowing
 #     exceptions so a render fault cannot abort or corrupt the paint loop.
+#     A video surface needs a continuous driver: after each paint that
+#     finds a loaded source (LOADING/MENU_ACTIVE/PLAYING/PAUSED) the
+#     widget starts a ~33 ms QTimer whose timeout calls update() exactly
+#     once, producing the next single update+render paint. The timer stops
+#     when the engine is idle (IDLE/STOPPED/EJECTED/ERROR), when the
+#     widget is hidden, and on closeEvent/stop_render_loop before dispose;
+#     there is never a second update() inside one paint.
 #     Otherwise self.video stays the plain QWidget/wid path. Mouse forwarding keeps the same
 #     _on_video_mouse handler; the GL surface additionally scales
 #     event.position() by devicePixelRatioF(). OSD/home/grid/help remain
@@ -2226,6 +2278,8 @@ class MainWindow(QMainWindow):
         self._close_home()
         self.osd.hide()
         self.osd._hide_timer.stop()
+        if isinstance(self.video, VideoGLWidget):
+            self.video.stop_render_loop()
         self.engine.dispose()
         if event is not None:
             event.accept()

@@ -1464,6 +1464,23 @@ check([entry for entry in render_log if entry[0] == "frame"] == [("frame", 640, 
       f"paintGL must render once at width*dpr, height*dpr: {render_log}")
 check(("size", 640, 360) in render_log, "resizeGL did not notify the engine")
 
+# Continuous render loop: idle engine must not run the driver, and a
+# loaded source starts it after paint; one tick is one update-per-paint.
+check(gl_window.video._repaint_timer.interval() == 33,
+      "video repaint driver interval must be ~33 ms")
+check(not gl_window.video._repaint_timer.isActive(),
+      "repaint driver must stay idle without a source")
+render_engine._transition(dp.PlayerState.LOADING)
+before_tick = render_log.count(("update",))
+gl_window.video.paintGL()
+check(gl_window.video._repaint_timer.isActive(),
+      "paintGL did not start the continuous repaint driver")
+check(render_log.count(("update",)) == before_tick + 1,
+      "paint must still run exactly one update with the driver armed")
+gl_window.video.stop_render_loop()
+check(not gl_window.video._repaint_timer.isActive(),
+      "stop_render_loop left the repaint driver running")
+
 # Regression: a refused attach_render falls back to attach_widget(winId()).
 fallback_engine = dp.DvdPlaybackEngine()
 fallback_engine.render_mode = "render"  # type: ignore[attr-defined]
