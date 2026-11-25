@@ -1782,8 +1782,11 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     _reveal_preview(): the dashboard hides, the ALREADY-RUNNING menu is
 #     revealed with no second load, and focus drops to the video/menu.
 #     The deferred resume prompt (disc_hash_ready during preview stashes
-#     _preview_hash/_preview_saved) is shown at that Enter moment, never
-#     during the quiet boot. Esc from the revealed menu calls
+#     _preview_hash/_preview_saved silently: zero QMessageBox calls) is shown
+#     at that Enter moment, never during the quiet boot. Enter with a stashed
+#     entry asks exactly once (Yes -> engine.resume_disc(saved), No ->
+#     ResumeStore().forget(hash)); with no saved entry Enter only reveals.
+#     Esc from the revealed menu calls
 #     _return_to_dashboard(): HomeMenu returns while the menu keeps running.
 #     _teardown_preview() clears all preview state on eject, loaded-disc
 #     removal (>=2 polls) and app close (stop guarded to preview states).
@@ -1852,12 +1855,16 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     eject/dispose.
 #   * _on_disc_hash(disc_hash): connected to engine.disc_hash_ready (the
 #     backend emits it from a worker thread once the hash is known).
-#     saved = ResumeStore().get(disc_hash); no entry -> nothing. Show the
-#     resume prompt ONLY while playback is still early: engine.state is
-#     PlayerState.LOADING, or less than 15 s elapsed since _load_source
-#     started (self._load_started_at — a slow hash arrival on USB still
-#     gets its prompt). Otherwise playback has moved on: silently skip.
-#     When shown, delegate to _show_resume_prompt(disc_hash, saved).
+#     saved = ResumeStore().get(disc_hash); no entry -> nothing. PREVIEW GATE:
+#     while _preview_running and not _preview_revealed, stash
+#     _preview_hash/_preview_saved and return — a preview boot NEVER raises a
+#     dialog. Only after Enter selects the disc (_reveal_preview) may the
+#     prompt fire. Outside preview, show the resume prompt ONLY while
+#     playback is still early: engine.state is PlayerState.LOADING, or less
+#     than 15 s elapsed since _load_source started (self._load_started_at — a
+#     slow hash arrival on USB still gets its prompt). Otherwise playback has
+#     moved on: silently skip. When shown, delegate to
+#     _show_resume_prompt(disc_hash, saved).
 #   * _show_resume_prompt: QMessageBox.question 'Resume playback from
 #     mm:ss?' (Yes -> ONLY engine.resume_disc(saved), applied immediately
 #     by the backend when PLAYING or staged otherwise; No -> ONLY
@@ -3135,6 +3142,12 @@ class MainWindow(QMainWindow):
 
     def _show_resume_prompt(self, disc_hash: str, saved: dict) -> None:  # type: ignore[type-arg]
         """Offer to resume the already-loading disc; never load it again."""
+        if self._preview_running and not self._preview_revealed:
+            # Defence in depth for the user rule: a quiet behind-the-glass
+            # preview must never raise a modal. Stash until ENTER selects.
+            self._preview_hash = disc_hash
+            self._preview_saved = saved
+            return
         position = saved.get("pos")
         try:
             seconds = float(position) if isinstance(position, (int, float)) else 0.0

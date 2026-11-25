@@ -838,30 +838,70 @@ check(not pv_window._preview_running, "eject did not tear down preview")
 pv_window.close()
 
 # Resume prompt belongs to ENTER, never to the quiet preview boot.
-rs_engine = dp.DvdPlaybackEngine()
-rs_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
-rs_engine.load = lambda src: None  # type: ignore[method-assign]
-rs_window = dp.MainWindow(rs_engine)
-rs_window._auto_detected = True
-rs_window._attach_engine = lambda: None  # type: ignore[method-assign]
-rs_window._disc_presence = {"/dev/sr0": True}
-rs_window._open_home()
-_seen_prompts: list[tuple[str, dict]] = []  # type: ignore[type-arg]
 _orig_get = dp.ResumeStore.get
+_orig_forget = dp.ResumeStore.forget
+
+
+def _resume_preview_window() -> tuple[dp.MainWindow, dp.DvdPlaybackEngine]:
+    engine = dp.DvdPlaybackEngine()
+    engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+    engine.load = lambda src: None  # type: ignore[method-assign]
+    window = dp.MainWindow(engine)
+    window._auto_detected = True
+    window._attach_engine = lambda: None  # type: ignore[method-assign]
+    window._disc_presence = {"/dev/sr0": True}
+    window._open_home()
+    return window, engine
+
+
+def _enter(window: dp.MainWindow) -> None:
+    window.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
+                  Qt.KeyboardModifier.NoModifier)
+    )
+
+
+rs_window, rs_engine = _resume_preview_window()
+_resumes: list[dict] = []  # type: ignore[type-arg]
+rs_engine.resume_disc = lambda saved: _resumes.append(saved)  # type: ignore[method-assign]
 dp.ResumeStore.get = lambda self, h: {"pos": 12.0}  # type: ignore[assignment]
-rs_window._show_resume_prompt = (  # type: ignore[method-assign]
-    lambda h, saved: _seen_prompts.append((h, saved))
-)
+_questions.clear()
 rs_window._on_disc_hash("pv-hash")
-check(_seen_prompts == [], "resume prompt appeared during preview")
-rs_window.keyPressEvent(
-    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
-              Qt.KeyboardModifier.NoModifier)
-)
-check(_seen_prompts == [("pv-hash", {"pos": 12.0})],
-      f"resume prompt missing at reveal: {_seen_prompts}")
-dp.ResumeStore.get = _orig_get  # type: ignore[assignment]
+check(_questions == [], "resume dialog fired during the quiet preview")
+check(rs_window._preview_saved == {"pos": 12.0}, "preview entry not stashed")
+_answer["value"] = QMessageBox.StandardButton.Yes
+_enter(rs_window)
+check(len(_questions) == 1, "ENTER did not prompt exactly once")
+check(_resumes == [{"pos": 12.0}], f"Yes did not resume: {_resumes}")
 rs_window.close()
+
+rs_no, rs_no_engine = _resume_preview_window()
+_no_resumes: list[dict] = []  # type: ignore[type-arg]
+_forgets: list[str] = []
+rs_no_engine.resume_disc = lambda saved: _no_resumes.append(saved)  # type: ignore[method-assign]
+dp.ResumeStore.forget = lambda self, h: _forgets.append(h)  # type: ignore[method-assign]
+dp.ResumeStore.get = lambda self, h: {"pos": 12.0}  # type: ignore[assignment]
+_questions.clear()
+rs_no._on_disc_hash("pv-no")
+check(_questions == [], "No-path dialog fired during the quiet preview")
+_answer["value"] = QMessageBox.StandardButton.No
+_enter(rs_no)
+check(len(_questions) == 1, "ENTER No path did not prompt exactly once")
+check(_forgets == ["pv-no"], f"No did not forget: {_forgets}")
+check(_no_resumes == [], "No path resumed")
+rs_no.close()
+
+rs_none, _ = _resume_preview_window()
+dp.ResumeStore.get = lambda self, h: None  # type: ignore[assignment]
+_questions.clear()
+rs_none._on_disc_hash("pv-none")
+check(rs_none._preview_saved is None, "empty entry was stashed")
+_enter(rs_none)
+check(_questions == [], "ENTER without an entry opened a dialog")
+check(rs_none.home.isHidden(), "ENTER without an entry did not reveal")
+rs_none.close()
+dp.ResumeStore.get = _orig_get  # type: ignore[assignment]
+dp.ResumeStore.forget = _orig_forget  # type: ignore[assignment]
 dp.list_dvd_devices = _pv_orig_devices  # type: ignore[assignment]
 
 # 2026 redesign tokens + frosted veil (video visible, not merely black).

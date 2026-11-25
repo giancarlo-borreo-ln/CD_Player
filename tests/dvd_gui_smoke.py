@@ -1754,31 +1754,76 @@ pv_window.close()
 check(not pv_window._preview_running, "close left preview running")
 
 # Resume prompt is deferred from preview boot to the ENTER reveal.
-rs_engine = dp.DvdPlaybackEngine()
-rs_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
-rs_engine.load = lambda src: None  # type: ignore[method-assign]
-rs_window = dp.MainWindow(rs_engine)
-rs_window._auto_detected = True
-rs_window._attach_engine = lambda: None  # type: ignore[method-assign]
-rs_window._disc_presence = {"/dev/sr0": True}
-rs_window._open_home()
-_resume_prompts: list[tuple[str, dict]] = []  # type: ignore[type-arg]
 _orig_resume_get = dp.ResumeStore.get
+_orig_resume_forget = dp.ResumeStore.forget
+
+
+def _make_preview_window() -> tuple[dp.MainWindow, dp.DvdPlaybackEngine]:
+    engine = dp.DvdPlaybackEngine()
+    engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+    engine.load = lambda src: None  # type: ignore[method-assign]
+    window = dp.MainWindow(engine)
+    window._auto_detected = True
+    window._attach_engine = lambda: None  # type: ignore[method-assign]
+    window._disc_presence = {"/dev/sr0": True}
+    window._open_home()
+    return window, engine
+
+
+def _press_enter(window: dp.MainWindow) -> None:
+    window.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
+                  Qt.KeyboardModifier.NoModifier)
+    )
+
+
+# (a) hash during preview: zero dialogs, the entry is stashed.
+rs_window, rs_engine = _make_preview_window()
+_resume_calls: list[dict] = []  # type: ignore[type-arg]
+rs_engine.resume_disc = lambda saved: _resume_calls.append(saved)  # type: ignore[method-assign]
 dp.ResumeStore.get = lambda self, h: {"pos": 65.0}  # type: ignore[assignment]
-rs_window._show_resume_prompt = (  # type: ignore[method-assign]
-    lambda h, saved: _resume_prompts.append((h, saved))
-)
+_dialogs["question"].clear()
 rs_window._on_disc_hash("preview-hash")
-check(_resume_prompts == [], "resume prompt fired during the quiet preview")
+check(_dialogs["question"] == [], "resume dialog fired during the quiet preview")
 check(rs_window._preview_saved == {"pos": 65.0}, "resume state was not deferred")
-rs_window.keyPressEvent(
-    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
-              Qt.KeyboardModifier.NoModifier)
-)
-check(_resume_prompts == [("preview-hash", {"pos": 65.0})],
-      f"ENTER did not show the deferred resume prompt: {_resume_prompts}")
-dp.ResumeStore.get = _orig_resume_get  # type: ignore[assignment]
+check(rs_window._preview_hash == "preview-hash", "preview hash not stashed")
+
+# (b) ENTER selects the disc: exactly one prompt, Yes resumes.
+_question_answer = QMessageBox.StandardButton.Yes
+_press_enter(rs_window)
+check(len(_dialogs["question"]) == 1, "ENTER did not show the deferred prompt once")
+check(_resume_calls == [{"pos": 65.0}], f"Yes did not resume: {_resume_calls}")
 rs_window.close()
+
+# (b2) No forgets the saved entry and never resumes.
+no_window, no_engine = _make_preview_window()
+_no_resume: list[dict] = []  # type: ignore[type-arg]
+_forgets: list[str] = []
+no_engine.resume_disc = lambda saved: _no_resume.append(saved)  # type: ignore[method-assign]
+dp.ResumeStore.forget = lambda self, h: _forgets.append(h)  # type: ignore[method-assign]
+dp.ResumeStore.get = lambda self, h: {"pos": 30.0}  # type: ignore[assignment]
+_dialogs["question"].clear()
+no_window._on_disc_hash("preview-no")
+check(_dialogs["question"] == [], "No-path dialog fired during the preview")
+_question_answer = QMessageBox.StandardButton.No
+_press_enter(no_window)
+check(len(_dialogs["question"]) == 1, "ENTER did not show exactly one No prompt")
+check(_forgets == ["preview-no"], f"No did not forget the entry: {_forgets}")
+check(_no_resume == [], "No branch resumed")
+no_window.close()
+
+# (c) ENTER with no saved entry only reveals (no dialog).
+none_window, none_engine = _make_preview_window()
+dp.ResumeStore.get = lambda self, h: None  # type: ignore[assignment]
+_dialogs["question"].clear()
+none_window._on_disc_hash("preview-none")
+check(none_window._preview_saved is None, "empty hash stashed a resume entry")
+_press_enter(none_window)
+check(_dialogs["question"] == [], "ENTER without an entry opened a dialog")
+check(none_window.home.isHidden(), "ENTER without an entry did not reveal")
+none_window.close()
+dp.ResumeStore.get = _orig_resume_get  # type: ignore[assignment]
+dp.ResumeStore.forget = _orig_resume_forget  # type: ignore[assignment]
 
 # Veil transparency: the video stays visible through the frosted glass,
 # yet it is tinted (not a raw passthrough) and the redesign tokens hold.
