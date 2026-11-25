@@ -23,6 +23,7 @@ from PyQt6.QtGui import (
     QPaintEvent,
     QPalette,
     QResizeEvent,
+    QShowEvent,
 )
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -77,6 +78,8 @@ class HomeMenu(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         """Build the launcher; it starts hidden."""
         super().__init__(parent)  # type: ignore[arg-type]
+        # D1: the DVD blade is hot on the very first frame — never -1/None,
+        # so the Xbox-green border, label and entry rows always paint.
         self._blade = 0
         self._selection = 0
         self._dvd_devices: list[str] = []
@@ -86,10 +89,25 @@ class HomeMenu(QWidget):
         self._label_epoch = 0
         self._label_thread: threading.Thread | None = None
         self.setMouseTracking(True)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Opaque on purpose: mpv owns video's native X window, so the
+        # dashboard must be its own native window to stack above it, and a
+        # depth-32 ARGB child is rendered pure black on a compositor-less
+        # xcb session. An opaque veil therefore always shows the blades.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAutoFillBackground(False)
+        self._painted_once = False
         self.labels_ready.connect(self._apply_labels)
         self.hide()
+
+    def showEvent(self, event: QShowEvent | None) -> None:
+        """Log the first live show so a missing overlay is diagnosable."""
+        super().showEvent(event)
+        log.debug(
+            "home menu shown: geom=%s parent=%r",
+            self.geometry(),
+            self.parentWidget(),
+        )
 
     # ── data ────────────────────────────────────────────────────────
     def refresh(
@@ -282,11 +300,18 @@ class HomeMenu(QWidget):
     def paintEvent(self, event: QPaintEvent | None) -> None:
         """Draw the dim veil, 360 blades and the active blade's entries."""
         del event
+        if not self._painted_once:
+            self._painted_once = True
+            log.debug(
+                "home menu first paint: geom=%s native=%#x",
+                self.geometry(),
+                int(self.winId()),
+            )
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             veil = QLinearGradient(0.0, 0.0, 0.0, float(self.height()))
-            veil.setColorAt(0.0, QColor(4, 10, 5, 236))
+            veil.setColorAt(0.0, QColor(4, 10, 5, 210))
             veil.setColorAt(1.0, QColor(0, 0, 0, 215))
             painter.fillRect(self.rect(), veil)
 
@@ -305,7 +330,7 @@ class HomeMenu(QWidget):
                     else QColor(255, 255, 255, 55)
                 )
                 painter.setBrush(
-                    QColor(22, 28, 22, 235) if active else QColor(14, 16, 14, 210)
+                    QColor(22, 28, 22, 235) if active else QColor(26, 30, 26, 220)
                 )
                 painter.drawRoundedRect(rect, 8.0, 8.0)
                 blade_font = QFont()
@@ -378,7 +403,10 @@ class ChapterGrid(QWidget):
         self._chapters: list[int] = []
         self._selected = 0
         self._pending: int | None = None
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Native + opaque: same xcb reasoning as HomeMenu — a non-native
+        # child cannot paint over mpv's native video window.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAutoFillBackground(False)
         self._settle = QTimer(self)
         self._settle.setSingleShot(True)
@@ -568,7 +596,9 @@ class HelpOverlay(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         """Build the hidden help panel."""
         super().__init__(parent)  # type: ignore[arg-type]
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Native + opaque overlay; see HomeMenu for the xcb rationale.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAutoFillBackground(False)
         self.hide()
 
@@ -790,9 +820,14 @@ class HelpOverlay(QWidget):
 #     status 'disc removed' and clear _loaded_source. _on_eject_clicked
 #     clears _loaded_source immediately after eject so closing the tray
 #     with a disc re-opens the dashboard.
-#   * HomeMenu overlay (A3): full-window child, shown via _open_home(); the
-#     dim veil covers the video while playback keeps running. On open the
-#     DVD blade is refreshed from list_dvd_devices() + _disc_presence; PVD
+#   * HomeMenu overlay (A3): full-window NATIVE child window (opaque), shown
+#     via _open_home(); mpv renders into video's native X window, so only a
+#     native sibling can stack above it, and an opaque veil is required on a
+#     compositor-less xcb session (an ARGB depth-32 child paints pure black).
+#     The dim veil covers the video while playback keeps running. The DVD blade
+#     is ACTIVE from construction (index 0, never -1), so the Xbox-green
+#     border/label and its entry rows paint on the very first frame. On open
+#     the DVD blade is refreshed from list_dvd_devices() + _disc_presence; PVD
 #     labels are read on a daemon thread through HomeMenu (DiscIdentity.label
 #     guarded with getattr) and never block the GUI. DVD entry -> set source
 #     text + _load_source(device, quiet=False); USB entry -> resolve
@@ -1321,9 +1356,18 @@ class MainWindow(QMainWindow):
         self.home.refresh(devices, present)
         self.home.setGeometry(0, 0, self.width(), self.height())
         self.chapter_grid.close_grid()
+        self.home.setGeometry(0, 0, self.width(), self.height())
         self.home.show()
         self.home.raise_()
         self.osd.hide()
+        log.debug(
+            "home menu opened: visible=%s geom=%s window=%sx%s devices=%s",
+            self.home.isVisible(),
+            self.home.geometry(),
+            self.width(),
+            self.height(),
+            devices,
+        )
 
     def _close_home(self) -> None:
         """Dismiss the dashboard only; playback continues untouched."""
@@ -1792,6 +1836,7 @@ class MainWindow(QMainWindow):
             self._set_status("ERROR")
             QMessageBox.critical(self, "Playback error", str(exc))
             return
+        log.debug("mpv attached to video window %#x", int(self.video.winId()))
         initial = self._initial_source
         self._initial_source = None
         if initial:
@@ -1801,6 +1846,7 @@ class MainWindow(QMainWindow):
         elif not self._auto_detected:
             self._auto_detected = True
             self._auto_detect_disc()
+            log.debug("auto-detect done: home visible=%s", self.home.isVisible())
 # ── [AGENT2: SECTION 6 END] ──
 
 # ════════════════════════════════════════════════════════════════════

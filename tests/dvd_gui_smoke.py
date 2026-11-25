@@ -13,7 +13,7 @@ sys.path.insert(
 )
 
 from PyQt6.QtCore import QEvent, QPointF, Qt
-from PyQt6.QtGui import QImage, QMouseEvent
+from PyQt6.QtGui import QColor, QImage, QMouseEvent
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import dvd_player as dp
@@ -954,6 +954,31 @@ check(home_menu._labels.get("/dev/sr0") == "SLOW-DISC",
       "slow label never reached HomeMenu")
 dp.DiscIdentity.label = staticmethod(_orig_label)  # type: ignore[attr-defined]
 home_menu.deleteLater()
+
+# ── (p) D1: the active DVD blade paints Xbox green on open ─────────
+launch_menu = dp.HomeMenu()
+check(launch_menu._blade == 0, "HomeMenu did not start on the DVD blade")
+check(launch_menu._selection == 0, "HomeMenu did not start on the first entry")
+launch_menu.resize(1280, 720)
+launch_menu._dvd_devices = ["/dev/sr0"]
+launch_menu._dvd_present = {"/dev/sr0": True}
+check(len(launch_menu.entries()) == 1, "active DVD blade has no entries")
+launch_image = QImage(1280, 720, QImage.Format.Format_ARGB32)
+launch_image.fill(QColor(0, 0, 0))
+launch_menu.render(launch_image)
+green_pixels = 0
+for _y in range(launch_image.height()):
+    for _x in range(launch_image.width()):
+        _px = launch_image.pixelColor(_x, _y)
+        if (
+            abs(_px.red() - 116) <= 30
+            and abs(_px.green() - 195) <= 30
+            and abs(_px.blue() - 41) <= 30
+        ):
+            green_pixels += 1
+check(green_pixels > 100,
+      f"active blade is not green at open: {green_pixels} px")
+launch_menu.deleteLater()
 
 # ── (o) C1/C2: ChapterGrid fidelity + burst coalescing ─────────────
 class _ChapterPlayer:

@@ -699,5 +699,30 @@ for _keys in _rows:
         check(_token in _readme_text, f"README misses {_token!r}")
 window.close()
 
+# D1: HomeMenu opens with the active DVD blade already Xbox-green.
+from PyQt6.QtGui import QColor, QImage
+
+launch_menu = dp.HomeMenu()
+check(launch_menu._blade == 0, "HomeMenu did not start on DVD")
+launch_menu.resize(1280, 720)
+launch_menu._dvd_devices = ["/dev/sr0"]
+launch_menu._dvd_present = {"/dev/sr0": True}
+check(len(launch_menu.entries()) == 1, "active blade entries missing")
+launch_image = QImage(1280, 720, QImage.Format.Format_ARGB32)
+launch_image.fill(QColor(0, 0, 0))
+launch_menu.render(launch_image)
+_green = 0
+for _y in range(launch_image.height()):
+    for _x in range(launch_image.width()):
+        _p = launch_image.pixelColor(_x, _y)
+        if (
+            abs(_p.red() - 116) <= 30
+            and abs(_p.green() - 195) <= 30
+            and abs(_p.blue() - 41) <= 30
+        ):
+            _green += 1
+check(_green > 100, f"active blade not green at open: {_green} px")
+launch_menu.deleteLater()
+
 app.processEvents()
 print(f"VERIFICATION-GUI OK {_count}")
