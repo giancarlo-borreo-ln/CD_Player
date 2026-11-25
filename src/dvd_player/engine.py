@@ -5,6 +5,7 @@ import locale
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -73,7 +74,8 @@ MPVError = ValueError
 #   * __init__: QObject ctor; StateMachine(IDLE); ResumeStore();
 #     _player=None, _wid=None, _source=None, _disc_hash=None,
 #     _pending_resume=None, _menu_active=False, _speed=1.0, _audio=[],
-#     _subs=[], _hash_worker=None; connect raw signals to private handlers
+#     _subs=[], _hash_worker=None, _resume_requested=False,
+#     _menu_jump_armed_at=None; connect raw signals to private handlers
 #     (_apply_menu_active, _apply_time_pos, _apply_tracks, _apply_eof,
 #     _apply_disc_hash).
 #   * attach_widget(wid): idempotent while attached. Create mpv.MPV(
@@ -157,8 +159,9 @@ MPVError = ValueError
 #     cycle_subtitle: same shape with type 'sub' and player.sid.
 #   * menu_nav(direction in {'up','down','left','right'}): only when
 #     _menu_active; player.command('discnav', direction) via _discnav,
-#     which is NON-FATAL (mpv failures are logged at info, never ERROR /
-#     error_occurred).
+#     which is NON-FATAL: ANY exception (not just mpv errors) is logged
+#     at debug and swallowed, so the non-fatal menu path NEVER propagates
+#     into the Qt singleShot callback / event loop (no ERROR, no abort).
 #     menu_select: discnav 'select' (menu only, non-fatal). menu_back:
 #     discnav 'prev' (menu only, non-fatal). menu_mouse_move(x, y):
 #     discnav 'mouse_move' x y (menu only, ints, non-fatal).
@@ -167,6 +170,27 @@ MPVError = ValueError
 #   * show_title_menu: player.command('discnav', 'menu') via _discnav
 #     (non-fatal; libmpv exposes no separate VTSM title-menu jump;
 #     log.info this fallback once).
+#   * menu-first load: on the FIRST transition into PLAYING after load
+#     (the LOADING->PLAYING branch of _apply_menu_active, i.e. first-play
+#     content started — never waiting for a menu to appear naturally),
+#     immediately jump INTO the disc menu via _discnav('menu') so the
+#     first-play trailers are skipped. A 250 ms singleShot settle QTimer
+#     is armed and time.monotonic() is recorded at arm time; Qt's
+#     CoarseTimer may fire early, so the callback re-checks
+#     elapsed >= 0.25 s and, when short, re-arms the remaining time
+#     (single-shot) and returns WITHOUT sending — the settle guarantee is
+#     never violated. The callback also re-checks state == PLAYING, not
+#     disposed, _resume_requested False and _pending_resume is None
+#     before sending (abort otherwise). A resume wins: the jump is
+#     suppressed at trigger time when _resume_requested is True or
+#     _pending_resume is not None (resume_disc marks _resume_requested
+#     even when it applies immediately) and re-checked in the callback
+#     (skip + mark done). Exactly once per load epoch: _menu_jump_done is
+#     reset in load() and set BEFORE sending; eject()/dispose() set it
+#     too. A menu-less disc needs no special case (discnav failures are
+#     already non-fatal). A disc that starts menu-active
+#     (LOADING->MENU_ACTIVE) needs no jump and the flag is simply never
+#     armed.
 #   * set_title(title): {PLAYING, PAUSED} only; player.disc_title = title.
 #   * cycle_aspect(): cycle player.video_aspect '-1' -> '16:9' -> '4:3' ->
 #     '-1' and cache the current value in _aspect (exposed via aspect).
@@ -186,8 +210,12 @@ MPVError = ValueError
 #     overwrites a newer target, and the burst produces at most one
 #     immediate write plus one latest-wins settle write.
 #   * adjust_volume(delta): player.volume = min(150, max(0, volume + delta)).
-#   * resume_disc(saved): _pending_resume = dict(saved). Applied AT MOST
-#     ONCE by _apply_pending_resume(): IMMEDIATELY when staged while state
+#   * resume_disc(saved): _resume_requested = True (unconditionally, in
+#     EVERY staging mode) and _pending_resume = dict(saved). The flag is
+#     reset False in load() and is what suppresses the menu-first jump
+#     even when the resume applies immediately and clears _pending_resume.
+#     Applied AT MOST ONCE by _apply_pending_resume(): IMMEDIATELY when
+#     staged while state
 #     is PLAYING and not _menu_active and _player is not None (the async
 #     hash/prompt often arrives after playback started), otherwise on the
 #     first transition into PLAYING after staging (the stage is cleared
@@ -222,7 +250,9 @@ MPVError = ValueError
 #   * _apply_menu_active(active) — handler for _menu_active_raw:
 #       _menu_active = bool(active)
 #       if active and state in {LOADING, PLAYING, PAUSED, STOPPED}: transition(MENU_ACTIVE)
-#       elif not active and state == LOADING: transition(PLAYING)
+#       elif not active and state == LOADING: transition(PLAYING) + arm
+#           the menu-first jump (see the menu-first load bullet; armed
+#           BEFORE the resume block below so a staged resume wins)
 #       elif not active and state == MENU_ACTIVE: transition(PLAYING)
 #       if state == PLAYING and _pending_resume: _apply_pending_resume()
 #       emit menu_active_changed(_menu_active)
@@ -299,6 +329,9 @@ class DvdPlaybackEngine(QObject):
         self._hash_worker: Any = None
         self._hash_epoch = 0  # stale-hash guard: workers carry their epoch
         self._pending_seek_pos: float | None = None
+        self._menu_jump_done = False  # exactly-once menu-first jump per load
+        self._menu_jump_armed_at: float | None = None  # monotonic arm timestamp
+        self._resume_requested = False  # a resume wins over the menu jump
         self._menu_active_raw.connect(self._apply_menu_active)
         self._time_pos_raw.connect(self._apply_time_pos)
         self._tracks_raw.connect(self._apply_tracks)
@@ -312,6 +345,10 @@ class DvdPlaybackEngine(QObject):
         self._seek_settle.setSingleShot(True)
         self._seek_settle.setInterval(350)
         self._seek_settle.timeout.connect(self._on_seek_settle)
+        self._menu_jump_settle = QTimer(self)
+        self._menu_jump_settle.setSingleShot(True)
+        self._menu_jump_settle.setInterval(250)
+        self._menu_jump_settle.timeout.connect(self._on_menu_jump_settle)
 
     # ── public API ──────────────────────────────────────────────────
     def attach_widget(self, wid: int) -> None:
@@ -408,6 +445,10 @@ class DvdPlaybackEngine(QObject):
         ):
             raise PlaybackError(f"cannot load while in state {state.name}")
         self._transition(PlayerState.LOADING)
+        self._menu_jump_settle.stop()
+        self._menu_jump_done = False
+        self._menu_jump_armed_at = None
+        self._resume_requested = False
         self._load_watchdog.start()
         try:
             player = self._ensure_player()
@@ -625,6 +666,7 @@ class DvdPlaybackEngine(QObject):
 
     def resume_disc(self, saved: dict) -> None:  # type: ignore[type-arg]
         """Stage a saved resume entry, applied now when already PLAYING."""
+        self._resume_requested = True
         self._pending_resume = dict(saved) if saved else None
         if (
             self.state is PlayerState.PLAYING
@@ -678,6 +720,8 @@ class DvdPlaybackEngine(QObject):
         self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
         self._seek_settle.stop()
         self._pending_seek_pos = None
+        self._menu_jump_settle.stop()
+        self._menu_jump_done = True
         source = self._source
         player = self._player
         self._player = None
@@ -710,6 +754,8 @@ class DvdPlaybackEngine(QObject):
         self._hash_epoch += 1  # invalidate any in-flight disc-hash worker
         self._seek_settle.stop()
         self._pending_seek_pos = None
+        self._menu_jump_settle.stop()
+        self._menu_jump_done = True
         self._save_resume_now()
         player = self._player
         self._player = None
@@ -908,14 +954,14 @@ class DvdPlaybackEngine(QObject):
         worker.start()
 
     def _discnav(self, *args: object) -> None:
-        """Send a dvdnav command; failures are non-fatal and only logged."""
+        """Send a dvdnav command; ANY failure is non-fatal and only logged."""
         player = self._player
         if player is None:
             return
         try:
             player.command("discnav", *args)
-        except (MPVError, OSError, SystemError, AttributeError) as exc:
-            log.info("discnav %s unavailable: %s", args, exc)
+        except Exception as exc:  # noqa: BLE001 - menu path must never propagate
+            log.debug("discnav %s unavailable: %s", args, exc)
 
     def _call(self, action: Callable[[Any], None]) -> bool:
         """Run a player action, converting mpv failures into ERROR state."""
@@ -994,9 +1040,44 @@ class DvdPlaybackEngine(QObject):
             self._transition(PlayerState.MENU_ACTIVE)
         elif not active and state in (PlayerState.LOADING, PlayerState.MENU_ACTIVE):
             self._transition(PlayerState.PLAYING)
+            if state is PlayerState.LOADING:
+                self._arm_menu_jump()
         if self.state is PlayerState.PLAYING and self._pending_resume:
             self._apply_pending_resume()
         self.menu_active_changed.emit(self._menu_active)
+
+    def _arm_menu_jump(self) -> None:
+        """Arm the once-per-load jump into the menu after first-play starts."""
+        if self._menu_jump_done or self._menu_jump_settle.isActive():
+            return
+        if self._resume_requested or self._pending_resume is not None:
+            # Resume wins: never jump into the menu for this load.
+            self._menu_jump_done = True
+            return
+        self._menu_jump_settle.setInterval(250)
+        self._menu_jump_armed_at = time.monotonic()
+        self._menu_jump_settle.start()
+
+    def _on_menu_jump_settle(self) -> None:
+        """Send the menu-first jump once the first-play content settled."""
+        if self._menu_jump_done:
+            return
+        if self._disposed or self.state is not PlayerState.PLAYING:
+            return
+        if self._resume_requested or self._pending_resume is not None:
+            self._menu_jump_done = True
+            return
+        armed_at = self._menu_jump_armed_at
+        if armed_at is not None:
+            remaining = 0.25 - (time.monotonic() - armed_at)
+            if remaining > 0.0:
+                # CoarseTimer may fire up to ~13 ms early: re-arm the
+                # remainder so the 250 ms settle guarantee always holds.
+                self._menu_jump_settle.setInterval(max(1, int(remaining * 1000) + 1))
+                self._menu_jump_settle.start()
+                return
+        self._menu_jump_done = True
+        self._discnav("menu")
 
     def _apply_disc_hash(self, payload: object) -> None:
         """Apply the worker's hash result on the GUI thread (stale epochs dropped)."""

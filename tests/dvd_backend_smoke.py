@@ -674,6 +674,210 @@ with tempfile.TemporaryDirectory() as tmp:
     restore_engine.dispose()
 
 
+# ── h. menu-first load: jump into the menu on first PLAYING ───────
+class MenuPlayer:
+    def __init__(self, fail: bool = False) -> None:
+        self.commands: list[tuple[object, ...]] = []
+        self.command_times: list[float] = []
+        self.fail = fail
+        self.terminated = 0
+        self.disc_title: int | None = None
+        self.chapter: int | None = None
+        self.time_pos: float | None = None
+        self.aid: object = None
+        self.sid: object = None
+        self.speed = 1.0
+        self.pause = False
+        self.dvd_device: str | None = None
+
+    def command(self, name: str, *args: object) -> None:
+        self.commands.append((name, *args))
+        self.command_times.append(time.monotonic())
+        if self.fail:
+            raise mpv.MPVError("discnav unavailable")
+
+    def play(self, target: str) -> None:
+        pass
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+
+def pump(seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+
+
+# (a) first LOADING->PLAYING arms the jump; exactly one send after >=250 ms.
+jump_engine = DvdPlaybackEngine()
+jump_fake = MenuPlayer()
+jump_engine._player = jump_fake  # type: ignore[assignment]
+jump_engine._sm = StateMachine(PlayerState.LOADING)
+jump_engine._apply_menu_active(False)
+check(jump_engine.state is PlayerState.PLAYING)
+armed_at = time.monotonic()
+pump(0.15)
+check(jump_fake.commands == [])  # settle has not elapsed yet
+pump(0.2)
+check(jump_fake.commands == [("discnav", "menu")])
+check(jump_fake.command_times[0] - armed_at >= 0.24)
+check(jump_engine._menu_jump_done)
+check(not jump_engine._menu_jump_settle.isActive())
+jump_engine._apply_menu_active(False)  # later PLAYING updates never re-jump
+pump(0.3)
+check(len(jump_fake.commands) == 1)
+jump_engine.dispose()
+
+# (b) staged resume wins: zero jumps.
+resume_engine = DvdPlaybackEngine()
+resume_fake = MenuPlayer()
+resume_engine._player = resume_fake  # type: ignore[assignment]
+resume_engine._sm = StateMachine(PlayerState.LOADING)
+resume_engine._pending_resume = {"pos": 5.0}
+resume_engine._apply_menu_active(False)
+check(resume_engine.state is PlayerState.PLAYING)
+check(resume_engine._pending_resume is None)
+check(resume_fake.time_pos == 5.0)
+check(resume_engine._menu_jump_done)
+pump(0.3)
+check(resume_fake.commands == [])
+resume_engine.dispose()
+
+# (c) direct LOADING->MENU_ACTIVE needs no jump: flag never armed.
+menu_engine = DvdPlaybackEngine()
+menu_fake = MenuPlayer()
+menu_engine._player = menu_fake  # type: ignore[assignment]
+menu_engine._sm = StateMachine(PlayerState.LOADING)
+menu_engine._apply_menu_active(True)
+check(menu_engine.state is PlayerState.MENU_ACTIVE)
+check(not menu_engine._menu_jump_done)
+pump(0.3)
+check(menu_fake.commands == [])
+menu_engine.dispose()
+
+# (d) eject/dispose before the callback -> no send.
+eject_engine = DvdPlaybackEngine()
+eject_fake = MenuPlayer()
+eject_engine._player = eject_fake  # type: ignore[assignment]
+eject_engine._sm = StateMachine(PlayerState.LOADING)
+eject_engine._apply_menu_active(False)
+eject_engine.eject()
+check(eject_engine.state is PlayerState.EJECTED)
+check(not eject_engine._menu_jump_settle.isActive())
+check(eject_engine._menu_jump_done)
+pump(0.3)
+check(eject_fake.commands == [])
+
+dispose_engine = DvdPlaybackEngine()
+dispose_fake = MenuPlayer()
+dispose_engine._player = dispose_fake  # type: ignore[assignment]
+dispose_engine._sm = StateMachine(PlayerState.LOADING)
+dispose_engine._apply_menu_active(False)
+dispose_engine.dispose()
+check(not dispose_engine._menu_jump_settle.isActive())
+pump(0.3)
+check(dispose_fake.commands == [])
+
+# (e) load twice resets the flag: exactly one jump per load epoch.
+with tempfile.TemporaryDirectory() as menu_tmp:
+    disc = Path(menu_tmp) / "disc"
+    disc.mkdir()
+    twice_engine = DvdPlaybackEngine()
+    twice_fake = MenuPlayer()
+    twice_engine._player = twice_fake  # type: ignore[assignment]
+    twice_engine.load(str(disc))
+    wait_hash(twice_engine)
+    twice_engine._apply_menu_active(False)
+    pump(0.3)
+    check(len(twice_fake.commands) == 1)
+    twice_engine.eject()
+    twice_engine._player = twice_fake  # type: ignore[assignment]
+    twice_engine.load(str(disc))
+    wait_hash(twice_engine)
+    twice_engine._apply_menu_active(False)
+    pump(0.3)
+    check(len(twice_fake.commands) == 2)
+    twice_engine.dispose()
+
+# (f) a raising discnav command stays non-fatal (PLAYING, no ERROR signal).
+fail_engine = DvdPlaybackEngine()
+fail_fake = MenuPlayer(fail=True)
+fail_engine._player = fail_fake  # type: ignore[assignment]
+fail_engine._sm = StateMachine(PlayerState.LOADING)
+fail_errors: list[str] = []
+fail_engine.error_occurred.connect(fail_errors.append)
+fail_engine._apply_menu_active(False)
+pump(0.3)
+check(fail_fake.commands == [("discnav", "menu")])
+check(fail_engine.state is PlayerState.PLAYING)
+check(fail_errors == [])
+fail_engine.dispose()
+
+# (g) settle guarantee: a premature (CoarseTimer-early) callback re-arms
+# the remainder and still sends exactly once, never before 250 ms.
+early_engine = DvdPlaybackEngine()
+early_fake = MenuPlayer()
+early_engine._player = early_fake  # type: ignore[assignment]
+early_engine._sm = StateMachine(PlayerState.LOADING)
+early_engine._apply_menu_active(False)
+check(early_engine._menu_jump_settle.isActive())
+early_engine._on_menu_jump_settle()  # simulate the timer firing early
+check(early_fake.commands == [])
+check(not early_engine._menu_jump_done)
+check(early_engine._menu_jump_settle.isActive())  # re-armed, not sent
+pump(0.3)
+check(early_fake.commands == [("discnav", "menu")])
+early_armed = early_engine._menu_jump_armed_at
+assert early_armed is not None
+check(early_fake.command_times[0] - early_armed >= 0.25)
+check(early_engine._menu_jump_done)
+early_engine.dispose()
+
+# (h) resume_disc() during PLAYING inside the settle window: the resume is
+# applied immediately (clearing _pending_resume) yet _resume_requested keeps
+# the jump suppressed -> zero jumps.
+race_engine = DvdPlaybackEngine()
+race_fake = MenuPlayer()
+race_engine._player = race_fake  # type: ignore[assignment]
+race_engine._sm = StateMachine(PlayerState.LOADING)
+race_engine._apply_menu_active(False)  # jump armed
+race_engine.resume_disc({"pos": 12.0})
+check(race_engine._resume_requested)
+check(race_engine._pending_resume is None)  # applied immediately
+check(race_fake.time_pos == 12.0)
+pump(0.3)
+check(race_fake.commands == [])  # jump leaked? no.
+check(race_engine._menu_jump_done)
+race_engine.dispose()
+
+
+# (i) ANY exception from discnav is swallowed: the non-fatal menu path can
+# never escape the singleShot callback / SIGABRT the process.
+class ExplodingMenuPlayer(MenuPlayer):
+    def command(self, name: str, *args: object) -> None:
+        self.commands.append((name, *args))
+        self.command_times.append(time.monotonic())
+        raise RuntimeError("discnav exploded")
+
+
+explode_engine = DvdPlaybackEngine()
+explode_fake = ExplodingMenuPlayer()
+explode_engine._player = explode_fake  # type: ignore[assignment]
+explode_engine._sm = StateMachine(PlayerState.LOADING)
+explode_engine._apply_menu_active(False)
+pump(0.3)  # jump callback runs and the RuntimeError is swallowed
+check(explode_engine.state is PlayerState.PLAYING)
+check(len(explode_fake.commands) == 1)
+explode_engine._discnav("menu")  # direct call: non-fatal too
+check(explode_engine.state is PlayerState.PLAYING)
+explode_engine._menu_jump_done = False
+explode_engine._menu_jump_armed_at = None
+explode_engine._on_menu_jump_settle()  # callback path again, no abort
+check(explode_engine.state is PlayerState.PLAYING)
+explode_engine.dispose()
+
 # ── g. dvdnav capability probe ─────────────────────────────────────
 # Qt's QCoreApplication switches LC_NUMERIC to the user locale; libmpv
 # requires "C" for LC_NUMERIC, so restore it before creating mpv.
