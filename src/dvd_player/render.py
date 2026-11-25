@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import mpv
 
@@ -25,9 +25,15 @@ API_TYPE_OPENGL = "opengl"
 FLIP_Y = True
 DEFAULT_FBO = 0
 
-#: GL proc loader as exposed by QOpenGLContext.getProcAddress().
-GetProcAddress = Callable[[str], int | None]
+#: GL proc loader as exposed by QOpenGLContext.getProcAddress(). Qt returns
+#: a ``sip.voidptr``, so the seam types the result loosely; the callback
+#: coerces it to ``int`` before handing it back to libmpv.
+GetProcAddress = Callable[[str], object]
 
+#: Exact C signature from mpv/render_gl.h:
+#: ``void *(*get_proc_address)(void *ctx, const char *name)``.
+#: Any arg-count or type drift here is undefined behaviour inside libmpv
+#: (it calls the trampoline for glGetString before create() returns).
 _MpvGlGetProcAddressFn = ctypes.CFUNCTYPE(
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p
 )
@@ -114,13 +120,27 @@ class RenderContext:
         return self._freed
 
     def _on_get_proc_address(
-        self, _context: ctypes.c_void_p, name: bytes
+        self, _fn_ctx: ctypes.c_void_p, name: bytes | None
     ) -> int | None:
+        # The trampoline runs inside libmpv's first GL call. Letting an
+        # exception escape it (or returning a non-integer pointer) makes
+        # ctypes hand libmpv a bogus address, which then dies in C with no
+        # Python traceback. Everything below returns int or NULL.
+        if not name:
+            return None
         try:
-            return self._get_proc_address(name.decode("ascii"))
+            address = self._get_proc_address(name.decode("ascii"))
         except Exception as exc:  # noqa: BLE001 - GL loader must not unwind
             log.debug("GL proc loader failed for %r: %s", name, exc)
             return None
+        try:
+            # sip.voidptr implements __int__; int() is the one conversion
+            # ctypes cannot do for us on the way back out.
+            value = int(cast(Any, address)) if address is not None else 0
+        except (TypeError, ValueError):
+            log.debug("GL loader returned a non-pointer %r for %r", address, name)
+            return None
+        return value or None
 
     def update(self) -> bool:
         """Ask libmpv whether a new frame is ready; no-op after free."""

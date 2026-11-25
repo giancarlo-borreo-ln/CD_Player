@@ -648,6 +648,25 @@ try:
     ).contents
     check(init.get_proc_address(None, b"glGenFramebuffers") == 0xABCD)
     check(proc_calls == ["glGenFramebuffers"])
+
+    # Qt's getProcAddress returns sip.voidptr, not int. An uncoerced pointer
+    # object cannot be converted to the callback's c_void_p restype: libmpv
+    # then calls a bogus glGetString and dies in C. The trampoline must
+    # return a plain int (or NULL for an unusable loader result).
+    class SipLike:
+        def __init__(self, value: int) -> None:
+            self._value = value
+
+        def __int__(self) -> int:
+            return self._value
+
+    # Same trampoline (init.get_proc_address) with a sip-like loader result
+    # and with an unusable one.
+    ctx._get_proc_address = lambda _name: SipLike(0x1234)
+    check(init.get_proc_address(None, b"glGetString") == 0x1234)
+    ctx._get_proc_address = lambda _name: object()
+    check(init.get_proc_address(None, b"glGetString") is None)
+    ctx._get_proc_address = gl_proc
     fbo0 = ctypes.cast(found[3].data, ctypes.POINTER(render_mod.mpv.MpvOpenGLFBO)).contents
     check(fbo0.fbo == 0)
     flip = ctypes.cast(found[4].data, ctypes.POINTER(ctypes.c_int)).contents
