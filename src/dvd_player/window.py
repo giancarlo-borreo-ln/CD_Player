@@ -1755,7 +1755,11 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     calls engine.load); once attach_complete(True) arrives the window
 #     flushes it. After attach_complete(False) loads are refused with the
 #     graceful renderer status, so the raw 'engine not attached' error can
-#     never reach the user.
+#     never reach the user. The slot NEVER outlives teardown: _teardown_preview
+#     (eject/disc-removal/close) and closeEvent clear it, _window_closed makes
+#     the attach-complete slot a no-op, and a post-close queue attempt is
+#     dropped — a late attach_complete can never call engine.load after
+#     eject/dispose.
 #   * _on_disc_hash(disc_hash): connected to engine.disc_hash_ready (the
 #     backend emits it from a worker thread once the hash is known).
 #     saved = ResumeStore().get(disc_hash); no entry -> nothing. Show the
@@ -1852,6 +1856,7 @@ class MainWindow(QMainWindow):
         self._engine_attached = not isinstance(self.video, VideoGLWidget)
         self._attach_failed = False
         self._pending_load: tuple[str, bool, bool] | None = None
+        self._window_closed = False
         if isinstance(self.video, VideoGLWidget):
             self.video.attach_complete.connect(self._on_video_attach_complete)
 
@@ -2052,6 +2057,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent | None) -> None:
         """Release the engine before the window goes away."""
+        self._window_closed = True
+        self._pending_load = None  # a late attach must never flush after close
         self._gamepad_timer.stop()
         self._disc_timer.stop()
         self.stop_mpris()
@@ -2413,6 +2420,7 @@ class MainWindow(QMainWindow):
     def _teardown_preview(self) -> None:
         """Drop all preview state (eject, disc removal or app close)."""
         was_running = self._preview_running
+        self._pending_load = None  # a queued load must not outlive teardown
         self._preview_session = False
         self._preview_started = False
         self._preview_running = False
@@ -2638,6 +2646,10 @@ class MainWindow(QMainWindow):
     def _on_video_attach_complete(self, attached: bool) -> None:
         """Release the queued load, or degrade gracefully when unattached."""
         log.debug("video attach complete signal: attached=%s", attached)
+        if self._window_closed:
+            self._pending_load = None
+            log.debug("ignoring attach completion after window close")
+            return
         if not attached:
             self._engine_attached = False
             self._attach_failed = True
@@ -2660,6 +2672,9 @@ class MainWindow(QMainWindow):
 
     def _queue_load(self, source: str, quiet: bool, preview: bool) -> None:
         """Keep only the newest load until the attach chain settles."""
+        if self._window_closed:
+            log.debug("dropping load queued after window close: %r", source)
+            return
         log.debug("load queued until attach: %r preview=%s", source, preview)
         self._pending_load = (source, quiet, preview)
 

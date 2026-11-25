@@ -1804,4 +1804,33 @@ check(fail_loads == [], "load after a failed attach still reached engine.load")
 check(_dialogs["critical"] == [], "post-failure load surfaced a raw error dialog")
 fail_window.close()
 
+# Loki regression: a queued load must not survive eject or close and be
+# flushed by a late attach_complete.
+def _queued_gl_window() -> tuple[dp.MainWindow, list[str]]:
+    engine = dp.DvdPlaybackEngine()
+    engine.render_mode = "render"  # type: ignore[attr-defined]
+    loads: list[str] = []
+    engine.attach_render = lambda proc, fbo=None: True  # type: ignore[method-assign]
+    engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+    engine.load = lambda src: loads.append(src)  # type: ignore[method-assign]
+    engine.eject = lambda: None  # type: ignore[method-assign]
+    window = dp.MainWindow(engine)
+    window._auto_detected = True
+    window._attach_engine = lambda: None  # type: ignore[method-assign]
+    window._play_source("/dev/sr0")
+    check(window._pending_load is not None, "queued load was not recorded")
+    return window, loads
+
+
+eject_window, eject_loads = _queued_gl_window()
+eject_window._on_eject_clicked()
+eject_window.video.initializeGL()
+check(eject_loads == [], f"late attach flushed a load after eject: {eject_loads}")
+eject_window.close()
+
+close_window, close_loads = _queued_gl_window()
+close_window.close()
+close_window.video.initializeGL()
+check(close_loads == [], f"late attach flushed a load after close: {close_loads}")
+
 print(f"GUI SMOKE OK {_count} assertions")
