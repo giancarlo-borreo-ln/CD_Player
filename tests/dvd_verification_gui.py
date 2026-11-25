@@ -743,6 +743,89 @@ launch_menu.render(launch_image)
 check(not launch_image.isNull(), "empty-state repaint failed")
 launch_menu.deleteLater()
 
+# ── Live title preview lifecycle + 2026 veil contract ──────────────
+_pv_orig_devices = dp.list_dvd_devices
+dp.list_dvd_devices = lambda: ["/dev/sr0"]  # type: ignore[assignment]
+pv_engine = dp.DvdPlaybackEngine()
+pv_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+pv_loads: list[str] = []
+pv_engine.load = lambda src: pv_loads.append(src)  # type: ignore[method-assign]
+pv_engine.eject = lambda: None  # type: ignore[method-assign]
+pv_window = dp.MainWindow(pv_engine)
+pv_window._auto_detected = True
+pv_window._attach_engine = lambda: None  # type: ignore[method-assign]
+pv_window._disc_presence = {"/dev/sr0": True}
+pv_window._open_home()
+check(pv_loads == ["/dev/sr0"], f"preview boot count: {pv_loads}")
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(pv_loads == ["/dev/sr0"], f"blade session reloaded: {pv_loads}")
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(pv_loads == ["/dev/sr0"], f"ENTER reloaded: {pv_loads}")
+check(pv_window.home.isHidden() and pv_window._preview_revealed,
+      "ENTER did not reveal the live menu")
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(not pv_window.home.isHidden() and pv_loads == ["/dev/sr0"],
+      "Esc did not return to the dashboard without reloading")
+pv_window._on_eject_clicked()
+check(not pv_window._preview_running, "eject did not tear down preview")
+pv_window.close()
+
+# Resume prompt belongs to ENTER, never to the quiet preview boot.
+rs_engine = dp.DvdPlaybackEngine()
+rs_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+rs_engine.load = lambda src: None  # type: ignore[method-assign]
+rs_window = dp.MainWindow(rs_engine)
+rs_window._auto_detected = True
+rs_window._attach_engine = lambda: None  # type: ignore[method-assign]
+rs_window._disc_presence = {"/dev/sr0": True}
+rs_window._open_home()
+_seen_prompts: list[tuple[str, dict]] = []  # type: ignore[type-arg]
+_orig_get = dp.ResumeStore.get
+dp.ResumeStore.get = lambda self, h: {"pos": 12.0}  # type: ignore[assignment]
+rs_window._show_resume_prompt = (  # type: ignore[method-assign]
+    lambda h, saved: _seen_prompts.append((h, saved))
+)
+rs_window._on_disc_hash("pv-hash")
+check(_seen_prompts == [], "resume prompt appeared during preview")
+rs_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(_seen_prompts == [("pv-hash", {"pos": 12.0})],
+      f"resume prompt missing at reveal: {_seen_prompts}")
+dp.ResumeStore.get = _orig_get  # type: ignore[assignment]
+rs_window.close()
+dp.list_dvd_devices = _pv_orig_devices  # type: ignore[assignment]
+
+# 2026 redesign tokens + frosted veil (video visible, not merely black).
+redesign_menu = dp.HomeMenu()
+redesign_menu.resize(1280, 720)
+check(redesign_menu.PANEL_RADIUS == 16.0, "panel radius drifted from 16 px")
+check(redesign_menu.VEIL_ALPHA < 210, "veil is too opaque to see the video")
+check(redesign_menu.VEIL_ALPHA > 120, "veil is too transparent for text")
+check(len(redesign_menu._blade_rects()) == 3, "blade count changed")
+check(redesign_menu.PANEL_RADIUS > 10.0, "legacy square panels returned")
+veil_image = QImage(1280, 720, QImage.Format.Format_ARGB32)
+veil_image.fill(QColor(210, 24, 24))
+redesign_menu.render(veil_image)
+_veil = veil_image.pixelColor(1275, 715)
+check(40 < _veil.red() < 210,
+      f"video is not visible through the frosted veil: {_veil.red()}")
+redesign_menu.deleteLater()
+
 # R8: platform gate — render API prefers native Wayland, wid keeps xcb,
 # non-Wayland and explicit choices are never touched.
 from dvd_player import app as dp_app  # noqa: E402

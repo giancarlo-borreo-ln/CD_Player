@@ -983,6 +983,7 @@ class MenuPlayer:
         self.command_times: list[float] = []
         self.fail = fail
         self.terminated = 0
+        self.played = 0
         self.disc_title: int | None = None
         self.chapter: int | None = None
         self.time_pos: float | None = None
@@ -999,7 +1000,7 @@ class MenuPlayer:
             raise mpv.MPVError("discnav unavailable")
 
     def play(self, target: str) -> None:
-        pass
+        self.played += 1
 
     def terminate(self) -> None:
         self.terminated += 1
@@ -1179,6 +1180,74 @@ explode_engine._menu_jump_armed_at = None
 explode_engine._on_menu_jump_settle()  # callback path again, no abort
 check(explode_engine.state is PlayerState.PLAYING)
 explode_engine.dispose()
+
+# ── i. preview seam: load() from IDLE lands in the menu, and a resume
+# staged while MENU_ACTIVE applies exactly once on the next PLAYING ──
+with tempfile.TemporaryDirectory() as preview_tmp:
+    preview_disc = Path(preview_tmp) / "preview"
+    (preview_disc / "VIDEO_TS").mkdir(parents=True)
+    (preview_disc / "VIDEO_TS" / "VIDEO_TS.IFO").write_bytes(b"PREVIEW" * 40)
+
+    # (a) background preview load: IDLE -> LOADING -> PLAYING -> jump.
+    preview_engine = DvdPlaybackEngine()
+    preview_engine._resume = ResumeStore(Path(preview_tmp) / "preview_resume.json")
+    preview_fake = MenuPlayer()
+    preview_engine._player = preview_fake  # type: ignore[assignment]
+    seen_states: list[PlayerState] = []
+    preview_engine.state_changed.connect(seen_states.append)
+    check(preview_engine.state is PlayerState.IDLE)
+    preview_engine.load(str(preview_disc))
+    check(preview_engine.state is PlayerState.LOADING)
+    check(preview_fake.played == 1 and preview_fake.dvd_device == str(preview_disc))
+    wait_hash(preview_engine)  # preview: playback starts before hashing finishes
+    preview_engine._apply_menu_active(False)  # first-play content started
+    check(preview_engine.state is PlayerState.PLAYING)
+    pump(0.3)
+    check(preview_fake.commands == [("discnav", "menu")])  # landed in menu
+    check(preview_engine._menu_jump_done)
+    check(seen_states == [PlayerState.LOADING, PlayerState.PLAYING])
+    preview_engine._apply_menu_active(True)
+    check(preview_engine.state is PlayerState.MENU_ACTIVE)
+
+    # (b) ENTER-with-resume: staged from MENU_ACTIVE, no second load, applied
+    # once on MENU_ACTIVE -> PLAYING and then cleared.
+    preview_engine.resume_disc({"pos": 42.0, "title": 2, "chapter": 3})
+    check(preview_engine.state is PlayerState.MENU_ACTIVE)
+    check(preview_fake.time_pos is None)  # not applied inside the menu
+    check(preview_engine._pending_resume is not None)
+    check(preview_fake.played == 1)  # staging never loads again
+    preview_engine._apply_menu_active(False)  # menu selection -> PLAYING
+    check(preview_engine.state is PlayerState.PLAYING)
+    check(preview_fake.disc_title == 2)
+    check(preview_fake.chapter == 3)
+    check(preview_fake.time_pos == 42.0)
+    check(preview_engine._pending_resume is None)
+    # Cleared: a later PLAYING update never re-applies the staging.
+    preview_fake.disc_title = None
+    preview_fake.chapter = None
+    preview_fake.time_pos = None
+    preview_engine._apply_menu_active(False)
+    check(preview_fake.disc_title is None and preview_fake.chapter is None)
+    check(preview_fake.time_pos is None)
+    check(len(preview_fake.commands) == 1)  # no extra menu jump
+    preview_engine.dispose()
+
+    # (c) preview teardown: stop from the menu, eject terminates the player.
+    teardown_engine = DvdPlaybackEngine()
+    teardown_engine._resume = ResumeStore(Path(preview_tmp) / "teardown_resume.json")
+    teardown_fake = MenuPlayer()
+    teardown_engine._player = teardown_fake  # type: ignore[assignment]
+    teardown_engine.load(str(preview_disc))
+    wait_hash(teardown_engine)
+    teardown_engine._apply_menu_active(True)  # preview sits in the menu
+    check(teardown_engine.state is PlayerState.MENU_ACTIVE)
+    teardown_engine.stop()
+    check(teardown_engine.state is PlayerState.STOPPED)
+    check(teardown_fake.commands[-1] == ("stop",))
+    teardown_engine.eject()
+    check(teardown_engine.state is PlayerState.EJECTED)
+    check(teardown_fake.terminated == 1)
+    check(teardown_engine._player is None)
 
 # ── g. dvdnav capability probe ─────────────────────────────────────
 # Qt's QCoreApplication switches LC_NUMERIC to the user locale; libmpv

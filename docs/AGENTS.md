@@ -35,11 +35,16 @@ their activation protocol, and the verification evidence each one produces.
 
 ```
 TODO.md → Thanos (CoD compression) → Dr. Strange (constraints/contracts, blind)
-       → Tony Stark + Spider-Man (implement to contract)
-       → Loki (pen-test, destroy)
-       → if problems: back to Thanos → Tony Stark + Spider-Man
+       → Tony Stark + Spider-Man (implement on a NEW FEATURE BRANCH)
+       → Loki (attack the branch; FAIL loops back)
+       → Nick Fury (accepts and merges to main — the ONLY merger)
        → Captain America (acceptance) → ship
 ```
+
+**Per-change protocol:** every change lands on a new branch; Loki's attack
+gate is mandatory before any merge; Nick Fury alone merges to main (and
+reinstalls the tool). Dr. Strange never sees code. Thanos alone creates the
+agents, each with a minimized packet.
 
 Dr. Strange never sees code. **Thanos ALONE launches the other agents** — no agent (Tony Stark, Spider-Man, Dr. Strange, Loki, Nick Fury, Captain America) may ever be spawned by anyone else, and every launch carries a Thanos-minimized packet (folded context, static prefix, budget, binary exit). Thanos's own hands (the architect meta-role) do the mechanical work that is not an agent's job: running suites, verifying reports, reinstalling, committing.
 

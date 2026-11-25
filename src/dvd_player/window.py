@@ -14,6 +14,7 @@ from typing import ClassVar
 
 from PyQt6.QtCore import QEvent, QObject, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
+    QBrush,
     QCloseEvent,
     QColor,
     QFont,
@@ -79,12 +80,14 @@ class HomeEntry:
 
 
 class HomeMenu(QWidget):
-    """Full-window Xbox 360 dashboard over the still-playing video."""
+    """2026 frosted-glass dashboard over the still-playing video."""
 
     entry_selected = pyqtSignal(str, arguments=())
     browse_requested = pyqtSignal(arguments=())
     close_requested = pyqtSignal(arguments=())
     labels_ready = pyqtSignal(object, arguments=())
+    # Blade highlights drive the MainWindow title preview lifecycle.
+    blade_changed = pyqtSignal(int, arguments=())
 
     BLADES: ClassVar[tuple[str, ...]] = ("DVD", "USB", "Storage")
     BLADE_SUBTITLES: ClassVar[tuple[str, ...]] = (
@@ -101,6 +104,15 @@ class HomeMenu(QWidget):
     # A key repeat or a double tap must never re-enter the load flow while
     # the first load is still in LOADING (Enter is edge-triggered).
     SELECT_DEBOUNCE_S: ClassVar[float] = 0.35
+    # 2026 design tokens (paint-only, never stylesheet driven).
+    PANEL_RADIUS: ClassVar[float] = 16.0
+    ROW_RADIUS: ClassVar[float] = 14.0
+    VEIL_ALPHA: ClassVar[int] = 172
+    ACCENT: ClassVar[QColor] = QColor(116, 195, 41)
+    ACCENT_BRIGHT: ClassVar[QColor] = QColor(159, 232, 85)
+    TEXT: ClassVar[QColor] = QColor(234, 238, 231)
+    MUTED: ClassVar[QColor] = QColor(158, 169, 158)
+    DIM: ClassVar[QColor] = QColor(96, 108, 96)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         """Build the launcher; it starts hidden."""
@@ -118,12 +130,12 @@ class HomeMenu(QWidget):
         self._usb_entries: list[tuple[str, str]] = []
         self._label_epoch = 0
         self._label_thread: threading.Thread | None = None
+        self._preview_live = False
         self.setMouseTracking(True)
-        # Opaque on purpose: mpv owns video's native X window, so the
-        # dashboard must be its own native window to stack above it, and a
-        # depth-32 ARGB child is rendered pure black on a compositor-less
-        # xcb session. An opaque veil therefore always shows the blades.
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        # 2026 frosted veil: translucent so the live DVD menu shows through
+        # the glass while the panels keep text readable. Qt still promotes
+        # this to a native sibling above mpv's X window.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.setAutoFillBackground(False)
         self._painted_once = False
@@ -155,10 +167,33 @@ class HomeMenu(QWidget):
                 self._dvd_present.setdefault(device, None)
         self._usb_entries = self._discover_usb()
         # A1: a summon always presents the DVD blade refreshed.
+        previous_blade = self._blade
         self._blade = 0
         self._selection = 0
         self._refresh_labels(self._dvd_devices)
         self.update()
+        if previous_blade != self._blade:
+            self.blade_changed.emit(self._blade)
+
+    def preview_device(self) -> str | None:
+        """Return the disc path the DVD blade would preview, if any."""
+        if self._blade != 0:
+            return None
+        for row in self.entry_rows():
+            if row.payload and self._dvd_present.get(row.payload) is True:
+                return row.payload
+        return None
+
+    def set_preview_live(self, live: bool) -> None:
+        """Mark the header as showing a live behind-the-glass preview."""
+        if live != self._preview_live:
+            self._preview_live = live
+            self.update()
+
+    @property
+    def preview_live(self) -> bool:
+        """Whether the header currently advertises a live menu preview."""
+        return self._preview_live
 
     def entries(self) -> list[tuple[str, str]]:
         """Return (display text, payload) for the active blade (compat view)."""
@@ -299,6 +334,7 @@ class HomeMenu(QWidget):
         self._blade = (self._blade + delta) % len(self.BLADES)
         self._selection = 0
         self.update()
+        self.blade_changed.emit(self._blade)
 
     def _move_selection(self, delta: int) -> None:
         count = len(self.entries())
@@ -348,26 +384,26 @@ class HomeMenu(QWidget):
 
     # ── painting ────────────────────────────────────────────────────
     def _layout(self) -> dict[str, float]:
-        """Return the shared spacing grid (blades 260-320 px, 16 px gaps)."""
+        """Return the generous 2026 spacing grid (16 px radii, 20 px gaps)."""
         width = float(self.width())
         height = float(self.height())
-        margin = 24.0
+        margin = 32.0
         content = max(0.0, width - 2.0 * margin)
-        blade_top = max(76.0, min(104.0, height * 0.14))
-        blade_h = max(84.0, min(132.0, height * 0.17))
-        entry_h = 56.0 if height >= 620.0 else 50.0
-        footer_h = 26.0
+        blade_top = max(88.0, min(120.0, height * 0.15))
+        blade_h = max(96.0, min(150.0, height * 0.19))
+        entry_h = 64.0 if height >= 640.0 else 56.0
+        footer_h = 30.0
         footer_top = height - margin - footer_h
         return {
             "margin": margin,
             "content": content,
             "blade_top": blade_top,
             "blade_h": blade_h,
-            "blade_gap": 16.0,
-            "entry_top": blade_top + blade_h + 24.0,
+            "blade_gap": 20.0,
+            "entry_top": blade_top + blade_h + 28.0,
             "entry_h": entry_h,
-            "entry_gap": 10.0,
-            "list_w": min(content, 900.0),
+            "entry_gap": 12.0,
+            "list_w": min(content, 940.0),
             "footer_top": footer_top,
             "footer_h": footer_h,
         }
@@ -408,126 +444,155 @@ class HomeMenu(QWidget):
         font.setItalic(italic)
         return font
 
+    @staticmethod
+    def _panel_gradient(rect: QRectF, active: bool) -> QLinearGradient:
+        """Return the frosted-glass vertical fill for one panel."""
+        gradient = QLinearGradient(rect.topLeft(), rect.bottomLeft())
+        if active:
+            gradient.setColorAt(0.0, QColor(44, 62, 42, 214))
+            gradient.setColorAt(1.0, QColor(22, 32, 24, 196))
+        else:
+            gradient.setColorAt(0.0, QColor(30, 38, 32, 186))
+            gradient.setColorAt(1.0, QColor(16, 23, 19, 176))
+        return gradient
+
     def _paint_header(self, painter: QPainter, m: dict[str, float]) -> None:
-        """Paint the title band: product name, brand mark and accent rule."""
-        painter.setFont(self._font(20, True))
-        painter.setPen(QColor(230, 234, 227))
+        """Paint the modern title band with a live-preview status chip."""
+        painter.setFont(self._font(22, True))
+        painter.setPen(self.TEXT)
         painter.drawText(
-            QRectF(m["margin"], m["margin"], m["content"], 30.0),
+            QRectF(m["margin"], m["margin"], m["content"], 34.0),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
             "DVD PLAYER",
         )
-        painter.setFont(self._font(10, True))
-        painter.setPen(QColor(116, 195, 41))
+        painter.setFont(self._font(9, True))
+        painter.setPen(self.ACCENT)
         painter.drawText(
-            QRectF(m["margin"], m["margin"], m["content"], 30.0),
+            QRectF(m["margin"], m["margin"], m["content"], 34.0),
             int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
-            "X B O X  3 6 0",
+            "X B O X   3 6 0   ·   2 0 2 6",
         )
-        rule_y = m["margin"] + 34.0
-        painter.setPen(QColor(42, 49, 42))
-        painter.drawLine(
-            int(m["margin"]), int(rule_y),
-            int(m["margin"] + m["content"]), int(rule_y),
+        if self._preview_live:
+            chip = QRectF(
+                m["margin"] + m["content"] - 140.0,
+                m["margin"] + 38.0,
+                140.0,
+                24.0,
+            )
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(116, 195, 41, 38))
+            painter.drawRoundedRect(chip, 12.0, 12.0)
+            painter.setPen(self.ACCENT)
+            painter.setFont(self._font(8, True))
+            painter.drawText(
+                chip,
+                int(Qt.AlignmentFlag.AlignCenter),
+                "◉  LIVE TITLE PREVIEW",
+            )
+        rule_y = m["margin"] + 50.0
+        line = QLinearGradient(
+            m["margin"], rule_y, m["margin"] + m["content"], rule_y
         )
-        painter.setPen(QColor(116, 195, 41))
-        painter.drawLine(
-            int(m["margin"]), int(rule_y),
-            int(m["margin"] + 64.0), int(rule_y),
+        line.setColorAt(0.0, QColor(116, 195, 41, 210))
+        line.setColorAt(0.35, QColor(116, 195, 41, 70))
+        line.setColorAt(1.0, QColor(116, 195, 41, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(line))
+        painter.drawRect(
+            QRectF(m["margin"], rule_y, m["content"], 1.5)
         )
 
     def _paint_blades(self, painter: QPainter) -> None:
-        """Paint the three blade cards with selected/hover/muted states."""
+        """Paint three frosted blade cards with glow, hover and muted states."""
         for index, (name, rect) in enumerate(self._blade_rects()):
             active = index == self._blade
             hover = index == self._hover_blade and not active
-            border = (
-                QColor(116, 195, 41)
-                if active
-                else QColor(58, 90, 31) if hover else QColor(42, 49, 42)
-            )
-            fill = (
-                QColor(32, 48, 31)
-                if active
-                else QColor(38, 46, 38) if hover else QColor(27, 33, 29)
-            )
-            painter.setPen(border)
-            painter.setBrush(fill)
-            painter.drawRoundedRect(rect, 10.0, 10.0)
             if active:
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(116, 195, 41, 46))
-                painter.drawRoundedRect(rect, 10.0, 10.0)
+                painter.setBrush(QColor(116, 195, 41, 34))
+                painter.drawRoundedRect(
+                    rect.adjusted(-3.0, -3.0, 3.0, 3.0), 19.0, 19.0
+                )
+                border = self.ACCENT
+            elif hover:
+                border = QColor(78, 122, 46)
+            else:
+                border = QColor(48, 58, 48, 210)
+            painter.setPen(border)
+            painter.setBrush(QBrush(self._panel_gradient(rect, active)))
+            painter.drawRoundedRect(rect, self.PANEL_RADIUS, self.PANEL_RADIUS)
+            if active:
+                painter.setPen(Qt.PenStyle.NoPen)
                 painter.setBrush(QColor(116, 195, 41))
-                painter.drawRect(
-                    QRectF(rect.left() + 16.0, rect.bottom() - 6.0, 40.0, 3.0)
+                painter.drawRoundedRect(
+                    QRectF(rect.left() + 20.0, rect.bottom() - 8.0, 48.0, 4.0),
+                    2.0,
+                    2.0,
                 )
                 painter.drawEllipse(
-                    QRectF(rect.right() - 24.0, rect.center().y() - 4.0, 8.0, 8.0)
+                    QRectF(rect.right() - 27.0, rect.center().y() - 5.0, 10.0, 10.0)
                 )
-            painter.setFont(self._font(15, True))
+            painter.setFont(self._font(16, True))
             painter.setPen(
-                QColor(159, 232, 85)
-                if active
-                else QColor(230, 234, 227) if hover else QColor(154, 163, 154)
+                self.ACCENT_BRIGHT if active else (
+                    self.TEXT if hover else self.MUTED
+                )
             )
             painter.drawText(
-                QRectF(rect.left() + 18.0, rect.top() + 14.0, rect.width() - 36.0, 26.0),
+                QRectF(rect.left() + 22.0, rect.top() + 18.0, rect.width() - 44.0, 28.0),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                 name.upper(),
             )
-            painter.setFont(self._font(9))
-            painter.setPen(
-                QColor(154, 163, 154) if active else QColor(92, 101, 92)
-            )
+            painter.setFont(self._font(10))
+            painter.setPen(self.MUTED if active else self.DIM)
             painter.drawText(
-                QRectF(rect.left() + 18.0, rect.top() + 44.0, rect.width() - 36.0, 20.0),
+                QRectF(rect.left() + 22.0, rect.top() + 52.0, rect.width() - 44.0, 22.0),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                 self.BLADE_SUBTITLES[index],
             )
 
     def _paint_empty(self, painter: QPainter, m: dict[str, float]) -> None:
-        """Paint a helpful empty card instead of leaving the area blank."""
+        """Paint a refined frosted empty card instead of leaving a void."""
         headline = self.empty_state_text()
         if headline is None:
             return
         panel = QRectF(
-            m["margin"], m["entry_top"], m["list_w"], min(150.0, m["entry_h"] * 2.4)
+            m["margin"], m["entry_top"], m["list_w"], min(168.0, m["entry_h"] * 2.5)
         )
-        painter.setPen(QColor(42, 49, 42))
-        painter.setBrush(QColor(27, 33, 29))
-        painter.drawRoundedRect(panel, 10.0, 10.0)
+        painter.setPen(QColor(52, 64, 52, 220))
+        painter.setBrush(QBrush(self._panel_gradient(panel, False)))
+        painter.drawRoundedRect(panel, self.PANEL_RADIUS, self.PANEL_RADIUS)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(116, 195, 41, 40))
+        painter.setBrush(QColor(116, 195, 41, 36))
         painter.drawEllipse(
-            QRectF(panel.left() + 22.0, panel.top() + 32.0, 34.0, 34.0)
+            QRectF(panel.left() + 26.0, panel.top() + 40.0, 44.0, 44.0)
         )
-        painter.setPen(QColor(116, 195, 41))
-        painter.setFont(self._font(15, True))
+        painter.setPen(self.ACCENT)
+        painter.setFont(self._font(18, True))
         painter.drawText(
-            QRectF(panel.left() + 26.0, panel.top() + 36.0, 26.0, 26.0),
+            QRectF(panel.left() + 26.0, panel.top() + 40.0, 44.0, 44.0),
             int(Qt.AlignmentFlag.AlignCenter),
             "◎",
         )
-        painter.setPen(QColor(154, 163, 154))
-        painter.setFont(self._font(13, False, True))
+        painter.setPen(self.TEXT)
+        painter.setFont(self._font(15, True))
         painter.drawText(
-            QRectF(panel.left() + 74.0, panel.top() + 30.0, panel.width() - 96.0, 24.0),
+            QRectF(panel.left() + 88.0, panel.top() + 38.0, panel.width() - 116.0, 26.0),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
             headline,
         )
-        painter.setPen(QColor(92, 101, 92))
-        painter.setFont(self._font(9, False, True))
+        painter.setPen(self.MUTED)
+        painter.setFont(self._font(10))
         painter.drawText(
-            QRectF(panel.left() + 74.0, panel.top() + 56.0, panel.width() - 96.0, 22.0),
+            QRectF(panel.left() + 88.0, panel.top() + 68.0, panel.width() - 116.0, 24.0),
             int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
             self.empty_state_hint(),
         )
 
     def _paint_entries(self, painter: QPainter) -> None:
-        """Paint two-line entry rows with selected and hover states."""
+        """Paint spacious glass rows with selected glow and hover lift."""
         rows = self.entry_rows()
-        limit = self._layout()["footer_top"] - 8.0
+        limit = self._layout()["footer_top"] - 10.0
         for index, (row, rect) in enumerate(
             zip(rows, self._entry_rects(), strict=False)
         ):
@@ -535,80 +600,91 @@ class HomeMenu(QWidget):
                 break  # never paint rows over the key-hint footer
             chosen = index == self._selection
             hover = index == self._hover_entry and not chosen
-            border = (
-                QColor(116, 195, 41)
-                if chosen
-                else QColor(58, 90, 31) if hover else QColor(42, 49, 42)
-            )
-            fill = (
-                QColor(32, 48, 31)
-                if chosen
-                else QColor(38, 46, 38) if hover else QColor(27, 33, 29)
-            )
-            painter.setPen(border)
-            painter.setBrush(fill)
-            painter.drawRoundedRect(rect, 8.0, 8.0)
             if chosen:
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(116, 195, 41, 46))
-                painter.drawRoundedRect(rect, 8.0, 8.0)
-                painter.setBrush(QColor(116, 195, 41))
-                painter.drawRect(
-                    QRectF(rect.left() + 12.0, rect.top() + 12.0, 3.0, rect.height() - 24.0)
+                painter.setBrush(QColor(116, 195, 41, 30))
+                painter.drawRoundedRect(
+                    rect.adjusted(-2.0, -2.0, 2.0, 2.0), 17.0, 17.0
                 )
-            painter.setFont(self._font(13, chosen))
-            painter.setPen(
-                QColor(159, 232, 85) if chosen else QColor(230, 234, 227)
-            )
+                border = self.ACCENT
+            elif hover:
+                border = QColor(78, 122, 46)
+            else:
+                border = QColor(48, 58, 48, 210)
+            painter.setPen(border)
+            painter.setBrush(QBrush(self._panel_gradient(rect, chosen)))
+            painter.drawRoundedRect(rect, self.ROW_RADIUS, self.ROW_RADIUS)
+            if chosen:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(self.ACCENT)
+                painter.drawRoundedRect(
+                    QRectF(rect.left() + 14.0, rect.top() + 14.0, 4.0, rect.height() - 28.0),
+                    2.0,
+                    2.0,
+                )
+            painter.setFont(self._font(14, chosen))
+            painter.setPen(self.ACCENT_BRIGHT if chosen else self.TEXT)
             painter.drawText(
                 QRectF(
-                    rect.left() + 24.0,
-                    rect.top() + 6.0,
-                    rect.width() - 68.0,
-                    rect.height() * 0.5 - 4.0,
+                    rect.left() + 28.0,
+                    rect.top() + 8.0,
+                    rect.width() - 78.0,
+                    rect.height() * 0.5 - 6.0,
                 ),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                 row.title,
             )
-            painter.setFont(self._font(11))
-            painter.setPen(QColor(154, 163, 154) if chosen else QColor(92, 101, 92))
+            painter.setFont(self._font(10))
+            painter.setPen(self.MUTED if chosen else self.DIM)
             painter.drawText(
                 QRectF(
-                    rect.left() + 24.0,
+                    rect.left() + 28.0,
                     rect.top() + rect.height() * 0.5 - 2.0,
-                    rect.width() - 68.0,
-                    rect.height() * 0.5 - 4.0,
+                    rect.width() - 78.0,
+                    rect.height() * 0.5 - 6.0,
                 ),
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
                 row.subtitle,
             )
             actionable = bool(row.payload) and row.title != "No disc"
             if actionable:
-                painter.setFont(self._font(15, chosen))
-                painter.setPen(
-                    QColor(116, 195, 41) if chosen else QColor(92, 101, 92)
-                )
+                painter.setFont(self._font(17, chosen))
+                painter.setPen(self.ACCENT if chosen else self.DIM)
                 painter.drawText(
-                    QRectF(rect.right() - 42.0, rect.top(), 26.0, rect.height()),
+                    QRectF(rect.right() - 46.0, rect.top(), 30.0, rect.height()),
                     int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
                     "›",
                 )
 
     def _paint_footer(self, painter: QPainter, m: dict[str, float]) -> None:
-        """Paint the separator and the centered 9 pt muted key hints."""
+        """Paint a subtle rule and centered key-hint glass capsules."""
         footer = self.footer_rect()
-        painter.setPen(QColor(42, 49, 42))
+        painter.setPen(QColor(48, 58, 48, 180))
         painter.drawLine(
-            int(m["margin"]), int(footer.top() - 8.0),
-            int(m["margin"] + m["content"]), int(footer.top() - 8.0),
+            int(m["margin"]), int(footer.top() - 10.0),
+            int(m["margin"] + m["content"]), int(footer.top() - 10.0),
         )
         painter.setFont(self._font(9))
-        painter.setPen(QColor(92, 101, 92))
-        painter.drawText(
-            footer,
-            int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
-            self.footer_text(),
-        )
+        metrics = painter.fontMetrics()
+        labels = [f"{key}  {action}" for key, action in self.FOOTER_HINTS]
+        widths = [float(metrics.horizontalAdvance(text)) + 26.0 for text in labels]
+        gap = 10.0
+        total = sum(widths) + gap * (len(widths) - 1)
+        x = footer.center().x() - total / 2.0
+        y = footer.top() + 3.0
+        height = footer.height() - 6.0
+        for text, width in zip(labels, widths, strict=False):
+            pill = QRectF(x, y, width, height)
+            painter.setPen(QColor(56, 68, 56, 210))
+            painter.setBrush(QColor(20, 28, 22, 150))
+            painter.drawRoundedRect(pill, 12.0, 12.0)
+            painter.setPen(self.MUTED)
+            painter.drawText(
+                pill,
+                int(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter),
+                text,
+            )
+            x += width + gap
 
     def paintEvent(self, event: QPaintEvent | None) -> None:
         """Draw the 360 dashboard: title band, blades, rows and hints."""
@@ -624,14 +700,27 @@ class HomeMenu(QWidget):
         painter = QPainter(self)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.fillRect(self.rect(), QColor(6, 10, 7, 220))
-            band = QLinearGradient(0.0, 0.0, 0.0, float(self.height()) * 0.42)
-            band.setColorAt(0.0, QColor(116, 195, 41, 24))
-            band.setColorAt(0.6, QColor(11, 14, 12, 10))
-            band.setColorAt(1.0, QColor(11, 14, 12, 0))
+            # Frosted veil: low enough alpha that the live DVD menu is
+            # visible through the glass, dark enough for text contrast.
             painter.fillRect(
-                QRectF(0.0, 0.0, float(self.width()), float(self.height()) * 0.42),
+                self.rect(), QColor(5, 9, 7, self.VEIL_ALPHA)
+            )
+            band = QLinearGradient(0.0, 0.0, 0.0, float(self.height()) * 0.55)
+            band.setColorAt(0.0, QColor(116, 195, 41, 30))
+            band.setColorAt(0.45, QColor(12, 18, 14, 12))
+            band.setColorAt(1.0, QColor(5, 9, 7, 36))
+            painter.fillRect(
+                QRectF(0.0, 0.0, float(self.width()), float(self.height())),
                 band,
+            )
+            glow = QLinearGradient(
+                float(self.width()) * 0.55, 0.0, float(self.width()), 0.0
+            )
+            glow.setColorAt(0.0, QColor(116, 195, 41, 0))
+            glow.setColorAt(1.0, QColor(116, 195, 41, 22))
+            painter.fillRect(
+                QRectF(0.0, 0.0, float(self.width()), float(self.height())),
+                glow,
             )
             self._paint_header(painter, m)
             self._paint_blades(painter)
@@ -1333,12 +1422,13 @@ class VideoGLWidget(QOpenGLWidget):
 #     status 'disc removed' and clear _loaded_source. _on_eject_clicked
 #     clears _loaded_source immediately after eject so closing the tray
 #     with a disc re-opens the dashboard.
-#   * HomeMenu overlay (A3): full-window NATIVE child window (opaque), shown
-#     via _open_home(); mpv renders into video's native X window, so only a
-#     native sibling can stack above it, and an opaque veil is required on a
-#     compositor-less xcb session (an ARGB depth-32 child paints pure black).
-#     The dim veil covers the video while playback keeps running. The DVD blade
-#     is ACTIVE from construction (index 0, never -1), so the Xbox-green
+#   * HomeMenu overlay (A3): full-window NATIVE child window with a
+#     frosted translucent veil, shown via _open_home(); mpv renders into
+#     video's native X window, so only a native sibling can stack above it.
+#     The 2026 veil uses alpha 172 (VEIL_ALPHA): low enough that the live
+#     DVD menu is visible through the glass, high enough for text contrast.
+#     The veil covers the video while playback keeps running. The DVD blade
+#     is ACTIVE from construction (index 0, never -1), so the green
 #     border/label and its entry rows paint on the very first frame. On open
 #     the DVD blade is refreshed from list_dvd_devices() + _disc_presence; PVD
 #     labels are read on a daemon thread through HomeMenu (DiscIdentity.label
@@ -1350,6 +1440,23 @@ class VideoGLWidget(QOpenGLWidget):
 #     while it is visible (no engine actions leak through). Enter is
 #     edge-triggered: a repeat/double press inside HomeMenu.SELECT_DEBOUNCE_S
 #     (0.35 s) is ignored so one blade press starts exactly one load.
+#   * LIVE TITLE PREVIEW (behind-the-glass): when the DVD blade is
+#     highlighted and a present disc exists, _open_home starts exactly one
+#     engine.load(device) per blade-session (self._preview_started guard; a
+#     blade away/back or a reopen never reloads). It only boots from an
+#     idle-like state {IDLE, STOPPED, EJECTED, ERROR}, so it never interrupts
+#     live playback, and it emits no modal dialogs (errors are logged/status
+#     only while previewing). HomeMenu.blade_changed -> _sync_home_preview.
+#     Insertion/launch use _summon_home(): dashboard only, preview dormant
+#     (A1: insertion never loads). ENTER while previewing calls
+#     _reveal_preview(): the dashboard hides, the ALREADY-RUNNING menu is
+#     revealed with no second load, and focus drops to the video/menu.
+#     The deferred resume prompt (disc_hash_ready during preview stashes
+#     _preview_hash/_preview_saved) is shown at that Enter moment, never
+#     during the quiet boot. Esc from the revealed menu calls
+#     _return_to_dashboard(): HomeMenu returns while the menu keeps running.
+#     _teardown_preview() clears all preview state on eject, loaded-disc
+#     removal (>=2 polls) and app close (stop guarded to preview states).
 #   * Platform gate (fix): window.py is imported before QApplication.main()
 #     creates the app. On a Wayland session without the render API it pins
 #     QT_QPA_PLATFORM=xcb (XWayland) because wid embedding needs a real X11
@@ -1357,19 +1464,22 @@ class VideoGLWidget(QOpenGLWidget):
 #     initializeGL's wid fallback and _attach_engine refuse wid embedding
 #     instead of passing a wl_surface pointer to Xlib, which aborts the
 #     process with an uncatchable X BadWindow error on first load.
-#   * HomeMenu presentation (paint-only, no QSS/assets): structured
-#     HomeEntry(title, subtitle, payload) rows (entries() stays the legacy
-#     (text, payload) projection). Palette #0B0E0C veil 220, panels #1B211D,
-#     selected #20301F + green 18% tint, green #74C329, bright #9FE855,
-#     borders #2A312A/#3A5A1F, text #E6EAE3/#9AA39A/#5C655C. Title band 20 pt
-#     bold with green underline; three 260-320 px blades, 16 px gaps, 24 px
-#     margins, 10 px radius; blades uppercase 15 pt; entry rows 8 px radius,
-#     13 pt title + 11 pt subtitle, selected = tint + 3 px green bar + bright
-#     text; hover = lighter fill. Empty blades paint muted italic guidance
+#   * HomeMenu presentation (2026 redesign; paint-only, no QSS/assets):
+#     structured HomeEntry(title, subtitle, payload) rows (entries() stays
+#     the legacy (text, payload) projection). Frosted glassmorphism: a dark
+#     translucent veil (VEIL_ALPHA 172) with soft green glows, gradient panel
+#     fills, green #74C329 / bright #9FE855 accents, text #EAEEE7/#9EA99E/
+#     #606C60 and 1 px hairline borders. PANEL_RADIUS 16 px, ROW_RADIUS 14 px,
+#     32 px margins, 20 px blade gaps, 28 px section spacing. Title band 22 pt
+#     bold with a fading green rule and an optional "LIVE TITLE PREVIEW" chip;
+#     three <=320 px blades, uppercase 16 pt; entry rows 14 pt title + 10 pt
+#     subtitle, selected = green glow + 4 px bar + bright text; hover = lighter
+#     fill. Empty blades paint a refined frosted card with muted guidance
 #     ("No disc — insert one"); a disc whose label is still loading shows a
 #     muted "Reading disc…" placeholder, never a blank row. Footer: centered
-#     9 pt muted hints "Enter select · ←/→ blades · Esc back · Ctrl+H help".
-#     Hover is pointer-only; navigation/selection/load contracts unchanged.
+#     glass key-hint capsules "Enter select · ←/→ blades · Esc back ·
+#     Ctrl+H help". Hover is pointer-only; navigation/selection/load/debounce
+#     contracts unchanged.
 #   * ChapterGrid overlay (C): key C in PLAYING/PAUSED opens it with
 #     engine.chapter_list; arrows navigate, Enter schedules ONE coalesced
 #     engine.seek_to(chapter time) after the grid's 350 ms settle; Escape or
@@ -1459,6 +1569,15 @@ class MainWindow(QMainWindow):
         self._mpris: MprisService | None = None
         self._mpris_started = False
         self._window_label: str | None = None
+        # Live DVD title preview behind the dashboard (one load per session).
+        self._preview_session = False
+        self._preview_started = False
+        self._preview_running = False
+        self._preview_revealed = False
+        self._preview_source: str | None = None
+        self._preview_hash: str | None = None
+        self._preview_saved: dict | None = None  # type: ignore[type-arg]
+        self._preview_next_open = True
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
@@ -1518,6 +1637,7 @@ class MainWindow(QMainWindow):
         self.home.entry_selected.connect(self._on_home_selected)
         self.home.browse_requested.connect(self._on_home_browse)
         self.home.close_requested.connect(self._close_home)
+        self.home.blade_changed.connect(self._on_home_blade_changed)
         self.chapter_grid.chapter_chosen.connect(self._on_chapter_chosen)
         self.chapter_grid.close_requested.connect(self._close_chapter_grid)
         self.help.close_requested.connect(self._close_help)
@@ -1612,6 +1732,12 @@ class MainWindow(QMainWindow):
                 self._close_help()
             event.accept()
             return
+        # Esc from a revealed live menu returns to the dashboard; the DVD
+        # menu keeps running behind the frosted veil (no reload).
+        if self._preview_revealed and key == Qt.Key.Key_Escape.value:
+            self._return_to_dashboard()
+            event.accept()
+            return
         # Guide G opens the dashboard anywhere; M remains an OSD-only toggle.
         if key == Qt.Key.Key_G.value:
             self._open_home()
@@ -1629,6 +1755,13 @@ class MainWindow(QMainWindow):
         if not self.home.isHidden():
             if key == Qt.Key.Key_Escape.value:
                 self._close_home()
+            elif (
+                key in (Qt.Key.Key_Return.value, Qt.Key.Key_Enter.value)
+                and self._preview_running
+            ):
+                # ENTER reveals the already-booted menu (never loads twice)
+                # and only now may the deferred resume prompt appear.
+                self._reveal_preview()
             else:
                 self.home.handle_key(key)
             event.accept()
@@ -1659,6 +1792,7 @@ class MainWindow(QMainWindow):
         self._gamepad_timer.stop()
         self._disc_timer.stop()
         self.stop_mpris()
+        self._teardown_preview()
         self._close_help()
         self._close_chapter_grid()
         self._close_home()
@@ -1873,6 +2007,10 @@ class MainWindow(QMainWindow):
     def _on_engine_error(self, message: str) -> None:
         """Show a critical dialog for backend failures."""
         self._set_status("ERROR")
+        if self._preview_running and not self._preview_revealed:
+            # No modal may interrupt the behind-the-glass preview.
+            log.warning("preview error: %s", message)
+            return
         QMessageBox.critical(self, "Playback error", message)
 
     # ── Help overlay (Ctrl+H) ───────────────────────────────────────
@@ -1890,12 +2028,23 @@ class MainWindow(QMainWindow):
         self.help.hide()
 
     # ── HomeMenu overlay (A1/A3) ────────────────────────────────────
-    def _open_home(self) -> None:
+    def _open_home(self, preview: bool = True) -> None:
         """Show the dashboard over the still-playing video."""
+        if not preview:
+            self._preview_next_open = False
+        preview = self._preview_next_open
+        self._preview_next_open = True
         devices = list_dvd_devices()
         present: dict[str, bool | None] = {}
         for device in devices:
             present[device] = self._disc_presence.get(device)
+        if self.home.isHidden() and not self._preview_running:
+            # A fresh dashboard starts a fresh blade-session: one preview
+            # load is allowed, and only after this point.
+            self._preview_started = False
+            self._preview_source = None
+            self._preview_saved = None
+            self._preview_hash = None
         self.home.refresh(devices, present)
         self.home.setGeometry(0, 0, self.width(), self.height())
         self.chapter_grid.close_grid()
@@ -1903,6 +2052,11 @@ class MainWindow(QMainWindow):
         self.home.show()
         self.home.raise_()
         self.osd.hide()
+        self._preview_revealed = False
+        self._preview_session = preview
+        self.home.set_preview_live(self._preview_running)
+        if preview:
+            self._sync_home_preview()
         log.debug(
             "home menu opened: visible=%s geom=%s window=%sx%s devices=%s",
             self.home.isVisible(),
@@ -1916,9 +2070,114 @@ class MainWindow(QMainWindow):
         """Dismiss the dashboard only; playback continues untouched."""
         self.home.hide()
 
+    def _summon_home(self) -> None:
+        """Insertion/launch summon: dashboard only, preview stays dormant."""
+        self._preview_next_open = False
+        try:
+            self._open_home()
+        finally:
+            self._preview_next_open = True
+
+    # ── live title preview lifecycle ────────────────────────────────
+    def _on_home_blade_changed(self, _index: int) -> None:
+        """A blade highlight moved: allow and sync the live preview."""
+        self._preview_session = True
+        self._sync_home_preview()
+
+    def _sync_home_preview(self) -> None:
+        """Boot the highlighted DVD once per blade-session (never twice)."""
+        if self.home.isHidden() or not self._preview_session:
+            return
+        target = self.home.preview_device()
+        if target is None:
+            return
+        if self._preview_started and target == self._preview_source:
+            return
+        if self._preview_started:
+            return  # strictly one load per dashboard session
+        if self._loaded_source == target:
+            return
+        if self.engine.state not in (
+            PlayerState.IDLE,
+            PlayerState.STOPPED,
+            PlayerState.EJECTED,
+            PlayerState.ERROR,
+        ):
+            return  # never interrupt live playback for a preview
+        self._start_preview(target)
+
+    def _start_preview(self, source: str) -> None:
+        """Load the disc menu behind the dashboard without any dialog."""
+        self._preview_session = True
+        self._preview_started = True
+        self._preview_running = True
+        self._preview_source = source
+        self._loaded_source = source
+        self._pending_source = source
+        self._load_started_at = time.monotonic()
+        self.home.set_preview_live(True)
+        try:
+            self.engine.load(source)
+        except PlaybackError as exc:
+            self._preview_running = False
+            self.home.set_preview_live(False)
+            self._set_status(str(exc))
+
+    def _reveal_preview(self) -> None:
+        """ENTER: show the already-running menu, focus it, defer no longer."""
+        if not self._preview_running:
+            return
+        saved = self._preview_saved
+        disc_hash = self._preview_hash
+        self._preview_saved = None
+        self._preview_revealed = True
+        self.home.hide()
+        self.osd.hide()
+        self.video.setFocus(Qt.FocusReason.OtherFocusReason)
+        if saved is not None and disc_hash is not None:
+            # The resume prompt belongs to the reveal moment, never to the
+            # quiet preview boot.
+            self._show_resume_prompt(disc_hash, saved)
+
+    def _return_to_dashboard(self) -> None:
+        """Esc from a revealed menu: dashboard returns, menu keeps running."""
+        self._preview_revealed = False
+        self._preview_session = True
+        self.home.setGeometry(0, 0, self.width(), self.height())
+        self.home.set_preview_live(self._preview_running)
+        self.home.show()
+        self.home.raise_()
+        self.osd.hide()
+
+    def _teardown_preview(self) -> None:
+        """Drop all preview state (eject, disc removal or app close)."""
+        was_running = self._preview_running
+        self._preview_session = False
+        self._preview_started = False
+        self._preview_running = False
+        self._preview_revealed = False
+        self._preview_source = None
+        self._preview_hash = None
+        self._preview_saved = None
+        self.home.set_preview_live(False)
+        if was_running and self.engine.state in (
+            PlayerState.LOADING,
+            PlayerState.MENU_ACTIVE,
+            PlayerState.PLAYING,
+            PlayerState.PAUSED,
+        ):
+            try:
+                self.engine.stop()
+            except PlaybackError as exc:
+                log.debug("preview stop failed: %s", exc)
+
     def _on_home_selected(self, path: str) -> None:
         """Load the entry chosen on the DVD/USB blade."""
         log.debug("home select %r", path)
+        if self._preview_running and path == self._preview_source:
+            # The disc is already booted behind the glass: reveal it.
+            self._reveal_preview()
+            return
         source = path
         if path not in list_dvd_devices():
             resolved = self._resolve_dvd_source(path)
@@ -2038,7 +2297,7 @@ class MainWindow(QMainWindow):
                 self._disc_presence[device] = disc_present(device)
             except Exception:  # noqa: BLE001 - hotplug/ioctl weirdness
                 self._disc_presence[device] = None
-        self._open_home()
+        self._summon_home()
 
     def _poll_disc_insertion(self) -> None:
         """Summon the dashboard on insertion and report removal."""
@@ -2065,14 +2324,17 @@ class MainWindow(QMainWindow):
                         PlayerState.ERROR,
                     )
                 ):
-                    # A1: insertion NEVER loads; it summons the dashboard.
-                    self._open_home()
+                    # A1: insertion NEVER loads; it summons the dashboard
+                    # (preview stays dormant until the user interacts).
+                    self._summon_home()
             elif self._loaded_source == device:
                 streak = self._disc_gone_streak.get(device, 0) + 1
                 self._disc_gone_streak[device] = streak
                 if streak >= 2:
                     self._set_status("disc removed")
                     self._loaded_source = None
+                    if self._preview_source == device:
+                        self._teardown_preview()
 
     def _load_source(self, source: str, quiet: bool = False) -> None:
         """Check the source, offer resume state and load it."""
@@ -2139,6 +2401,7 @@ class MainWindow(QMainWindow):
 
     def _on_eject_clicked(self) -> None:
         """Eject the disc and show the new state."""
+        self._teardown_preview()
         self.engine.eject()
         self._loaded_source = None  # tray-close with a disc may then auto-boot
         self._set_status("EJECTED")
@@ -2298,6 +2561,11 @@ class MainWindow(QMainWindow):
         self._update_window_title()
         saved = ResumeStore().get(disc_hash)
         if not saved:
+            return
+        if self._preview_running and not self._preview_revealed:
+            # Quiet preview: stash the prompt for the ENTER reveal moment.
+            self._preview_hash = disc_hash
+            self._preview_saved = saved
             return
         elapsed = time.monotonic() - self._load_started_at
         early = self.engine.state is PlayerState.LOADING or elapsed < 15.0

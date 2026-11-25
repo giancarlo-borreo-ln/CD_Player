@@ -1553,4 +1553,116 @@ check(gl_window.osd.geometry().getRect() == (0, 720 - 64, 1280, 64),
       "OSD geometry wrong over the GL surface")
 gl_window.close()
 
+# ── (q) 2026 live title preview: one load per blade-session ─────────
+_prev_devices = dp.list_dvd_devices
+_prev_present = dp.disc_present
+dp.list_dvd_devices = lambda: ["/dev/sr0"]  # type: ignore[assignment]
+dp.disc_present = lambda dev: True  # type: ignore[assignment]
+
+pv_engine = dp.DvdPlaybackEngine()
+pv_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+pv_loads: list[str] = []
+pv_engine.load = lambda src: pv_loads.append(src)  # type: ignore[method-assign]
+pv_engine.eject = lambda: None  # type: ignore[method-assign]
+pv_window = dp.MainWindow(pv_engine)
+pv_window._auto_detected = True
+pv_window._attach_engine = lambda: None  # type: ignore[method-assign]
+pv_window._disc_presence = {"/dev/sr0": True}
+pv_window._open_home()
+check(pv_loads == ["/dev/sr0"], f"preview did not boot once: {pv_loads}")
+check(pv_window._preview_running, "preview flag not set")
+check(pv_window.home.preview_live, "dashboard did not advertise live preview")
+
+# Blade away and back within the same session never reloads.
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Right.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Left.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(pv_loads == ["/dev/sr0"], f"blade re-highlight reloaded: {pv_loads}")
+pv_window._open_home()
+check(pv_loads == ["/dev/sr0"], f"reopening the dashboard reloaded: {pv_loads}")
+
+# ENTER reveals the already-running menu without a second load.
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(pv_loads == ["/dev/sr0"], f"ENTER reloaded the disc: {pv_loads}")
+check(pv_window.home.isHidden(), "ENTER did not reveal the live menu")
+check(pv_window._preview_revealed, "reveal state not recorded")
+
+# Esc returns to the dashboard; the menu keeps running behind it.
+pv_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(not pv_window.home.isHidden(), "Esc did not return to the dashboard")
+check(not pv_window._preview_revealed, "Esc left the reveal state set")
+check(pv_loads == ["/dev/sr0"], f"Esc reloaded the disc: {pv_loads}")
+
+# Eject tears the preview down.
+pv_window._on_eject_clicked()
+check(not pv_window._preview_running, "eject left preview running")
+check(not pv_window.home.preview_live, "eject left the live badge on")
+
+# App close also tears down an active preview.
+pv_window._disc_presence = {"/dev/sr0": True}
+pv_window._open_home()
+check(pv_loads == ["/dev/sr0", "/dev/sr0"], "preview did not restart")
+pv_window.close()
+check(not pv_window._preview_running, "close left preview running")
+
+# Resume prompt is deferred from preview boot to the ENTER reveal.
+rs_engine = dp.DvdPlaybackEngine()
+rs_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+rs_engine.load = lambda src: None  # type: ignore[method-assign]
+rs_window = dp.MainWindow(rs_engine)
+rs_window._auto_detected = True
+rs_window._attach_engine = lambda: None  # type: ignore[method-assign]
+rs_window._disc_presence = {"/dev/sr0": True}
+rs_window._open_home()
+_resume_prompts: list[tuple[str, dict]] = []  # type: ignore[type-arg]
+_orig_resume_get = dp.ResumeStore.get
+dp.ResumeStore.get = lambda self, h: {"pos": 65.0}  # type: ignore[assignment]
+rs_window._show_resume_prompt = (  # type: ignore[method-assign]
+    lambda h, saved: _resume_prompts.append((h, saved))
+)
+rs_window._on_disc_hash("preview-hash")
+check(_resume_prompts == [], "resume prompt fired during the quiet preview")
+check(rs_window._preview_saved == {"pos": 65.0}, "resume state was not deferred")
+rs_window.keyPressEvent(
+    QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Return.value,
+              Qt.KeyboardModifier.NoModifier)
+)
+check(_resume_prompts == [("preview-hash", {"pos": 65.0})],
+      f"ENTER did not show the deferred resume prompt: {_resume_prompts}")
+dp.ResumeStore.get = _orig_resume_get  # type: ignore[assignment]
+rs_window.close()
+
+# Veil transparency: the video stays visible through the frosted glass,
+# yet it is tinted (not a raw passthrough) and the redesign tokens hold.
+veil_menu = dp.HomeMenu()
+veil_menu.resize(1280, 720)
+check(veil_menu.PANEL_RADIUS == 16.0, "panel radius is not 16 px")
+check(veil_menu.ROW_RADIUS >= 12.0, "row radius lost its modern scale")
+check(120 <= veil_menu.VEIL_ALPHA <= 210, "veil alpha outside the legible band")
+check(len(veil_menu._blade_rects()) == 3, "blade structure changed")
+check(veil_menu.footer_text() ==
+      "Enter select  ·  ←/→ blades  ·  Esc back  ·  Ctrl+H help",
+      "footer hints drifted")
+veil_canvas = QImage(1280, 720, QImage.Format.Format_ARGB32)
+veil_canvas.fill(QColor(210, 24, 24))
+veil_menu.render(veil_canvas)
+_veil_px = veil_canvas.pixelColor(1275, 715)
+check(_veil_px.red() > 40, f"video invisible through veil: {_veil_px.red()}")
+check(_veil_px.red() < 210, f"veil did not tint the video: {_veil_px.red()}")
+veil_menu.deleteLater()
+
+dp.list_dvd_devices = _prev_devices  # type: ignore[assignment]
+dp.disc_present = _prev_present  # type: ignore[assignment]
+
 print(f"GUI SMOKE OK {_count} assertions")

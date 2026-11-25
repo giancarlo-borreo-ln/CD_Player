@@ -202,6 +202,13 @@ MPVError = ValueError
 #     immediately jump INTO the disc menu via _discnav('menu') so the
 #     first-play trailers are skipped. A 250 ms singleShot settle QTimer
 #     is armed and time.monotonic() is recorded at arm time; Qt's
+#     KNOWN LIMITATION (title-preview mode): a preview is an ordinary
+#     load(), so the menu-first jump fires whenever no resume was staged
+#     BEFORE the load. The GUI cannot know at load time whether a later
+#     ENTER will request a resume (the hash/prompt arrives during
+#     LOADING/PLAYING), so a preview later resumed at ENTER may jump into
+#     the menu first; the staged resume then lands on the next PLAYING.
+#     Accepted: preview MUST land in the menu, and resume never reloads.
 #     CoarseTimer may fire early, so the callback re-checks
 #     elapsed >= 0.25 s and, when short, re-arms the remaining time
 #     (single-shot) and returns WITHOUT sending — the settle guarantee is
