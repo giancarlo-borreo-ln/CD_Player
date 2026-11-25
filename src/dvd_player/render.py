@@ -25,6 +25,11 @@ API_TYPE_OPENGL = "opengl"
 FLIP_Y = True
 DEFAULT_FBO = 0
 
+#: Highest accepted proc address, exclusive. c_void_p would accept negative
+#: ints and wrap them to 0xFFFF...FF; a real GL pointer is a positive value
+#: below the signed canonical limit.
+_MAX_PROC_ADDRESS = 1 << 63
+
 #: GL proc loader as exposed by QOpenGLContext.getProcAddress(). Qt returns
 #: a ``sip.voidptr``, so the seam types the result loosely; the callback
 #: coerces it to ``int`` before handing it back to libmpv.
@@ -130,17 +135,23 @@ class RenderContext:
             return None
         try:
             address = self._get_proc_address(name.decode("ascii"))
+            # Floats (including inf/nan) are never pointers; reject before
+            # int() can truncate or overflow.
+            if address is None or isinstance(address, float):
+                return None
+            # sip.voidptr implements __int__; int() is the one conversion
+            # ctypes cannot do for us on the way back out. A hostile __int__
+            # may raise anything (OverflowError, ArithmeticError, RuntimeError).
+            value = int(cast(Any, address))
         except Exception as exc:  # noqa: BLE001 - GL loader must not unwind
             log.debug("GL proc loader failed for %r: %s", name, exc)
             return None
-        try:
-            # sip.voidptr implements __int__; int() is the one conversion
-            # ctypes cannot do for us on the way back out.
-            value = int(cast(Any, address)) if address is not None else 0
-        except (TypeError, ValueError):
+        if not 0 < value < _MAX_PROC_ADDRESS:
+            # Negative values would become 0xFFFF_FFFF_FFFF_FFFF as c_void_p;
+            # anything past the signed canonical range is not a valid pointer.
             log.debug("GL loader returned a non-pointer %r for %r", address, name)
             return None
-        return value or None
+        return value
 
     def update(self) -> bool:
         """Ask libmpv whether a new frame is ready; no-op after free."""

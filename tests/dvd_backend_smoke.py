@@ -666,6 +666,36 @@ try:
     check(init.get_proc_address(None, b"glGetString") == 0x1234)
     ctx._get_proc_address = lambda _name: object()
     check(init.get_proc_address(None, b"glGetString") is None)
+
+    # Loki: a loader or __int__ that raises anything must yield NULL, never
+    # unwind into ctypes (which would return garbage). Non-canonical values
+    # (negative, huge, float, bool-as-float) must not reach libmpv.
+    class Raising:
+        def __init__(self, exc: BaseException) -> None:
+            self._exc = exc
+
+        def __int__(self) -> int:
+            raise self._exc
+
+    hostile: list[object] = [
+        Raising(OverflowError("too big")),
+        Raising(ArithmeticError("weird")),
+        Raising(RuntimeError("hostile")),
+        -1,
+        -(1 << 63),
+        1 << 64,
+        float("inf"),
+        float("nan"),
+        4096.0,
+    ]
+    for bad in hostile:
+        ctx._get_proc_address = lambda _name, v=bad: v
+        check(init.get_proc_address(None, b"glGetString") is None)
+    for exc in (OverflowError("x"), ArithmeticError("x"), RuntimeError("x")):
+        ctx._get_proc_address = lambda _name, e=exc: (_ for _ in ()).throw(e)
+        check(init.get_proc_address(None, b"glGetString") is None)
+    ctx._get_proc_address = lambda _name: True
+    check(init.get_proc_address(None, b"glGetString") == 1)
     ctx._get_proc_address = gl_proc
     fbo0 = ctypes.cast(found[3].data, ctypes.POINTER(render_mod.mpv.MpvOpenGLFBO)).contents
     check(fbo0.fbo == 0)
