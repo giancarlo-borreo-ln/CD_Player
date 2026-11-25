@@ -2187,12 +2187,17 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     the direct _on_video_mouse entry point so tests bypassing Qt notify
 #     still count). On timeout->_hide_idle_cursor: setCursor(BlankCursor).
 #     The guard is checked AT TIMEOUT: never hide while _scrub_active
-#     (seek-bar press..release) or while QApplication.activeModalWidget()
-#     is not None. The next activity restores unsetCursor immediately and
-#     restarts the countdown, so the pointer never stays blank. Scrubbing
-#     handlers also note activity (press/move/release). Timer activity is
-#     silent: no OSD reveal, no repaint, no mpv call. closeEvent stops the
-#     timer, removes the app filter and restores the cursor.
+#     (seek-bar press..release), while QApplication.activeModalWidget()
+#     is not None, or while the boot/loading splash or home menu covers
+#     the window. A guarded refusal RESTARTS the single-shot timer (never
+#     returns disarmed), so auto-hide resumes once the guard clears. Any
+#     splash show and _dismiss_splash also note activity, restoring a
+#     pointer the splash may have covered. The next activity restores
+#     unsetCursor immediately and restarts the countdown, so the pointer
+#     never stays blank. Scrubbing handlers also note activity
+#     (press/move/release). Timer activity is silent: no OSD reveal, no
+#     repaint, no mpv call. closeEvent stops the timer, removes the app
+#     filter and restores the cursor.
 #   * closeEvent: engine.dispose(); event.accept().
 #   * _sync_osd: osd.set_transport(state=engine.state, speed=engine.speed,
 #     time_pos=engine.time_pos, duration=engine.duration,
@@ -2414,6 +2419,7 @@ class MainWindow(QMainWindow):
         if self._startup_done or self.home._painted_once:
             return
         self._splash_timer.stop()
+        self._note_mouse_activity()
         self.splash.show_boot()
         log.info("milestone boot splash shown")
 
@@ -2421,6 +2427,7 @@ class MainWindow(QMainWindow):
         """Show 'Loading disc…' with the best non-blocking label we have."""
         if self._window_closed:
             return
+        self._note_mouse_activity()
         label = getattr(self.engine, "disc_label", None)
         if not (isinstance(label, str) and label.strip()):
             try:
@@ -2437,6 +2444,9 @@ class MainWindow(QMainWindow):
         """Hide the splash and stop all of its timers (idempotent)."""
         self._splash_timer.stop()
         self.splash.dismiss()
+        # The splash may have covered a hidden pointer; never leave the
+        # cursor blank after it goes away, and restart the idle countdown.
+        self._note_mouse_activity()
 
     def _on_home_first_paint(self) -> None:
         """The dashboard is on screen: let startup proceed after this frame."""
@@ -2607,7 +2617,15 @@ class MainWindow(QMainWindow):
         """Blank the cursor after idleness; never during scrub or a modal."""
         if self._window_closed or not self.isVisible():
             return
-        if self._scrub_active or QApplication.activeModalWidget() is not None:
+        if (
+            self._scrub_active
+            or QApplication.activeModalWidget() is not None
+            or self.splash.isVisible()
+            or self.home.isVisible()
+        ):
+            # A guarded refusal must not disarm auto-hide: re-arm the
+            # countdown so the next expiry can hide once the guard clears.
+            self._cursor_timer.start()
             return
         self.setCursor(Qt.CursorShape.BlankCursor)
         self._cursor_hidden = True

@@ -1432,15 +1432,36 @@ check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
       "cursor hidden during an active scrub")
 _cursor_window._on_scrub_released()
 
-# Never hide while a modal dialog is up.
+# Never hide while a modal dialog is up; the refusal re-arms the timer.
 _orig_modal = QApplication.activeModalWidget
 QApplication.activeModalWidget = staticmethod(lambda: object())  # type: ignore[method-assign]
 try:
+    _cursor_window._cursor_timer.stop()
     _cursor_window._cursor_timer.timeout.emit()
     check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
           "cursor hidden over a modal dialog")
+    check(_cursor_window._cursor_timer.isActive(),
+          "modal guard disarmed the idle timer")
 finally:
     QApplication.activeModalWidget = _orig_modal  # type: ignore[method-assign]
+
+# Never hide under a live boot/loading splash; dismissing it must not leave
+# a blank pointer and must leave the countdown armed.
+_cursor_window.splash.show_boot()
+app.processEvents()
+check(_cursor_window.splash.isVisible(), "splash not visible for cursor guard")
+_cursor_window._cursor_timer.stop()
+_cursor_window._cursor_timer.timeout.emit()
+check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+      "cursor hidden under a live splash")
+check(_cursor_window._cursor_timer.isActive(),
+      "splash guard disarmed the idle timer")
+_cursor_window._dismiss_splash()
+app.processEvents()
+check(_cursor_window.cursor().shape() != Qt.CursorShape.BlankCursor,
+      "splash dismissal left the cursor blank")
+check(_cursor_window._cursor_timer.isActive(),
+      "splash dismissal left the idle timer stopped")
 
 # Close stops the timer and restores the cursor.
 _cursor_window._cursor_timer.timeout.emit()
