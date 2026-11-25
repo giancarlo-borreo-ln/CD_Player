@@ -2668,14 +2668,14 @@ class MainWindow(QMainWindow):
         elapsed_ms = (time.monotonic() - started) * 1000.0
         if milestone:
             log.info(
-                "milestone device probe %s: present=%s duration=%.1fms",
+                "milestone device probe %r: present=%s duration=%.1fms",
                 device,
                 present,
                 elapsed_ms,
             )
         else:
             log.debug(
-                "device poll %s: present=%s duration=%.1fms",
+                "device poll %r: present=%s duration=%.1fms",
                 device,
                 present,
                 elapsed_ms,

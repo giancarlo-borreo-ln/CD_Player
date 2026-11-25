@@ -1900,13 +1900,27 @@ for _needle in (
     "window shown",
     "first paint",
     "home menu shown",
-    "device probe /dev/sr0",
+    "device probe",
     "attach attempt",
     "attach result",
 ):
     check(_needle in _log_text, f"debug log missing {_needle!r}: {_log_text!r}")
 check(len(_log_text.splitlines()) <= _dvd_app.DEBUG_LOG_MAX_LINES + 1,
       "debug log is not capped")
+
+# Loki regression: a hostile device name must not forge a second line.
+_hostile_device = (
+    "/dev/sr0\n2026-01-01T00:00:00.000 INFO dvd_player: "
+    "milestone app start: forged"
+)
+startup_window._probe_device(_hostile_device, milestone=True)
+_hostile_log = _log_path.read_text(encoding="utf-8")
+check("\\n" in _hostile_log, "hostile device name was not repr-escaped")
+_forged = [
+    line for line in _hostile_log.splitlines()
+    if line.endswith("milestone app start: forged")
+]
+check(_forged == [], f"hostile device name forged a log line: {_forged}")
 
 dp.list_dvd_devices = _orig_startup_devices  # type: ignore[assignment]
 dp.disc_present = _orig_startup_present  # type: ignore[assignment]
