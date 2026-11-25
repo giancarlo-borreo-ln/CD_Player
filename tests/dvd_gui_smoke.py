@@ -1756,4 +1756,52 @@ veil_menu.deleteLater()
 dp.list_dvd_devices = _prev_devices  # type: ignore[assignment]
 dp.disc_present = _prev_present  # type: ignore[assignment]
 
+# ── (r) attach ordering: loads wait for attach_complete ────────────
+gate_engine = dp.DvdPlaybackEngine()
+gate_engine.render_mode = "render"  # type: ignore[attr-defined]
+gate_loads: list[str] = []
+gate_engine.attach_render = lambda proc, fbo=None: True  # type: ignore[method-assign]
+gate_engine.attach_widget = lambda wid: None  # type: ignore[method-assign]
+gate_engine.load = lambda src: gate_loads.append(src)  # type: ignore[method-assign]
+gate_window = dp.MainWindow(gate_engine)
+gate_window._auto_detected = True
+gate_window._attach_engine = lambda: None  # type: ignore[method-assign]
+gate_window._start_preview("/dev/sr0")
+check(gate_loads == [],
+      f"preview loaded before the attach-complete signal: {gate_loads}")
+gate_window.video.initializeGL()
+check(gate_loads == ["/dev/sr0"],
+      f"queued preview did not flush after attach: {gate_loads}")
+gate_window.close()
+
+fail_engine = dp.DvdPlaybackEngine()
+fail_engine.render_mode = "render"  # type: ignore[attr-defined]
+fail_loads: list[str] = []
+fail_engine.load = lambda src: fail_loads.append(src)  # type: ignore[method-assign]
+fail_engine.attach_render = lambda proc, fbo=None: False  # type: ignore[method-assign]
+
+
+def _refuse_wid(wid: int) -> None:
+    raise dp.PlaybackError(
+        "engine not attached to a video widget yet (attach_widget first)"
+    )
+
+
+fail_engine.attach_widget = _refuse_wid  # type: ignore[method-assign]
+fail_window = dp.MainWindow(fail_engine)
+fail_window._auto_detected = True
+fail_window._attach_engine = lambda: None  # type: ignore[method-assign]
+_dialogs["critical"].clear()
+fail_window._play_source("/dev/sr0")
+check(fail_loads == [], "unattached load reached engine.load before attach")
+fail_window.video.initializeGL()
+check(fail_loads == [], "failed attach still loaded the queued source")
+check("renderer unavailable" in fail_window.status.text(),
+      f"attach failure did not show the graceful status: {fail_window.status.text()!r}")
+check(_dialogs["critical"] == [], "attach failure surfaced a PlaybackError dialog")
+fail_window._play_source("/dev/sr0")
+check(fail_loads == [], "load after a failed attach still reached engine.load")
+check(_dialogs["critical"] == [], "post-failure load surfaced a raw error dialog")
+fail_window.close()
+
 print(f"GUI SMOKE OK {_count} assertions")

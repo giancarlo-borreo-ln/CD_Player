@@ -1109,7 +1109,14 @@ class VideoGLWidget(QOpenGLWidget):
     On success the engine receives the widget's live framebuffer source
     (``defaultFramebufferObject`` as a callable), so libmpv paints into this
     widget's FBO instead of the window backbuffer (FBO 0).
+
+    ``attach_complete(bool)`` fires exactly once per attach chain, after the
+    render path, the optional software-GL retry and the wid fallback have all
+    settled. MainWindow queues loads until that signal and degrades to a
+    clear status when it reports failure.
     """
+
+    attach_complete = pyqtSignal(bool, arguments=())
 
     def __init__(
         self, engine: DvdPlaybackEngine, parent: QWidget | None = None
@@ -1123,53 +1130,99 @@ class VideoGLWidget(QOpenGLWidget):
     def initializeGL(self) -> None:
         """Hand the GL proc-address loader to the engine, once.
 
-        On a refused attach the widget calls ``attach_widget(winId())`` so
-        the wid path takes over; if that also fails the engine's own
-        software path remains the last resort. The window is never left
-        unattached without a log trail.
+        Ordered chain: ``attach_render`` -> one software-GL retry on native
+        Wayland -> ``attach_widget(winId())`` when wid embedding is safe.
+        ``attach_complete(attached)`` always fires, so MainWindow can release
+        queued loads or show the graceful renderer-unavailable status.
         """
         if self._render_attached:
             return
-        attach = getattr(self._engine, "attach_render", None)
-        if not callable(attach):
-            return
-        context = self.context()
-        loader = getattr(context, "getProcAddress", None)
-        get_proc = loader if callable(loader) else None
-        fbo = self._fbo_source()
-        try:
-            attached = bool(attach(get_proc, fbo=fbo))
-        except TypeError:
-            # Engines that still expose attach_render(proc) only: keep the
-            # wid path reachable rather than failing the handshake outright.
-            try:
-                attached = bool(attach(get_proc))
-            except Exception as exc:  # noqa: BLE001 - renderer must never kill
-                log.warning("render attach failed: %s", exc)
-                attached = False
-        except Exception as exc:  # noqa: BLE001 - renderer must never kill the GUI
-            log.warning("render attach failed: %s", exc)
-            attached = False
-        if attached:
+        log.debug("attach chain start: platform=%s", self._platform_name())
+        if self._try_attach_render():
             self._render_attached = True
+            log.debug("attach chain: render API attached")
+            self._emit_attach_complete(True)
             return
         self._render_attached = False
+        if self._software_retry_feasible():
+            os.environ["LIBGL_ALWAYS_SOFTWARE"] = "1"
+            log.warning("render attach failed; retrying once with software GL")
+            if self._try_attach_render():
+                self._render_attached = True
+                log.debug("attach chain: software render API attached")
+                self._emit_attach_complete(True)
+                return
+        else:
+            log.debug(
+                "software GL retry not feasible (platform=%s, flag=%r)",
+                self._platform_name(),
+                os.environ.get("LIBGL_ALWAYS_SOFTWARE"),
+            )
         if not wid_embedding_safe():
             log.warning(
                 "render attach failed on native Wayland: wid embedding is "
                 "unavailable, refusing to pass a Wayland surface id to Xlib"
             )
+            self._emit_attach_complete(False)
             return
         fallback = getattr(self._engine, "attach_widget", None)
         if not callable(fallback):
             log.warning("render attach refused and no wid fallback exists")
+            self._emit_attach_complete(False)
             return
         try:
             fallback(int(self.winId()))
         except Exception as exc:  # noqa: BLE001 - wid fallback is best effort
             log.warning("wid fallback after render failure failed: %s", exc)
+            self._emit_attach_complete(False)
         else:
             log.info("render attach refused; using the wid video path")
+            self._emit_attach_complete(True)
+
+    def _try_attach_render(self) -> bool:
+        """Attempt the render handshake once, swallowing any backend fault."""
+        attach = getattr(self._engine, "attach_render", None)
+        if not callable(attach):
+            return False
+        context = self.context()
+        loader = getattr(context, "getProcAddress", None)
+        get_proc = loader if callable(loader) else None
+        fbo = self._fbo_source()
+        try:
+            return bool(attach(get_proc, fbo=fbo))
+        except TypeError:
+            # Engines that still expose attach_render(proc) only: keep the
+            # wid path reachable rather than failing the handshake outright.
+            try:
+                return bool(attach(get_proc))
+            except Exception as exc:  # noqa: BLE001 - renderer must never kill
+                log.warning("render attach failed: %s", exc)
+                return False
+        except Exception as exc:  # noqa: BLE001 - renderer must never kill the GUI
+            log.warning("render attach failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _platform_name() -> str:
+        """Return the active Qt platform name (empty when no app exists)."""
+        app: QApplication | None = QApplication.instance()
+        return app.platformName() if app is not None else ""
+
+    def _software_retry_feasible(self) -> bool:
+        """Software GL is worth one retry only on native Wayland, once."""
+        return (
+            self._platform_name() == "wayland"
+            and os.environ.get("LIBGL_ALWAYS_SOFTWARE") != "1"
+        )
+
+    def _emit_attach_complete(self, attached: bool) -> None:
+        """Record and broadcast the settled attach result."""
+        log.debug(
+            "attach chain done: attached=%s render=%s",
+            attached,
+            self._render_attached,
+        )
+        self.attach_complete.emit(attached)
 
     def _fbo_source(self) -> Callable[[], int]:
         """Return a callable that re-reads this widget's FBO every frame.
@@ -1438,9 +1491,15 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     returns True only when libmpv paints into the widget's own FBO: the
 #     widget passes ``lambda: int(defaultFramebufferObject())`` so the live
 #     framebuffer is re-read on every frame. Returning False (or raising)
-#     leaves the surface unattached, so initializeGL then
-#     calls engine.attach_widget(int(winId())) — the wid path is the ordered
-#     fallback, and a failed fallback is logged (never a silent black frame).
+#     triggers one software-GL retry on native Wayland (LIBGL_ALWAYS_SOFTWARE
+#     set before the re-init, only when the flag was absent); if that also
+#     fails the widget calls engine.attach_widget(int(winId())) once — the
+#     wid path is the ordered fallback. initializeGL then ALWAYS emits
+#     attach_complete(attached); failures are logged, never a silent black
+#     frame. MainWindow holds one pending-load slot until that signal: no
+#     preview/user load reaches engine.load before it fires. A False result
+#     (or an attach-related PlaybackError) clears the queue and shows
+#     'renderer unavailable — falling back…', never the raw PlaybackError.
 #     paintGL runs exactly one engine.update() followed by one
 #     engine.render_frame(width*dpr, height*dpr) per paint, swallowing
 #     exceptions so a render fault cannot abort or corrupt the paint loop.
@@ -1500,7 +1559,8 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     _on_engine_error (QMessageBox.critical).
 #   * After window.show(): QTimer.singleShot(0, self._attach_engine) ->
 #     engine.attach_widget(int(self.video.winId())) inside try/except
-#     PlaybackError (QMessageBox.critical + status 'ERROR'); then when
+#     PlaybackError: log + graceful status 'renderer unavailable — falling
+#     back…' (no modal); then when
 #     __init__ received a non-empty source: set self.source text and
 #     _load_source(source, quiet=False); otherwise _auto_detect_disc().
 #     _attach_engine() is also called at the start of _load_source so a
@@ -1690,6 +1750,12 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     source …'; not quiet -> QMessageBox.critical with the same text;
 #     return. The GUI NEVER computes a disc hash here: it then calls
 #     _play_source(source) directly so playback starts immediately.
+#     _play_source/_start_preview gate on the attach state: while the GL
+#     chain is pending they store the newest load in _pending_load (nothing
+#     calls engine.load); once attach_complete(True) arrives the window
+#     flushes it. After attach_complete(False) loads are refused with the
+#     graceful renderer status, so the raw 'engine not attached' error can
+#     never reach the user.
 #   * _on_disc_hash(disc_hash): connected to engine.disc_hash_ready (the
 #     backend emits it from a worker thread once the hash is known).
 #     saved = ResumeStore().get(disc_hash); no entry -> nothing. Show the
@@ -1780,6 +1846,14 @@ class MainWindow(QMainWindow):
         self.video.setPalette(video_palette)
         self.video.installEventFilter(self)
         layout.addWidget(self.video, 1)
+        # Load gate: a GL surface is attached only after initializeGL has
+        # settled; until then loads wait in one window-level slot. The wid
+        # path attaches synchronously in _attach_engine, so it starts ready.
+        self._engine_attached = not isinstance(self.video, VideoGLWidget)
+        self._attach_failed = False
+        self._pending_load: tuple[str, bool, bool] | None = None
+        if isinstance(self.video, VideoGLWidget):
+            self.video.attach_complete.connect(self._on_video_attach_complete)
 
         bottom = QWidget(central)
         bar = QHBoxLayout(bottom)
@@ -2305,12 +2379,10 @@ class MainWindow(QMainWindow):
         self._pending_source = source
         self._load_started_at = time.monotonic()
         self.home.set_preview_live(True)
-        try:
-            self.engine.load(source)
-        except PlaybackError as exc:
-            self._preview_running = False
-            self.home.set_preview_live(False)
-            self._set_status(str(exc))
+        if not self._engine_attached:
+            self._queue_load(source, quiet=True, preview=True)
+            return
+        self._perform_load(source, preview=True)
 
     def _reveal_preview(self) -> None:
         """ENTER: show the already-running menu, focus it, defer no longer."""
@@ -2563,13 +2635,72 @@ class MainWindow(QMainWindow):
         self._pending_source = source
         self._play_source(source)
 
+    def _on_video_attach_complete(self, attached: bool) -> None:
+        """Release the queued load, or degrade gracefully when unattached."""
+        log.debug("video attach complete signal: attached=%s", attached)
+        if not attached:
+            self._engine_attached = False
+            self._attach_failed = True
+            pending = self._pending_load
+            self._pending_load = None
+            if pending is not None and pending[2]:
+                self._preview_running = False
+                self.home.set_preview_live(False)
+            self._renderer_unavailable()
+            return
+        self._engine_attached = True
+        self._attach_failed = False
+        pending = self._pending_load
+        self._pending_load = None
+        if pending is None:
+            return
+        source, _quiet, preview = pending
+        log.debug("releasing queued load after attach: %r preview=%s", source, preview)
+        self._perform_load(source, preview=preview)
+
+    def _queue_load(self, source: str, quiet: bool, preview: bool) -> None:
+        """Keep only the newest load until the attach chain settles."""
+        log.debug("load queued until attach: %r preview=%s", source, preview)
+        self._pending_load = (source, quiet, preview)
+
+    def _renderer_unavailable(self) -> None:
+        """Show the graceful renderer fallback status, never a raw error."""
+        log.warning("renderer unavailable; suppressing load and showing status")
+        self._set_status("renderer unavailable — falling back…")
+
+    def _status_for_load_error(self, exc: PlaybackError) -> None:
+        """Map an attach-related PlaybackError to the graceful status."""
+        if self._attach_failed or "not attached" in str(exc):
+            self._renderer_unavailable()
+        else:
+            self._set_status(str(exc))
+
+    def _perform_load(self, source: str, preview: bool) -> None:
+        """Run one already-authorized load for either the menu or the user."""
+        if preview:
+            try:
+                self.engine.load(source)
+            except PlaybackError as exc:
+                self._preview_running = False
+                self.home.set_preview_live(False)
+                log.debug("preview load failed: %s", exc)
+                self._status_for_load_error(exc)
+            return
+        self._play_source(source)
+
     def _play_source(self, source: str) -> None:
         """Load ``source``; an illegal-state PlaybackError -> status only."""
+        if not self._engine_attached:
+            if self._attach_failed:
+                self._renderer_unavailable()
+            else:
+                self._queue_load(source, quiet=False, preview=False)
+            return
         self._loaded_source = source
         try:
             self.engine.load(source)
         except PlaybackError as exc:
-            self._set_status(str(exc))
+            self._status_for_load_error(exc)
 
     def _browse_for_source(self) -> str | None:
         """Pick an ISO image (or VIDEO_TS folder); return None on cancel."""
@@ -2888,15 +3019,20 @@ class MainWindow(QMainWindow):
                     if QApplication.instance() is not None
                     else "?",
                 )
-                self._set_status("video surface unavailable on this platform")
+                self._attach_failed = True
+                self._engine_attached = False
+                self._renderer_unavailable()
                 return
             try:
                 self.engine.attach_widget(int(self.video.winId()))
             except PlaybackError as exc:
-                log.exception("could not attach the video widget")
-                self._set_status("ERROR")
-                QMessageBox.critical(self, "Playback error", str(exc))
+                log.exception("could not attach the video widget: %s", exc)
+                self._attach_failed = True
+                self._engine_attached = False
+                self._renderer_unavailable()
                 return
+            self._engine_attached = True
+            self._attach_failed = False
             log.debug("mpv attached to video window %#x", int(self.video.winId()))
         initial = self._initial_source
         self._initial_source = None
