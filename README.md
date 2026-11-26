@@ -59,13 +59,16 @@ imports and native libraries, then runs a per-OS setup branch. Pick the
 launcher for your OS — it refuses to run on the wrong system:
 
 ```sh
-git clone git@github.com:giancarlo-borreo-ln/CD_Player.git
+git clone https://github.com/giancarlo-borreo-ln/CD_Player.git
 cd CD_Player
 ./install-linux.sh      # Linux
 ./install-mac.sh        # macOS
 install-windows.cmd     # Windows (known-good wrapper)
 install-windows.ps1     # Windows (PowerShell-native, statically validated only)
 ```
+
+SSH clone is also supported if you have a key set up:
+`git clone git@github.com:giancarlo-borreo-ln/CD_Player.git`.
 
 On Windows, `install-windows.cmd` is the known-good, self-contained launcher
 and needs **no system Python**. It finds `uv` (`where uv`, then the winget,
@@ -116,6 +119,27 @@ works without answers. Pass `--ask` to be prompted before each install; `--yes`
 is kept as a no-op alias. Uninstall and `--purge` never install anything.
 
 Wrong-OS launchers exit `2` with a message naming the right one.
+
+### Find the app
+
+- **Windows** — the installer adds a Start Menu entry named **DVD Player**;
+  open the Start Menu and search for it.
+- **macOS** — the app bundle is `~/Applications/DVD Player.app`; find it with
+  Spotlight (search for "DVD Player").
+- **Linux** — the installer writes a desktop entry
+  (`~/.local/share/applications/dvd-player.desktop`), so the player appears in
+  your app launcher as **dvd-player**.
+
+### Uninstall
+
+Each launcher has a matching uninstall mode. Config and state are kept unless
+you pass `--purge`:
+
+```sh
+install-windows.cmd --uninstall [--purge]   # Windows
+./install-mac.sh --uninstall [--purge]      # macOS
+./install-linux.sh --uninstall [--purge]    # Linux
+```
 
 ### Where the player looks for a disc
 
