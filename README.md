@@ -63,21 +63,29 @@ git clone git@github.com:giancarlo-borreo-ln/CD_Player.git
 cd CD_Player
 ./install-linux.sh      # Linux
 ./install-mac.sh        # macOS
-install-windows.ps1     # Windows (PowerShell)
+install-windows.cmd     # Windows (known-good wrapper)
+install-windows.ps1     # Windows (PowerShell-native, statically validated only)
 ```
 
-`install-windows.cmd` is a thin wrapper around the native
-`install-windows.ps1`, and a compiled `install-windows.exe` is preferred when
-present. From a PowerShell prompt the one-liner is:
+On Windows, `install-windows.cmd` is the known-good, self-contained launcher:
+it bootstraps Python via `scripts/install-windows-bootstrap.ps1`, runs
+`scripts/install.py --platform windows` and launches the player; a compiled
+`install-windows.exe` is preferred when present. `install-windows.ps1` is an
+independent, PowerShell-native entry point for users who prefer it. It finds
+Python, calls the same `scripts/install.py --platform windows`, and launches
+the player. The `.ps1` is statically validated only (it cannot be executed on
+the Linux CI host); the `.cmd` remains the Loki-tested path.
+
+From a PowerShell prompt the one-liner is:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1
 ```
 
 `-ExecutionPolicy Bypass` applies only to that PowerShell process, so no
-machine-wide policy or administrator rights are needed. Pass `-Ask`, `-Yes`,
-`-Check`, `-Uninstall` or `-Purge`; cmd-style `--uninstall` flags forwarded by
-the `.cmd` are accepted too.
+machine-wide policy or administrator rights are needed. The `.ps1` accepts
+`-Ask`, `-Yes`, `-Check`, `-Uninstall` or `-Purge` (cmd-style flags also pass
+through to `install.py`).
 
 Each launcher delegates to `scripts/install.py --platform <os> "$@"`, so extra
 flags pass through, for example `./install-linux.sh --no-sync`. You can also
@@ -145,12 +153,13 @@ py -3 scripts\build_windows_exe.py
 ```
 
 The result lands in `dist\install-windows.exe`; copy it beside
-`install-windows.cmd`, which prefers the exe and otherwise delegates to
-`install-windows.ps1`. The PowerShell installer locates a repo-relative Python
-3.12+ (`py -3`, `python` or `%LOCALAPPDATA%\Programs\Python\Python31{2,3}`) and
-installs a missing one with winget unattended; add `-Ask` to be prompted
-first. The exe bakes in `--platform windows --pause`, so a double-clicked
-window stays open.
+`install-windows.cmd`, which prefers the exe and otherwise runs its own
+bootstrap (`scripts/install-windows-bootstrap.ps1`) before calling
+`scripts/install.py`. The separate `install-windows.ps1` locates a
+repo-relative Python 3.12+ (`py -3`, `python` or
+`%LOCALAPPDATA%\Programs\Python\Python31{2,3}`) and installs a missing one with
+winget unattended; add `-Ask` to be prompted first. The exe bakes in
+`--platform windows --pause`, so a double-clicked window stays open.
 
 | Platform | Branch behavior | Status |
 |---|---|---|

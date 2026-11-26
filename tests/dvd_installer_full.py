@@ -154,8 +154,9 @@ def test_manifest_hash_well_formed() -> None:
     )
 
 
-def test_windows_ps1_is_native_and_maps_flags() -> None:
+def test_windows_installers_are_independent_and_map_flags() -> None:
     text = (REPO / "install-windows.ps1").read_text(encoding="utf-8")
+    cmd = (REPO / "install-windows.cmd").read_text(encoding="utf-8")
     lowered = text.lower()
     check("setlocal" not in lowered)
     check("@echo" not in lowered)
@@ -168,9 +169,15 @@ def test_windows_ps1_is_native_and_maps_flags() -> None:
     check(param_block.count("(") == param_block.count(")"))
     for name in ("$Ask", "$Yes", "$Check", "$Uninstall", "$Purge"):
         check(name in param_block)
-    for flag in ("--install", "--ask", "--check", "--uninstall", "--purge"):
+    check("install-windows.ps1" not in cmd)
+    check("scripts\\install-windows-bootstrap.ps1" in cmd)
+    check("scripts\\install.py" in cmd)
+    flags = ("--install", "--ask", "--check", "--uninstall", "--purge")
+    for flag in flags:
         check(flag in text)
+        check(flag in cmd)
     check("--platform" in text and "'windows'" in text)
+    check("--platform windows" in cmd)
 
 
 def _fake_winget_libmpv(payload: bytes) -> tuple[bool, install.Report, list[list[str]], str]:
@@ -468,7 +475,7 @@ for test in (
     test_required_native_failure_is_hard,
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
-    test_windows_ps1_is_native_and_maps_flags,
+    test_windows_installers_are_independent_and_map_flags,
     test_bundled_libdvdcss_reports_ok,
     test_missing_dvdcss_marker_warns_once_without_fetch,
 ):
