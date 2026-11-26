@@ -3,9 +3,20 @@
 Attacks are inert data only.  A marker file proves no shell ever ran.
 Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 """
+# ── STATIC AUDIT CHARTER ──────────────────────────────────────────────
+# This is a REGRESSION TRIPWIRE, not a sandbox.  It guarantees, for ordinary
+# (non-obfuscated) code committed to src/dvd_player: recursive scope over
+# **/*.py, exactly one process call site, list-form argv, no shell=, no
+# os.system/eval/exec/__import__, and no known dynamic-escape idioms in
+# modules that touch subprocess/os/shutil.  It does NOT stop a contributor
+# with commit rights (who can edit this file), deliberate obfuscation, or
+# runtime behaviour outside the sentinel's executed paths.  Those limits are
+# exactly why section 0b watches actual process/builtin access at runtime.
+# ──────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
 import ast
+import builtins
 import io
 import json
 import locale
@@ -18,6 +29,8 @@ import tempfile
 import time
 import tokenize
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -296,6 +309,169 @@ for label, pattern in FORBIDDEN_TEXT:
 check(len(re.findall(r"\bsubprocess\.run\s*\(", code_only)) == 1)
 check("import pickle" not in code_only)
 check("import yaml" not in code_only and "from yaml" not in code_only)
+# ── Taint-scoped static rules ─────────────────────────────────────────
+# Modules that import subprocess/os/shutil get extra dynamic-escape bans;
+# modules that do not (the __init__ re-export/lazy-loader facade) are left
+# alone.  sys.modules is legitimate in that facade, so it is banned only here.
+PROCESS_MODULES = {"subprocess", "os", "shutil"}
+FORBIDDEN_TAINT_NAMES = {
+    "__builtins__", "__getattribute__", "__subclasses__", "__globals__",
+    "vars", "globals", "locals",
+}
+FORBIDDEN_TAINT_ATTRS = {
+    "__dict__", "__builtins__", "__getattribute__", "__subclasses__",
+    "__globals__", "__call__", "__get__",
+}
+for module_path in SOURCE_PATHS:
+    module_text = module_path.read_text(encoding="utf-8")
+    module_tree = ast.parse(module_text)
+    module_aliases: set[str] = set()
+    sys_aliases: set[str] = {"sys"}
+    tainted = False
+    for node in ast.walk(module_tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in PROCESS_MODULES:
+                    tainted = True
+                    module_aliases.add(alias.asname or top)
+                if top == "sys":
+                    sys_aliases.add(alias.asname or "sys")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in PROCESS_MODULES:
+                tainted = True
+    # The package facade only re-exports these modules and owns the lazy
+    # loader; its sys.modules/globals use is exactly what the sentinel covers.
+    if module_path.name == "__init__.py":
+        tainted = False
+    if not tainted:
+        continue
+    for node in ast.walk(module_tree):
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_TAINT_NAMES:
+            raise AssertionError(
+                f"{module_path.name}: forbidden {node.id} in process-touching module"
+            )
+        if isinstance(node, ast.Attribute):
+            if node.attr in FORBIDDEN_TAINT_ATTRS:
+                raise AssertionError(
+                    f"{module_path.name}: forbidden .{node.attr} in process-touching module"
+                )
+            if (
+                node.attr == "modules"
+                and isinstance(node.value, ast.Name)
+                and node.value.id in sys_aliases
+            ):
+                raise AssertionError(
+                    f"{module_path.name}: forbidden sys.modules in process-touching module"
+                )
+        if isinstance(node, ast.Subscript):
+            base = node.value
+            if isinstance(base, ast.Name) and base.id in module_aliases:
+                raise AssertionError(
+                    f"{module_path.name}: dynamic subscript on module alias {base.id}"
+                )
+        for field in ("id", "attr", "arg", "name", "asname"):
+            value = getattr(node, field, None)
+            if isinstance(value, str) and not value.isascii():
+                raise AssertionError(
+                    f"{module_path.name}: non-ASCII identifier {value!r} (homoglyph?)"
+                )
+
+# ════════════════════════════════════════════════════════════════════
+# 0b. Runtime sentinel: catches dynamic routes static AST cannot see
+# ════════════════════════════════════════════════════════════════════
+import dvd_player.hardware as hardware  # noqa: E402
+
+SENTINEL_ALLOWED_ATTRS = {
+    "run", "SubprocessError", "TimeoutExpired", "CalledProcessError",
+    "CompletedProcess",
+}
+
+
+class _RecordingModule:
+    """Proxy that records every attribute read on the subprocess module."""
+
+    def __init__(self, real: object, result: object) -> None:
+        self._real = real
+        self._result = result
+        self.accessed: list[str] = []
+
+    def __getattr__(self, name: str) -> object:
+        self.accessed.append(name)
+        return getattr(self._real, name)
+
+    def run(self, *args: object, **kwargs: object) -> object:
+        self.accessed.append("run")
+        return self._result
+
+
+def _sentinel(action) -> tuple[list[str], list[str]]:
+    proxy = _RecordingModule(
+        hardware.subprocess,
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    forbidden: list[str] = []
+    real_import, real_eval = builtins.__import__, builtins.eval
+    real_exec, real_compile = builtins.exec, builtins.compile
+
+    def _record_import(name, *args, **kwargs):
+        forbidden.append("__import__")
+        return real_import(name, *args, **kwargs)
+
+    def _record_eval(*args, **kwargs):
+        forbidden.append("eval")
+        return real_eval(*args, **kwargs)
+
+    def _record_exec(*args, **kwargs):
+        forbidden.append("exec")
+        return real_exec(*args, **kwargs)
+
+    def _record_compile(*args, **kwargs):
+        forbidden.append("compile")
+        return real_compile(*args, **kwargs)
+
+    with (
+        mock.patch.object(hardware, "subprocess", proxy),
+        mock.patch.object(hardware, "_subprocess_run", proxy.run),
+        mock.patch.object(builtins, "__import__", _record_import),
+        mock.patch.object(builtins, "eval", _record_eval),
+        mock.patch.object(builtins, "exec", _record_exec),
+        mock.patch.object(builtins, "compile", _record_compile),
+    ):
+        action()
+    return proxy.accessed, forbidden
+
+
+def _exercise_hardware() -> int:
+    with (
+        mock.patch.object(hardware.os, "open", side_effect=OSError),
+        mock.patch.object(hardware.shutil, "which", return_value="/bin/eject"),
+        mock.patch.object(hardware.os, "listdir", return_value=["sr0"]),
+        mock.patch.object(hardware.os.path, "realpath", side_effect=lambda p: p),
+        mock.patch.object(hardware.os.path, "exists", return_value=True),
+    ):
+        hardware._run_command(["/bin/true"])       # sanctioned alias route
+        hardware._linux_eject("/dev/sr0")          # eject fallback
+        devices = hardware._linux_list_dvd_devices()  # discovery
+        hardware.disc_present("/dev/sr0")          # presence probe
+    return len(devices)
+
+
+_sentinel_accessed, _sentinel_forbidden = _sentinel(_exercise_hardware)
+check("run" in _sentinel_accessed)
+check(set(_sentinel_accessed) <= SENTINEL_ALLOWED_ATTRS)
+check(_sentinel_forbidden == [])
+
+
+def _dynamic_import_route() -> None:
+    table = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
+    table["__import__"]("os").system("true")  # system is faked by the test
+
+
+with mock.patch.object(os, "system", return_value=0):
+    _, _dynamic_forbidden = _sentinel(_dynamic_import_route)
+check("__import__" in _dynamic_forbidden)
+
 # ════════════════════════════════════════════════════════════════════
 # 1. Qt app + marker file
 # ════════════════════════════════════════════════════════════════════
