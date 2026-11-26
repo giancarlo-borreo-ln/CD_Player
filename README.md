@@ -55,18 +55,46 @@ sudo pacman -S --needed mpv libdvdnav libdvdread libdvdcss python-pyqt6 uv
 ## Install (cross-platform)
 
 One standard-library script checks Python, `uv`, the project environment,
-imports and native libraries, then runs a per-OS setup branch:
+imports and native libraries, then runs a per-OS setup branch. Pick the
+launcher for your OS — it refuses to run on the wrong system:
 
 ```sh
 git clone git@github.com:giancarlo-borreo-ln/CD_Player.git
 cd CD_Player
-python3 scripts/install.py          # check everything + `uv sync`
+./install-linux.sh      # Linux
+./install-mac.sh        # macOS
+install-windows.cmd     # Windows (or install-windows.exe, see below)
+```
+
+Each launcher delegates to `scripts/install.py --platform <os> "$@"`, so extra
+flags pass through, for example `./install-linux.sh --no-sync`. You can also
+call the script directly:
+
+```sh
+python3 scripts/install.py            # detect the OS + `uv sync`
 python3 scripts/install.py --no-sync  # verify an existing environment
-uv run dvd-player                   # auto-boots any disc in the drive
+uv run dvd-player                     # auto-boots any disc in the drive
 uv run dvd-player /path/to/movie.iso
 uv run dvd-player /path/to/VIDEO_TS
-uv run python -m dvd_player         # equivalent module entry point
+uv run python -m dvd_player           # equivalent module entry point
 ```
+
+Wrong-OS launchers exit `2` with a message naming the right one.
+
+### Windows: building `install-windows.exe`
+
+`install-windows.exe` is a release artifact and is not committed. It must be
+built **on Windows** — PyInstaller cannot cross-compile from Linux or macOS:
+
+```bat
+py -3 -m pip install pyinstaller
+py -3 scripts\build_windows_exe.py
+```
+
+The result lands in `dist\install-windows.exe`; copy it beside
+`install-windows.cmd`, which prefers the exe and otherwise falls back to
+`py -3`/`python`. The exe bakes in `--platform windows --pause`, so a
+double-clicked window stays open.
 
 | Platform | Branch behavior | Status |
 |---|---|---|

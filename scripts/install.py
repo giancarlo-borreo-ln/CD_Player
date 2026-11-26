@@ -25,9 +25,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 12)
 
+# Set from --platform so the launchers and the Windows .exe can force a branch
+# even when the interpreter reports a different sys.platform (e.g. MSYS).
+_OS_OVERRIDE: str | None = None
+
 
 def current_os() -> str:
     """Map sys.platform to a branch key: linux, macos, windows or other."""
+    if _OS_OVERRIDE:
+        return _OS_OVERRIDE
     if sys.platform.startswith("linux"):
         return "linux"
     if sys.platform == "darwin":
@@ -437,8 +443,24 @@ PLATFORMS = {
     "other": platform_other,
 }
 
+# Accepted --platform values (aliases map to a branch key).
+PLATFORM_ALIASES = {
+    "auto": None,
+    "linux": "linux",
+    "macos": "macos",
+    "darwin": "macos",
+    "windows": "windows",
+    "win32": "windows",
+}
+
+
+def normalize_platform(value: str) -> str | None:
+    """Translate a --platform value to a branch key, or None for auto-detect."""
+    return PLATFORM_ALIASES[value]
+
 
 def main(argv: list[str] | None = None) -> int:
+    global _OS_OVERRIDE
     parser = argparse.ArgumentParser(
         prog="install.py",
         description=(
@@ -453,13 +475,44 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="skip `uv sync` and only verify the existing environment",
     )
+    parser.add_argument(
+        "--platform",
+        choices=sorted(PLATFORM_ALIASES),
+        default="auto",
+        help=(
+            "force an OS branch instead of detecting sys.platform "
+            "(default: auto; darwin/win32 are accepted aliases)"
+        ),
+    )
+    parser.add_argument(
+        "--pause",
+        action="store_true",
+        help=(
+            "wait for Enter before exiting; meant for the double-clicked "
+            "Windows install-windows.exe so the window stays open"
+        ),
+    )
     args = parser.parse_args(argv)
+    _OS_OVERRIDE = normalize_platform(args.platform)
 
+    code = run(args)
+
+    if args.pause:
+        try:
+            input("\nPress Enter to close...")
+        except EOFError:
+            pass
+    return code
+
+
+def run(args: argparse.Namespace) -> int:
     key = current_os()
     distro = distro_family()
     print("DVD Player installer — cross-platform dependency check")
     print(f"Repo: {REPO_ROOT}")
     print(f"Platform: {sys.platform}" + (f" ({distro})" if distro else ""))
+    if _OS_OVERRIDE:
+        print(f"Forced branch: {_OS_OVERRIDE} (--platform)")
 
     report = Report()
     if not check_python(report):
