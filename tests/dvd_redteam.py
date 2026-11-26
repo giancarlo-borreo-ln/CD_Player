@@ -124,7 +124,7 @@ for _root, _dirs, _files in os.walk(PKG, followlinks=False):
     _real_root = Path(os.path.realpath(_root_path)).resolve()
     if _real_root != PACKAGE_ROOT and PACKAGE_ROOT not in _real_root.parents:
         raise AssertionError(f"walk escaped package root: {_root_path} -> {_real_root}")
-    ACTUAL_DIRECTORIES.append(str(_root_path.relative_to(PKG)))
+    ACTUAL_DIRECTORIES.append(_root_path.relative_to(PKG).as_posix())
     for _name in _dirs:
         _entry = _root_path / _name
         if _entry.is_symlink():
@@ -141,7 +141,7 @@ for _root, _dirs, _files in os.walk(PKG, followlinks=False):
 assert SOURCE_PATHS, "static audit scope is empty"
 SOURCE_PATHS.sort()
 ACTUAL_SOURCE_FILES = sorted(
-    str(Path(os.path.realpath(path)).relative_to(PACKAGE_ROOT))
+    Path(os.path.realpath(path)).relative_to(PACKAGE_ROOT).as_posix()
     for path in SOURCE_PATHS
 )
 check(ACTUAL_DIRECTORIES == sorted(EXPECTED_DIRECTORIES))
