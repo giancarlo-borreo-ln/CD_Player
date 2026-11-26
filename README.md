@@ -81,6 +81,39 @@ uv run python -m dvd_player           # equivalent module entry point
 
 Wrong-OS launchers exit `2` with a message naming the right one.
 
+### Where the player looks for a disc
+
+After the dependency checks, `scripts/install.py` prints a **Disc locations**
+section: the optical candidates for your OS (with `disc ready` / `empty` /
+`unknown`), and any playable `VIDEO_TS` folders or `.iso` files found
+non-recursively in the current folder, `~/Videos`, `~/Downloads` and
+`~/Desktop` (the listing is capped, with a count of hidden entries).
+
+| OS | Optical candidates (default lookups) | Disc state probe | Other playable sources |
+|---|---|---|---|
+| Linux | existing `/dev/sr*`, `/dev/cdrom`, `/dev/dvd` nodes (deduplicated; block devices preferred) | `CDROM_DRIVE_STATUS` ioctl → ready / empty / unknown | `VIDEO_TS` folder (or its parent) and `*.iso` |
+| macOS | `/dev/disk*` whole disks corroborated by `drutil status`; missing/failing `drutil` reports **unknown** (never a failure) | mount table | `VIDEO_TS` folder (or its parent) and `*.iso` |
+| Windows | drive letters from `GetLogicalDrives` where `GetDriveTypeW == DRIVE_CDROM` (5) | `VIDEO_TS` folder on the drive root | `VIDEO_TS` folder (or its parent) and `*.iso` |
+
+Probing is best-effort with a strict per-tool timeout (3 s for `drutil`,
+5 s for other helpers; a hung tool reports `unknown` rather than blocking):
+when no drive or probe tool exists the script says `unknown`/`none found`
+with the remedy and keeps its exit code — it never crashes. Optical and
+playable-source listings are each capped at 10 entries with a hidden count.
+`--disc` resolves symlinks first, so a symlinked `VIDEO_TS` folder or `.iso`
+is classified by its target (the printed line shows both paths). Use `--disc PATH` to check one source before launching:
+
+```sh
+python3 scripts/install.py --disc /dev/sr0             # optical device
+python3 scripts/install.py --disc "~/Movies/My DVD"   # folder containing VIDEO_TS
+python3 scripts/install.py --disc "~/Movies/My DVD/VIDEO_TS"
+python3 scripts/install.py --disc ./movie.iso         # ISO image
+```
+
+`PATH` accepts `~`, quoted spaces and relative paths (the same forms the app
+accepts). Success prints `will play: <kind> <path>` where kind is `device`,
+`dvd-folder` or `iso`; an invalid path prints the reason and exits `1`.
+
 ### Windows: building `install-windows.exe`
 
 `install-windows.exe` is a release artifact and is not committed. It must be
@@ -108,7 +141,8 @@ double-clicked window stays open.
 > are reported as warnings because mpv often bundles them.
 
 Exit code is `0` when the player is ready and `1` when a hard dependency is
-missing; every failure includes the exact command or directory to fix it.
+missing or `--disc` is invalid; `2` is reserved for wrong-platform launchers
+and usage errors.
 
 ## Development
 

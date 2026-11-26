@@ -7,17 +7,21 @@ OS-specific setup: Linux, macOS or Windows.
 
     python3 scripts/install.py          # check + `uv sync`
     python3 scripts/install.py --no-sync
+    python3 scripts/install.py --disc /dev/sr0   # validate one disc source
 
-Exit codes: 0 = ready to run, 1 = a hard dependency is missing.
+Exit codes: 0 = ready to run, 1 = a hard dependency is missing or --disc is
+invalid, 2 = usage/wrong-platform error.
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import ctypes.util
 import os
 import platform
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -459,6 +463,340 @@ def normalize_platform(value: str) -> str | None:
     return PLATFORM_ALIASES[value]
 
 
+# ── Disc locations ──────────────────────────────────────────────────────────
+# Mirrors the app's hardware layer without importing it (this script runs
+# before the venv exists). Every probe degrades to "unknown" instead of raising.
+
+CDS_NO_DISC = 1
+CDS_DISC_OK = 4
+CDROM_DRIVE_STATUS = 0x5326
+DRIVE_CDROM = 5
+MAX_SOURCES = 10
+MAX_DEVICES = 10
+PROBE_TIMEOUT = 5
+DRUTIL_TIMEOUT = 3
+SOURCE_DIRS = ("", "Videos", "Downloads", "Desktop")
+SOURCE_MARKERS = ("VIDEO_TS.IFO", "VIDEO_TS.BUP")
+
+
+def _run_tool(
+    argv: list[str], timeout: float = PROBE_TIMEOUT
+) -> subprocess.CompletedProcess[str] | None:
+    """Run a helper with a hard timeout; None (unknown) on any failure."""
+    try:
+        return subprocess.run(argv, check=False, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _linux_optical_devices() -> list[str] | None:
+    candidates = ["/dev/cdrom", "/dev/dvd"]
+    try:
+        candidates.extend(
+            os.path.join("/dev", name) for name in os.listdir("/dev") if name.startswith("sr")
+        )
+    except OSError:
+        pass
+    devices: list[str] = []
+    seen: set[str] = set()
+    for candidate in sorted(candidates):
+        try:
+            real = os.path.realpath(candidate)
+            present = os.path.exists(candidate)
+        except OSError:
+            continue
+        if present and real not in seen:
+            seen.add(real)
+            devices.append(candidate)
+    return devices
+
+
+def _darwin_optical_devices() -> list[str] | None:
+    """Optical whole disks per drutil; None when drutil cannot tell."""
+    drutil = shutil.which("drutil")
+    if drutil is None:
+        return None
+    completed = _run_tool([drutil, "status"], timeout=DRUTIL_TIMEOUT)
+    if completed is None or completed.returncode != 0:
+        return None
+    optical: set[str] = set()
+    for token in completed.stdout.split():
+        token = token.rstrip(":,")
+        if token.startswith("/dev/disk") and token[9:].isdigit():
+            optical.add(token)
+    try:
+        names = os.listdir("/dev")
+    except OSError:
+        return None
+    devices: list[str] = []
+    seen: set[str] = set()
+    for name in sorted(names):
+        if not (name.startswith("disk") and name[4:].isdigit()):
+            continue
+        candidate = os.path.join("/dev", name)
+        try:
+            real = os.path.realpath(candidate)
+        except OSError:
+            continue
+        if (candidate in optical or real in optical) and real not in seen:
+            seen.add(real)
+            devices.append(candidate)
+    return devices
+
+
+def _windows_optical_devices() -> list[str] | None:
+    """CD-ROM letters from GetLogicalDrives + GetDriveTypeW; None on error."""
+    try:
+        kernel32 = ctypes.CDLL("kernel32", use_last_error=True)
+        get_drives = kernel32.GetLogicalDrives
+        get_drives.restype = ctypes.c_uint32
+        get_type = kernel32.GetDriveTypeW
+        get_type.argtypes = [ctypes.c_wchar_p]
+        get_type.restype = ctypes.c_uint32
+        mask = int(get_drives())
+    except (OSError, AttributeError, TypeError, ValueError):
+        return None
+    if mask == 0:
+        return []
+    devices: list[str] = []
+    for index in range(26):
+        if not mask & (1 << index):
+            continue
+        root = f"{chr(ord('A') + index)}:\\"
+        try:
+            if int(get_type(root)) == DRIVE_CDROM:
+                devices.append(root)
+        except (OSError, TypeError, ValueError):
+            continue
+    return devices
+
+
+def optical_devices() -> list[str] | None:
+    """Optical candidates for the branch; None means the probe is unavailable."""
+    key = current_os()
+    if key == "macos":
+        return _darwin_optical_devices()
+    if key == "windows":
+        return _windows_optical_devices()
+    if key == "linux":
+        return _linux_optical_devices()
+    return None
+
+
+def _linux_state(device: str) -> bool | None:
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    try:
+        fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        try:
+            status = int(fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0))
+        except OSError:
+            return None
+        if status == CDS_DISC_OK:
+            return True
+        if status == CDS_NO_DISC:
+            return False
+        return None
+    finally:
+        os.close(fd)
+
+
+def _darwin_state(device: str) -> bool | None:
+    completed = _run_tool(["/sbin/mount"])
+    if completed is None or completed.returncode != 0:
+        return None
+    try:
+        real = os.path.realpath(device)
+    except OSError:
+        return None
+    for line in completed.stdout.splitlines():
+        source = line.split(" on ", 1)[0].strip()
+        if source in {device, real}:
+            return True
+    return False
+
+
+def _windows_state(device: str) -> bool | None:
+    root = device.rstrip("\\/") + "\\"
+    try:
+        if not os.path.exists(root):
+            return None
+        return os.path.isdir(root + "VIDEO_TS")
+    except OSError:
+        return None
+
+
+def disc_state(device: str) -> bool | None:
+    """True = disc ready, False = empty, None = unknown (never raises)."""
+    key = current_os()
+    if key == "macos":
+        return _darwin_state(device)
+    if key == "windows":
+        return _windows_state(device)
+    if key == "linux":
+        return _linux_state(device)
+    return None
+
+
+def _has_ifo(video_ts: Path) -> bool:
+    for marker in SOURCE_MARKERS:
+        try:
+            if (video_ts / marker).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def classify_source(raw: str) -> tuple[str, str]:
+    """Return (kind, reason): kind is device | dvd-folder | iso, or '' + why.
+
+    Symlinks are resolved first so a neutral link name pointing at a VIDEO_TS
+    folder or an .iso is classified by its target, not by the link.
+    """
+    if not raw.strip():
+        return "", "empty path"
+    text = raw.strip()
+    stripped = text.rstrip("/\\")
+    if stripped and not (len(stripped) == 2 and stripped[1] == ":"):
+        text = stripped
+    try:
+        expanded = os.path.expanduser(text)
+        path = Path(expanded)
+        if not path.exists():
+            if os.path.lexists(expanded):
+                try:
+                    os.path.realpath(expanded, strict=True)
+                except OSError as error:
+                    return "", f"cannot resolve symlink ({error.strerror or error})"
+            return "", f"path does not exist: {path}"
+        resolved = Path(os.path.realpath(expanded, strict=True))
+    except (OSError, ValueError, RuntimeError) as error:
+        return "", f"cannot resolve path ({error})"
+    try:
+        if resolved.is_dir():
+            if resolved.name.lower() == "video_ts":
+                if _has_ifo(resolved):
+                    return "dvd-folder", ""
+                return "", "VIDEO_TS folder has no VIDEO_TS.IFO or VIDEO_TS.BUP"
+            if (resolved / "VIDEO_TS").is_dir():
+                if _has_ifo(resolved / "VIDEO_TS"):
+                    return "dvd-folder", ""
+                return "", "folder has no VIDEO_TS/VIDEO_TS.IFO (not a DVD layout)"
+            return "", "directory has no VIDEO_TS folder and is not one itself"
+        if resolved.is_file():
+            if resolved.suffix.lower() == ".iso":
+                return "iso", ""
+            return "", "unsupported file type (expected an .iso image)"
+        try:
+            mode = resolved.stat().st_mode
+        except OSError as error:
+            return "", f"cannot stat path ({error})"
+        if stat.S_ISBLK(mode):
+            return "device", ""
+        return "", "not a block device, .iso image or VIDEO_TS folder"
+    except OSError as error:
+        return "", f"cannot inspect path ({error})"
+
+
+def _scan_base(base: Path) -> list[tuple[str, Path]]:
+    found: list[tuple[str, Path]] = []
+    try:
+        entries = sorted(base.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        try:
+            target = Path(os.path.realpath(entry, strict=True))
+        except OSError:
+            continue
+        try:
+            if target.is_dir():
+                if _has_ifo(target / "VIDEO_TS") or (
+                    target.name.lower() == "video_ts" and _has_ifo(target)
+                ):
+                    found.append(("dvd-folder", entry))
+            elif target.is_file() and target.suffix.lower() == ".iso":
+                found.append(("iso", entry))
+        except OSError:
+            continue
+    return found
+
+
+def scan_sources() -> tuple[list[tuple[str, Path]], int]:
+    """Non-recursive scan of cwd and the usual media folders; cap the list."""
+    bases: list[Path] = []
+    try:
+        bases.append(Path.cwd())
+    except OSError:
+        pass
+    try:
+        home = Path.home()
+    except (OSError, RuntimeError):
+        home = None
+    if home is not None:
+        for name in SOURCE_DIRS[1:]:
+            bases.append(home / name)
+    seen: set[str] = set()
+    found: list[tuple[str, Path]] = []
+    for base in bases:
+        for kind, path in _scan_base(base):
+            try:
+                key = os.path.realpath(path)
+            except OSError:
+                key = str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((kind, path))
+    return found[:MAX_SOURCES], max(0, len(found) - MAX_SOURCES)
+
+
+def _state_label(device: str) -> str:
+    state = disc_state(device)
+    if state is True:
+        return "disc ready"
+    if state is False:
+        return "empty (no disc)"
+    return "unknown (cannot probe)"
+
+
+def check_disc(report: Report) -> None:
+    report.section("Disc locations")
+    try:
+        devices = optical_devices()
+        print("  Optical drives (the app looks here by default):")
+        if devices is None:
+            print(
+                "    unknown — no probe available on this system "
+                "(install the OS optical tools, or pass --disc PATH)"
+            )
+        elif not devices:
+            print("    none found — no optical drive was detected; pass --disc PATH")
+        else:
+            for device in devices[:MAX_DEVICES]:
+                print(f"    {device} — {_state_label(device)}")
+            hidden_devices = max(0, len(devices) - MAX_DEVICES)
+            if hidden_devices:
+                print(f"    ... and {hidden_devices} more not shown")
+        sources, hidden = scan_sources()
+        print("  Playable sources (cwd, ~/Videos, ~/Downloads, ~/Desktop):")
+        if not sources:
+            print("    none found — put a VIDEO_TS folder or .iso there, or pass --disc PATH")
+        else:
+            for kind, path in sources:
+                print(f"    {kind} {path}")
+        if hidden:
+            print(f"    ... and {hidden} more not shown")
+    except Exception:  # noqa: BLE001 - probing must never raise at install time
+        print("    unknown — disc probing failed; pass --disc PATH to check a source")
+
+
 def main(argv: list[str] | None = None) -> int:
     global _OS_OVERRIDE
     parser = argparse.ArgumentParser(
@@ -482,6 +820,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "force an OS branch instead of detecting sys.platform "
             "(default: auto; darwin/win32 are accepted aliases)"
+        ),
+    )
+    parser.add_argument(
+        "--disc",
+        metavar="PATH",
+        default=None,
+        help=(
+            "validate and print where PATH will be played from: an optical "
+            "device, a VIDEO_TS folder (or its parent) or an .iso file"
         ),
     )
     parser.add_argument(
@@ -515,6 +862,25 @@ def run(args: argparse.Namespace) -> int:
     if _OS_OVERRIDE:
         print(f"Forced branch: {_OS_OVERRIDE} (--platform)")
 
+    requested = getattr(args, "disc", None)
+    if requested is not None:
+        try:
+            kind, reason = classify_source(requested)
+        except Exception:  # noqa: BLE001 - validation must never traceback
+            kind, reason = "", "cannot validate this path"
+        if not kind:
+            print(f"invalid --disc: {reason}", file=sys.stderr)
+            return 1
+        try:
+            shown = Path(os.path.expanduser(requested.strip()))
+            resolved = Path(os.path.realpath(shown))
+        except (OSError, ValueError, RuntimeError):
+            shown, resolved = Path(requested), None
+        if resolved is not None and str(resolved) != str(shown):
+            print(f"will play: {kind} {shown} -> {resolved}")
+        else:
+            print(f"will play: {kind} {shown}")
+
     report = Report()
     if not check_python(report):
         print("\nResult: FAIL — install Python 3.12+ first.")
@@ -536,6 +902,8 @@ def run(args: argparse.Namespace) -> int:
     check_native(report, dvdnav_names, "libdvdnav", hint_libdvdnav(), hard=False)
 
     PLATFORMS.get(key, platform_other)(report)
+
+    check_disc(report)
 
     if report.failures:
         print(f"\nResult: FAIL — {report.failures} hard dependency problem(s) above.")
