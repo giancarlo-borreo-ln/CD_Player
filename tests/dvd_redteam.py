@@ -22,10 +22,12 @@ Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 #     chains are followed transitively (cycles rejected).  Adding, removing,
 #     renaming or moving a spawn path fails the audit, which names the diff.
 #   * the SAME rules apply to every module (no taint gating): subprocess may
-#     be imported only by hardware.py; any multiprocessing import is rejected;
-#     os.system/popen/exec*/spawn*/posix_spawn*/fork/forkpty and asyncio
-#     create_subprocess_exec/_shell (module or from-import form) are rejected
-#     everywhere.  No family is silently excluded.
+#     be imported only by hardware.py; any multiprocessing/posix import is
+#     rejected; os.system/popen/exec*/spawn*/posix_spawn*/fork/forkpty,
+#     posix.system/popen/exec*/fork*/spawn* and asyncio create_subprocess_exec/
+#     _shell (module or from-import form) plus event-loop subprocess_exec/
+#     subprocess_shell are rejected everywhere.  No family is silently
+#     excluded.
 #   * each call site takes exactly one argv list, never shell=True and never a
 #     captured command string; the eject argv is [eject_bin, device].  The
 #     alias definition resolves to subprocess.run only through the literal
@@ -181,6 +183,7 @@ for _parent in ast.walk(tree):
 SPAWN_ATTRS = {"run", "call", "Popen", "check_call", "check_output",
                "getoutput", "getstatusoutput"}
 ASYNCIO_SPAWN = {"create_subprocess_exec", "create_subprocess_shell"}
+LOOP_SPAWN = {"subprocess_exec", "subprocess_shell"}
 SUBPROCESS_ATTRS = {"run", "SubprocessError", "TimeoutExpired",
                     "CalledProcessError", "CompletedProcess"}
 ALLOWED_SUBPROCESS_IMPORTS = SUBPROCESS_ATTRS | {"CompletedProcess"}
@@ -198,6 +201,11 @@ for node in ast.walk(tree):
         for alias in node.names:
             top = alias.name.split(".")[0]
             imported.add(top)
+            if top == "posix":
+                raise AssertionError(
+                    f"forbidden import {alias.name!r} - posix re-exposes the "
+                    "os spawn surface"
+                )
             if top == "subprocess":
                 subprocess_modules.add(alias.asname or "subprocess")
             elif top == "os":
@@ -205,6 +213,11 @@ for node in ast.walk(tree):
     elif isinstance(node, ast.ImportFrom) and node.module:
         top = node.module.split(".")[0]
         imported.add(top)
+        if top == "posix":
+            raise AssertionError(
+                "forbidden 'from posix import' - posix re-exposes the os "
+                "spawn surface"
+            )
         for alias in node.names:
             bound = alias.asname or alias.name
             if top == "subprocess":
@@ -492,6 +505,11 @@ def _resolve_callee(
             return "os." + expr.attr
         if base in asyncio_mods and expr.attr in ASYNCIO_SPAWN:
             return "asyncio." + expr.attr
+        if expr.attr in LOOP_SPAWN:
+            # Event-loop method: any base object may expose it (``loop``,
+            # ``self._loop``, a variable copy), so the method name alone is
+            # enough to resolve the asyncio spawn family.
+            return "asyncio." + expr.attr
         return None
     if isinstance(expr, ast.Subscript):
         container = expr.value
@@ -776,6 +794,10 @@ FORBIDDEN_TEXT = (
     ("os.spawn*", r"\bos\.spawn\w*"),
     ("os.posix_spawn*", r"\bos\.posix_spawn\w*"),
     ("os.fork*", r"\bos\.fork\w*"),
+    ("posix spawn surface", r"\bposix\.(?:system|popen|exec\w*|fork\w*|spawn\w*|posix_spawn\w*)"),
+    ("posix import", r"(?m)^\s*(?:import\s+posix\b|from\s+posix\s+import\b)"),
+    ("loop.subprocess_exec", r"\bsubprocess_exec\b"),
+    ("loop.subprocess_shell", r"\bsubprocess_shell\b"),
     ("__import__", r"\b__import__\b"),
     ("importlib", r"\bimportlib\b"),
     ("builtin eval()", r"(?<![\w.])eval\s*\("),
@@ -873,6 +895,10 @@ for module_path in SOURCE_PATHS:
             for _target in _targets:
                 ctypes_handles.add(_target.id)
     for node in ast.walk(module_tree):
+        if isinstance(node, ast.Attribute) and node.attr in LOOP_SPAWN:
+            raise AssertionError(
+                f"{module_path.name}: forbidden event-loop {node.attr}"
+            )
         if isinstance(node, ast.Call):
             func = node.func
             if (
@@ -1013,6 +1039,7 @@ def _sentinel_guards() -> list[tuple[object, str]]:
     import asyncio
     import ctypes
     import multiprocessing
+    import posix
     import pty
 
     targets: list[tuple[object, str]] = [
@@ -1022,7 +1049,18 @@ def _sentinel_guards() -> list[tuple[object, str]]:
             "execve", "execvp", "execvpe", "spawnl", "spawnv",
         ) if hasattr(os, name)
     ]
+    targets += [
+        (posix, name) for name in (
+            "system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp",
+            "execl", "execle", "execlp", "execlpe", "execv",
+            "execve", "execvp", "execvpe", "spawnl", "spawnv",
+        ) if hasattr(posix, name)
+    ]
     targets += [(asyncio, name) for name in ASYNCIO_SPAWN if hasattr(asyncio, name)]
+    targets += [
+        (asyncio.BaseEventLoop, name) for name in LOOP_SPAWN
+        if hasattr(asyncio.BaseEventLoop, name)
+    ]
     targets += [
         (multiprocessing, name) for name in MULTIPROCESSING_SPAWN
         if hasattr(multiprocessing, name)
