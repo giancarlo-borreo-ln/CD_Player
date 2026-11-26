@@ -24,10 +24,12 @@ Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 #   * the SAME rules apply to every module (no taint gating): subprocess may
 #     be imported only by hardware.py; any multiprocessing/posix import is
 #     rejected; os.system/popen/exec*/spawn*/posix_spawn*/fork/forkpty,
-#     posix.system/popen/exec*/fork*/spawn* and asyncio create_subprocess_exec/
-#     _shell (module or from-import form) plus event-loop subprocess_exec/
-#     subprocess_shell are rejected everywhere.  No family is silently
-#     excluded.
+#     posix.system/popen/exec*/fork*/spawn*, asyncio create_subprocess_exec/
+#     _shell (module or from-import form), event-loop subprocess_exec/
+#     subprocess_shell, and Qt QProcess.start/startDetached are rejected
+#     everywhere; os/asyncio star imports and subscript-yielded module bases
+#     (``[os][0].execv``) are rejected/resolved, not skipped.  No family is
+#     silently excluded.
 #   * each call site takes exactly one argv list, never shell=True and never a
 #     captured command string; the eject argv is [eject_bin, device].  The
 #     alias definition resolves to subprocess.run only through the literal
@@ -216,6 +218,15 @@ for node in ast.walk(tree):
         if top == "posix":
             raise AssertionError(
                 "forbidden 'from posix import' - posix re-exposes the os "
+                "spawn surface"
+            )
+        if top in {"os", "asyncio"} and any(
+            alias.name == "*" for alias in node.names
+        ):
+            # Star import binds every spawn name (execv/system/...) without
+            # an explicit alias, so it must fail before any call is analysed.
+            raise AssertionError(
+                f"forbidden 'from {top} import *' - star import binds the "
                 "spawn surface"
             )
         for alias in node.names:
@@ -458,6 +469,26 @@ def _dotted(node: ast.AST) -> str:
     return ""
 
 
+def _module_bases(node: ast.AST) -> set[str]:
+    """Names a base expression can yield, including ``[os][0]`` indexing."""
+    if isinstance(node, ast.Subscript):
+        container = node.value
+        if (
+            isinstance(container, (ast.List, ast.Tuple))
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, int)
+        ):
+            index = node.slice.value
+            if -len(container.elts) <= index < len(container.elts):
+                return _module_bases(container.elts[index])
+        return set()
+    if isinstance(node, ast.Name):
+        return {node.id}
+    if isinstance(node, ast.Attribute):
+        return _module_bases(node.value)
+    return set()
+
+
 # ── A3: every Call whose callee resolves to a banned family is a site ──
 EJECT_SITE = ("hardware.py", "_linux_eject", "subprocess.run")
 SPAWN_FAMILIES = ("subprocess.", "os.", "asyncio.", "multiprocessing.", "pty.")
@@ -470,6 +501,54 @@ def _assignment_parts(node: ast.AST) -> tuple[ast.expr | None, list[ast.Name]]:
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         return node.value, [node.target]
     return None, []
+
+
+QT_SPAWN = {"start", "startDetached"}
+
+
+def _qt_process_bindings(
+    module: ast.Module,
+) -> tuple[set[str], set[str], set[str]]:
+    """Return QProcess class names, dotted names and instance names."""
+    qprocess_names: set[str] = set()
+    qtcore_names: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "PyQt6.QtCore":
+                    qtcore_names.add(alias.asname or "PyQt6")
+                elif alias.name == "PyQt6.QtCore.QtCore":
+                    qtcore_names.add(alias.asname or "QtCore")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module == "PyQt6.QtCore" or node.module.endswith(".QtCore"):
+                for alias in node.names:
+                    if alias.name == "QProcess":
+                        qprocess_names.add(alias.asname or "QProcess")
+            elif node.module == "PyQt6":
+                for alias in node.names:
+                    if alias.name == "QtCore":
+                        qtcore_names.add(alias.asname or "QtCore")
+    dotted_names = {f"{name}.QProcess" for name in qtcore_names}
+    dotted_names.add("PyQt6.QtCore.QProcess")
+    instances: set[str] = set()
+    for node in ast.walk(module):
+        value, targets = _assignment_parts(node)
+        if not isinstance(value, ast.Call):
+            continue
+        func = value.func
+        if (
+            isinstance(func, ast.Name) and func.id in qprocess_names
+        ) or _dotted(func) in dotted_names:
+            instances.update(target.id for target in targets)
+    return qprocess_names, dotted_names, instances
+
+
+def _is_qprocess_base(
+    base: ast.expr, names: set[str], dotted: set[str], instances: set[str],
+) -> bool:
+    if isinstance(base, ast.Name):
+        return base.id in names or base.id in instances
+    return _dotted(base) in dotted
 
 
 def _resolve_callee(
@@ -495,15 +574,15 @@ def _resolve_callee(
             )
         return None
     if isinstance(expr, ast.Attribute):
-        base = _dotted(expr.value)
-        if base in sub_modules and expr.attr in SPAWN_ATTRS:
+        bases = _module_bases(expr.value)
+        if bases & sub_modules and expr.attr in SPAWN_ATTRS:
             return "subprocess." + expr.attr
-        if base in os_mods and (
+        if bases & os_mods and (
             expr.attr in banned_os
             or expr.attr.startswith(("exec", "spawn", "posix_spawn"))
         ):
             return "os." + expr.attr
-        if base in asyncio_mods and expr.attr in ASYNCIO_SPAWN:
+        if bases & asyncio_mods and expr.attr in ASYNCIO_SPAWN:
             return "asyncio." + expr.attr
         if expr.attr in LOOP_SPAWN:
             # Event-loop method: any base object may expose it (``loop``,
@@ -587,6 +666,20 @@ for module_path in SOURCE_PATHS:
                     if len(gen.iter.elts) == 1:
                         aliases[gen.target.id] = gen.iter.elts[0]
     sanctioned_call_ids: set[int] = set()
+    _qprocess_names, _qprocess_dotted, _qprocess_instances = _qt_process_bindings(module)
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr in QT_SPAWN
+            and _is_qprocess_base(
+                node.value, _qprocess_names, _qprocess_dotted,
+                _qprocess_instances,
+            )
+        ):
+            raise AssertionError(
+                f"{module_path.name}:{node.lineno}: forbidden Qt process spawn "
+                f"QProcess.{node.attr}"
+            )
     for node in ast.walk(module):
         if not isinstance(node, ast.Call):
             continue
@@ -796,6 +889,8 @@ FORBIDDEN_TEXT = (
     ("os.fork*", r"\bos\.fork\w*"),
     ("posix spawn surface", r"\bposix\.(?:system|popen|exec\w*|fork\w*|spawn\w*|posix_spawn\w*)"),
     ("posix import", r"(?m)^\s*(?:import\s+posix\b|from\s+posix\s+import\b)"),
+    ("os star import", r"(?m)^\s*from\s+os\s+import\s+\*"),
+    ("QProcess.start", r"\bQProcess\.(?:startDetached|start)\s*\("),
     ("loop.subprocess_exec", r"\bsubprocess_exec\b"),
     ("loop.subprocess_shell", r"\bsubprocess_shell\b"),
     ("__import__", r"\b__import__\b"),

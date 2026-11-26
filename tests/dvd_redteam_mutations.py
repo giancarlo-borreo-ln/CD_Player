@@ -71,6 +71,42 @@ def a2_loop_subprocess_shell(root: Path, audit: str) -> str:
     return audit
 
 
+def a2_os_star_execv(root: Path, audit: str) -> str:
+    _append(
+        root, "hardware.py",
+        '\nfrom os import *\n\n\ndef _evil(argv: list[str]) -> None:\n'
+        "    execv(argv[0], argv)\n",
+    )
+    return audit
+
+
+def a2_subscript_module_execv(root: Path, audit: str) -> str:
+    _append(
+        root, "hardware.py",
+        '\n\ndef _evil(argv: list[str]) -> None:\n'
+        '    [os][0].execv(argv[0], argv)\n',
+    )
+    return audit
+
+
+def a2_qprocess_start_detached(root: Path, audit: str) -> str:
+    _append(
+        root, "hardware.py",
+        '\nfrom PyQt6.QtCore import QProcess\n\n\ndef _evil() -> bool:\n'
+        '    return QProcess.startDetached("/bin/true")\n',
+    )
+    return audit
+
+
+def a2_qprocess_start(root: Path, audit: str) -> str:
+    _append(
+        root, "hardware.py",
+        '\nfrom PyQt6.QtCore import QProcess\n\n\ndef _evil() -> None:\n'
+        '    proc = QProcess()\n    proc.start("/bin/true")\n',
+    )
+    return audit
+
+
 def a3_subscript_alias(root: Path, audit: str) -> str:
     _append(
         root, "hardware.py",
@@ -137,6 +173,10 @@ MUTANTS = [
     ("A2", a2_posix_system),
     ("A2", a2_loop_subprocess_exec),
     ("A2", a2_loop_subprocess_shell),
+    ("A2", a2_os_star_execv),
+    ("A2", a2_subscript_module_execv),
+    ("A2", a2_qprocess_start_detached),
+    ("A2", a2_qprocess_start),
     ("A3", a3_subscript_alias),
     ("A4", a4_shell_false),
     ("A5", a5_extra_sys_modules),
