@@ -272,6 +272,23 @@ with (
     mock.patch.object(hardware.shutil, "which", return_value=None),
 ):
     expect_playback_error(hardware.eject_device, "/dev/sr0")
+# Eject-binary timeout folds into PlaybackError naming the drive (no leak).
+with (
+    mock.patch.object(hardware.sys, "platform", "linux"),
+    mock.patch.object(hardware.os, "open", side_effect=OSError(2, "missing")),
+    mock.patch.object(hardware.shutil, "which", return_value="/usr/bin/eject"),
+    mock.patch.object(
+        hardware.subprocess,
+        "run",
+        side_effect=subprocess.TimeoutExpired(["eject", "/dev/sr0"], 1),
+    ),
+):
+    try:
+        hardware.eject_device("/dev/sr0")
+    except PlaybackError as exc:
+        check("/dev/sr0" in str(exc))
+    else:
+        raise AssertionError("timeout escaped as a non-PlaybackError")
 
 # macOS discovery: only whole disks reported by drutil status.
 with (

@@ -261,7 +261,7 @@ def disc_present(device: str) -> bool | None:
 
 def _linux_eject(device: str) -> None:
     """Open the tray via ioctl, falling back to the ``eject`` binary."""
-    ioctl_error: OSError | None = None
+    ioctl_error: OSError | subprocess.SubprocessError | None = None
     try:
         fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as exc:
@@ -283,7 +283,7 @@ def _linux_eject(device: str) -> None:
                 capture_output=True,
                 text=True,
             )
-        except OSError as exc:
+        except (OSError, subprocess.SubprocessError) as exc:
             ioctl_error = ioctl_error or exc
         else:
             if completed.returncode == 0:
