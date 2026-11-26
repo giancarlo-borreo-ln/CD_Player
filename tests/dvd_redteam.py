@@ -4,14 +4,26 @@ Attacks are inert data only.  A marker file proves no shell ever ran.
 Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 """
 # ── STATIC AUDIT CHARTER ──────────────────────────────────────────────
-# This is a REGRESSION TRIPWIRE, not a sandbox.  It guarantees, for ordinary
-# (non-obfuscated) code committed to src/dvd_player: recursive scope over
-# **/*.py, exactly one process call site, list-form argv, no shell=, no
-# os.system/eval/exec/__import__, and no known dynamic-escape idioms in
-# modules that touch subprocess/os/shutil.  It does NOT stop a contributor
-# with commit rights (who can edit this file), deliberate obfuscation, or
-# runtime behaviour outside the sentinel's executed paths.  Those limits are
-# exactly why section 0b watches actual process/builtin access at runtime.
+# This is a REGRESSION TRIPWIRE, not a sandbox.  For ordinary (non-obfuscated)
+# code committed to src/dvd_player it checks, over EVERY **/*.py recursively:
+#   * the set of process-spawn sites equals EXPECTED_SPAWN_SITES exactly -
+#     three enumerated sites in hardware.py: _linux_eject (literal run),
+#     _subprocess_run (sanctioned alias) and _run_command (wrapper).  Adding,
+#     removing or moving a spawn path fails the audit, which names the diff.
+#   * each call site takes exactly one argv list, never shell=True and never a
+#     captured command string; the eject argv is [eject_bin, device].  The
+#     alias definition resolves to subprocess.run only through the literal
+#     sanctioned getattr; the wrapper takes a list[...] parameter and forwards
+#     it as one positional argument.
+#   * no os.system/popen/exec*/spawn*, eval/exec/compile/__import__, no
+#     dynamic-escape idioms in modules importing subprocess/os/shutil.
+# Deliberate exemptions, stated so the claims stay literal: the package
+# facade __init__.py imports those modules only to re-export them and owns the
+# lazy loader (its sys.modules/globals use is legitimate, so it is untainted);
+# hardware.py's getattr(subprocess, "run") alias is the one sanctioned
+# reflection, pinned to the name _subprocess_run.
+# It does NOT stop deliberate obfuscation, edits to this file, or runtime
+# behaviour outside section 0b's executed paths - hence the runtime sentinel.
 # ──────────────────────────────────────────────────────────────────────
 from __future__ import annotations
 
@@ -148,6 +160,146 @@ for node in ast.walk(tree):
     ):
         continue
     sanctioned_getattr.add(id(value))
+
+# ── Enumerated spawn-site contract ───────────────────────────────────
+# Every sanctioned way to reach a process.  The discovered set must match
+# this list exactly, so a new call, alias or wrapper cannot hide behind the
+# "one literal subprocess.run" count.
+EXPECTED_SPAWN_SITES = [
+    ("hardware.py", "_linux_eject", "literal-run"),
+    ("hardware.py", "_subprocess_run", "alias"),
+    ("hardware.py", "_run_command", "wrapper"),
+]
+MODULE_TREES: dict[str, ast.Module] = {}
+SPAWN_SITE_NODES: list[tuple[str, str, str, ast.AST]] = []
+
+
+def _module_spawn_aliases(module: ast.Module) -> tuple[set[str], dict[str, str]]:
+    modules: set[str] = {"subprocess"}
+    from_names: dict[str, str] = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] == "subprocess":
+                    modules.add(alias.asname or "subprocess")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] == "subprocess":
+                for alias in node.names:
+                    from_names[alias.asname or alias.name] = alias.name
+    return modules, from_names
+
+
+def _enclosing_symbol(node: ast.AST, parents: dict[int, ast.AST]) -> str:
+    current = parents.get(id(node))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current.name
+        current = parents.get(id(current))
+    return "<module>"
+
+
+def _is_subprocess_attr_alias(value: ast.expr | None, modules: set[str]) -> bool:
+    return (
+        isinstance(value, ast.Attribute)
+        and isinstance(value.value, ast.Name)
+        and value.value.id in modules
+        and value.attr in SPAWN_ATTRS
+    )
+
+
+def _is_sanctioned_run_getattr(value: ast.expr | None, modules: set[str]) -> bool:
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id == "getattr"
+        and len(value.args) >= 2
+        and isinstance(value.args[0], ast.Name)
+        and value.args[0].id in modules
+        and isinstance(value.args[1], ast.Constant)
+        and value.args[1].value == "run"
+    )
+
+
+for module_path in SOURCE_PATHS:
+    module = ast.parse(module_path.read_text(encoding="utf-8"))
+    MODULE_TREES[module_path.name] = module
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(module):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    modules, from_names = _module_spawn_aliases(module)
+    alias_names: set[str] = set()
+    for node in ast.walk(module):
+        target = value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            if isinstance(node.targets[0], ast.Name):
+                target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, value = node.target, node.value
+        if target is None:
+            continue
+        if _is_subprocess_attr_alias(value, modules) or _is_sanctioned_run_getattr(value, modules):
+            alias_names.add(target.id)
+            SPAWN_SITE_NODES.append((module_path.name, target.id, "alias", node))
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        symbol = _enclosing_symbol(node, parents)
+        if _is_subprocess_attr_alias(func, modules):
+            SPAWN_SITE_NODES.append((module_path.name, symbol, "literal-run", node))
+        elif isinstance(func, ast.Name) and from_names.get(func.id) in SPAWN_ATTRS:
+            SPAWN_SITE_NODES.append((module_path.name, symbol, "literal-run", node))
+        elif isinstance(func, ast.Name) and func.id in alias_names:
+            SPAWN_SITE_NODES.append((module_path.name, symbol, "wrapper", node))
+
+_discovered_sites = [(file, symbol, kind) for file, symbol, kind, _ in SPAWN_SITE_NODES]
+if len(_discovered_sites) != len(EXPECTED_SPAWN_SITES) or set(_discovered_sites) != set(EXPECTED_SPAWN_SITES):
+    _expected = set(EXPECTED_SPAWN_SITES)
+    _actual = set(_discovered_sites)
+    raise AssertionError(
+        "spawn-site contract changed: "
+        f"unexpected={sorted(_actual - _expected)} missing={sorted(_expected - _actual)} "
+        f"(count {len(_discovered_sites)} vs {len(EXPECTED_SPAWN_SITES)})"
+    )
+
+for _file, _symbol, _kind, _node in SPAWN_SITE_NODES:
+    if _kind == "literal-run":
+        assert isinstance(_node, ast.Call)
+        check(len(_node.args) == 1)
+        check(isinstance(_node.args[0], ast.List))
+        check(all(kw.arg != "shell" for kw in _node.keywords))
+        check(not any(isinstance(arg, ast.Constant) and isinstance(arg.value, str) for arg in _node.args))
+        if _symbol == "_linux_eject":
+            _argv = _node.args[0]
+            assert isinstance(_argv, ast.List)
+            check(len(_argv.elts) == 2)
+            check(isinstance(_argv.elts[0], ast.Name) and _argv.elts[0].id == "eject_bin")
+            check(isinstance(_argv.elts[1], ast.Name) and _argv.elts[1].id == "device")
+    elif _kind == "alias":
+        _value = getattr(_node, "value", None)
+        check(_is_subprocess_attr_alias(_value, {"subprocess"}) or _is_sanctioned_run_getattr(_value, {"subprocess"}))
+    elif _kind == "wrapper":
+        assert isinstance(_node, ast.Call)
+        _functions = [
+            item for item in ast.walk(MODULE_TREES[_file])
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == _symbol
+        ]
+        check(len(_functions) == 1)
+        _function = _functions[0]
+        _params = _function.args.posonlyargs + _function.args.args
+        check(len(_params) == 1)
+        check(_function.args.vararg is None and _function.args.kwarg is None)
+        check(_params[0].arg not in {"shell", "cmd", "command"})
+        _annotation = _params[0].annotation
+        check(
+            isinstance(_annotation, ast.Subscript)
+            and isinstance(_annotation.value, ast.Name)
+            and _annotation.value.id in {"list", "List"}
+        )
+        check(len(_node.args) == 1)
+        check(isinstance(_node.args[0], ast.Name) and _node.args[0].id == _params[0].arg)
+        check(all(kw.arg != "shell" for kw in _node.keywords))
 
 subprocess_calls: list[ast.Call] = []
 shell_true: list[ast.Call] = []
