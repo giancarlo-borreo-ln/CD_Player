@@ -24,14 +24,26 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 12)
+FETCH_DEPS = Path(__file__).resolve().parent / "fetch_deps.py"
+TOOL_NAME = "dvd-player"
 
 # Set from --platform so the launchers and the Windows .exe can force a branch
 # even when the interpreter reports a different sys.platform (e.g. MSYS).
 _OS_OVERRIDE: str | None = None
+_RAW_ARGV: list[str] = []
+_BOOTSTRAPPED = False
+
+SMOKE_CODE = (
+    "import mpv\n"
+    "player = mpv.MPV(vo='null', ao='null')\n"
+    "player.terminate()\n"
+    "print('libmpv opened')\n"
+)
 
 
 def current_os() -> str:
@@ -144,7 +156,7 @@ def native_names() -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
     key = current_os()
     if key == "windows":
         return (
-            ("mpv-2.dll", "mpv-1.dll"),
+            ("libmpv-2.dll", "mpv-2.dll", "mpv-1.dll"),
             ("dvdcss.dll", "libdvdcss-2.dll"),
             ("dvdnav.dll", "libdvdnav-4.dll", "libdvdnav.dll"),
         )
@@ -797,6 +809,577 @@ def check_disc(report: Report) -> None:
         print("    unknown — disc probing failed; pass --disc PATH to check a source")
 
 
+# ── Install / bootstrap / entry points ──────────────────────────────────────
+
+
+def is_tty() -> bool:
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def consent(assume_yes: bool, message: str) -> bool:
+    """Ask before any system change; --yes is explicit unattended consent."""
+    if assume_yes:
+        print(f"[consent] --yes: {message}")
+        return True
+    if not is_tty():
+        print(
+            "[refuse] no terminal to ask for consent; re-run with --yes "
+            "for unattended installs",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        answer = input(f"{message} [y/N] ").strip().lower()
+    except EOFError:
+        answer = ""
+    if answer not in ("y", "yes"):
+        print("[refuse] declined; no system change was made", file=sys.stderr)
+        return False
+    return True
+
+
+def run_argv(
+    argv: list[str], cwd: Path | None = None, capture: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Run an argv array (never a shell string)."""
+    print(f"  $ {' '.join(argv)}")
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            check=False,
+            capture_output=capture,
+            text=True,
+        )
+    except OSError as error:
+        return subprocess.CompletedProcess(argv, 127, "", str(error))
+
+
+def atomic_write_text(path: Path, text: str, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    finally:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            pass
+
+
+def python_version(binary: str) -> tuple[int, int] | None:
+    try:
+        result = subprocess.run(
+            [binary, "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        parts = result.stdout.strip().split(".")[:2]
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return None
+
+
+def find_new_python() -> str | None:
+    for name in ("python3.13", "python3.12", "python3"):
+        candidate = shutil.which(name)
+        if not candidate:
+            continue
+        version = python_version(candidate)
+        if version is not None and version >= MIN_PYTHON:
+            return candidate
+    return None
+
+
+def python_install_argv() -> list[str] | None:
+    key = current_os()
+    if key == "windows":
+        return [
+            "winget", "install", "--id", "Python.Python.3.12", "--silent",
+            "--accept-package-agreements", "--accept-source-agreements",
+        ]
+    if key == "macos":
+        return ["brew", "install", "python@3.12"]
+    if key == "linux":
+        if distro_family() == "arch":
+            return ["pacman", "-S", "--needed", "--noconfirm", "python"]
+        if distro_family() == "debian":
+            return ["apt-get", "install", "-y", "python3"]
+    return None
+
+
+def uv_install_argv() -> list[str] | None:
+    key = current_os()
+    if key == "windows":
+        return [
+            "winget", "install", "--id", "astral-sh.uv", "--silent",
+            "--accept-package-agreements", "--accept-source-agreements",
+        ]
+    if key == "macos":
+        return ["brew", "install", "uv"]
+    if key == "linux":
+        if distro_family() == "arch":
+            return ["pacman", "-S", "--needed", "--noconfirm", "uv"]
+        if distro_family() == "debian":
+            return ["apt-get", "install", "-y", "uv"]
+    return None
+
+
+def with_privilege(argv: list[str]) -> list[str]:
+    """Add sudo only when needed; the command is shown before consent."""
+    if (
+        current_os() == "linux"
+        and hasattr(os, "geteuid")
+        and os.geteuid() != 0
+        and shutil.which("sudo")
+    ):
+        return ["sudo", *argv]
+    return argv
+
+
+def ensure_python(report: Report, assume_yes: bool) -> bool:
+    """Find (or bootstrap, with consent) a Python >= 3.12 and re-exec into it."""
+    if sys.version_info >= MIN_PYTHON:
+        return True
+    if _BOOTSTRAPPED:
+        report.fail("Python too old", f"still running {platform.python_version()}")
+        return False
+    candidate = find_new_python()
+    if candidate and Path(candidate).resolve() != Path(sys.executable).resolve():
+        print(f"Re-launching with Python 3.12+: {candidate}")
+        os.environ["DVD_PLAYER_BOOTSTRAPPED"] = "1"
+        try:
+            os.execv(candidate, [candidate, str(Path(__file__).resolve()), *_RAW_ARGV])
+        except OSError as error:
+            report.fail("re-exec failed", f"{candidate}: {error}")
+            return False
+    argv = python_install_argv()
+    if argv is None:
+        report.fail(
+            f"Python {'.'.join(map(str, MIN_PYTHON))}+ required",
+            f"found {platform.python_version()}; {hint_python()}",
+        )
+        return False
+    argv = with_privilege(argv)
+    if not consent(assume_yes, f"install Python 3.12+ with {' '.join(argv)}?"):
+        report.fail("Python bootstrap refused", hint_python())
+        return False
+    result = run_argv(argv)
+    if result.returncode != 0:
+        report.fail("Python install failed", f"{' '.join(argv)} exited {result.returncode}")
+        return False
+    candidate = find_new_python()
+    if candidate is None:
+        report.fail(
+            "Python installed but not found",
+            "open a new terminal so PATH refreshes, then re-run the installer",
+        )
+        return False
+    os.environ["DVD_PLAYER_BOOTSTRAPPED"] = "1"
+    try:
+        os.execv(candidate, [candidate, str(Path(__file__).resolve()), *_RAW_ARGV])
+    except OSError as error:
+        report.fail("re-exec failed", f"{candidate}: {error}")
+    return False
+
+
+def ensure_uv(report: Report, assume_yes: bool) -> bool:
+    uv = shutil.which("uv")
+    if uv:
+        return True
+    argv = uv_install_argv()
+    if argv is None:
+        report.fail("uv not found", hint_uv())
+        return False
+    argv = with_privilege(argv)
+    if not consent(assume_yes, f"install uv with {' '.join(argv)}?"):
+        report.fail("uv bootstrap refused", hint_uv())
+        return False
+    result = run_argv(argv)
+    if result.returncode != 0:
+        report.fail("uv install failed", f"{' '.join(argv)} exited {result.returncode}")
+        return False
+    uv = shutil.which("uv")
+    if not uv:
+        report.fail(
+            "uv installed but not found on PATH",
+            "open a new terminal so PATH refreshes, then re-run the installer",
+        )
+        return False
+    return True
+
+
+def install_native(report: Report, assume_yes: bool, offline: Path | None) -> bool:
+    """Install libmpv/libdvdcss: pinned fetch on Windows, packages elsewhere."""
+    key = current_os()
+    if key == "windows":
+        if not consent(
+            assume_yes, "download and verify pinned libmpv/libdvdcss DLLs?"
+        ):
+            report.fail("Windows native library install declined", hint_libmpv())
+            return False
+        argv = [sys.executable, str(FETCH_DEPS), "--yes"]
+        if offline is not None:
+            argv += ["--offline", str(offline)]
+        result = run_argv(argv)
+        if result.returncode != 0:
+            report.fail(
+                "Windows native libraries not installed",
+                "fetch_deps.py refused or failed (see per-URL errors above); "
+                "nothing unverified was written",
+            )
+            return False
+        return True
+
+    if key == "macos":
+        argv = ["brew", "install", "mpv", "libdvdnav", "libdvdcss"]
+    elif key == "linux":
+        if distro_family() == "arch":
+            argv = [
+                "pacman", "-S", "--needed", "--noconfirm",
+                "mpv", "libdvdnav", "libdvdread", "libdvdcss",
+            ]
+        elif distro_family() == "debian":
+            argv = [
+                "apt-get", "install", "-y",
+                "mpv", "libmpv2", "libdvdnav4", "libdvdread8", "libdvdcss2",
+            ]
+        else:
+            report.warn("native package install skipped", hint_libmpv())
+            return False
+    else:
+        report.warn("native package install skipped", "unsupported platform")
+        return False
+    if offline is not None:
+        print("  offline: skipping package manager; using already-installed libraries")
+        return True
+    if shutil.which(argv[0]) is None:
+        report.fail(f"{argv[0]} not found", f"install the libraries manually: {hint_libmpv()}")
+        return False
+    argv = with_privilege(argv)
+    if not consent(assume_yes, f"install native libraries with {' '.join(argv)}?"):
+        report.fail("native library install declined", hint_libmpv())
+        return False
+    result = run_argv(argv)
+    if result.returncode != 0:
+        report.fail("native library install failed", f"{' '.join(argv)} exited {result.returncode}")
+        return False
+    return True
+
+
+def install_tool(report: Report, offline: Path | None) -> bool:
+    argv = ["uv", "tool", "install", "--force"]
+    if offline is not None:
+        argv.append("--offline")
+    argv.append(str(REPO_ROOT))
+    result = run_argv(argv)
+    if result.returncode != 0:
+        report.fail(
+            "uv tool install failed",
+            "fix the build error above, then re-run: python3 scripts/install.py --install",
+        )
+        return False
+    report.ok("dvd-player tool", "installed/updated with uv tool install --force")
+    return True
+
+
+def tool_binary() -> Path:
+    """The real uv-tool binary, not a shell wrapper."""
+    suffix = ".exe" if current_os() == "windows" else ""
+    candidates: list[Path] = []
+    home = Path.home()
+    candidates.append(home / ".local" / "bin" / f"{TOOL_NAME}{suffix}")
+    found = shutil.which(TOOL_NAME)
+    if found:
+        candidates.append(Path(found))
+    candidates.append(Path(sys.executable).parent / f"{TOOL_NAME}{suffix}")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return candidates[1]
+
+
+def _desktop_quote(value: str) -> str:
+    special = ' \t"\'\\$`'
+    if any(char in value for char in special):
+        escaped = (
+            value.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("`", "\\`")
+            .replace("$", "\\$")
+        )
+        return f'"{escaped}"'
+    return value
+
+
+def create_linux_entry(report: Report, binary: Path) -> bool:
+    base = os.environ.get("XDG_DATA_HOME")
+    root = Path(base) if base else Path.home() / ".local" / "share"
+    target = root / "applications" / "dvd-player.desktop"
+    text = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        "Name=dvd-player\n"
+        "Comment=Xbox 360-style DVD player (libmpv + dvdnav)\n"
+        f"Exec={_desktop_quote(str(binary))}\n"
+        "Icon=dvd-player\n"
+        "Terminal=false\n"
+        "Categories=AudioVideo;Player;\n"
+        "StartupWMClass=dvd_player\n"
+    )
+    try:
+        atomic_write_text(target, text)
+    except OSError as error:
+        report.fail("desktop entry could not be written", f"{target}: {error}")
+        return False
+    report.ok("desktop entry", str(target))
+    return True
+
+
+def create_macos_entry(report: Report, binary: Path) -> bool:
+    app = Path.home() / "Applications" / "DVD Player.app"
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        "  <key>CFBundleName</key><string>DVD Player</string>\n"
+        "  <key>CFBundleIdentifier</key><string>com.example.dvdplayer</string>\n"
+        "  <key>CFBundleVersion</key><string>0.1.0</string>\n"
+        "  <key>CFBundleExecutable</key><string>dvd-player</string>\n"
+        "  <key>CFBundlePackageType</key><string>APPL</string>\n"
+        "</dict></plist>\n"
+    )
+    quoted = "'" + str(binary).replace("'", "'\\''") + "'"
+    launcher = f'#!/bin/sh\nexec {quoted} "$@"\n'
+    try:
+        app.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        report.fail("macOS Applications folder unavailable", f"{app.parent}: {error}")
+        return False
+    staging = Path(tempfile.mkdtemp(prefix=".dvd-player-app-", dir=str(app.parent)))
+    try:
+        (staging / "Contents" / "MacOS").mkdir(parents=True)
+        atomic_write_text(staging / "Contents" / "Info.plist", plist)
+        atomic_write_text(staging / "Contents" / "MacOS" / "dvd-player", launcher, 0o755)
+        if app.exists():
+            shutil.rmtree(app)
+        os.replace(staging, app)
+    except OSError as error:
+        report.fail("macOS app bundle could not be written", f"{app}: {error}")
+        return False
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+    report.ok("macOS app bundle", str(app))
+    return True
+
+
+def create_windows_entry(report: Report, binary: Path) -> bool:
+    appdata = os.environ.get("APPDATA")
+    root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    shortcut = root / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "DVD Player.lnk"
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if powershell is None:
+        report.fail("Start Menu shortcut not created", "PowerShell was not found on PATH")
+        return False
+    try:
+        shortcut.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        report.fail("Start Menu folder unavailable", f"{shortcut.parent}: {error}")
+        return False
+
+    def quote(value: str) -> str:
+        return "'" + value.replace("'", "''") + "'"
+
+    script = (
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut(" + quote(str(shortcut)) + ");"
+        "$s.TargetPath=" + quote(str(binary)) + ";"
+        "$s.WorkingDirectory=" + quote(str(REPO_ROOT)) + ";"
+        "$s.Save()"
+    )
+    result = run_argv(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+        capture=True,
+    )
+    if result.returncode != 0 or not shortcut.exists():
+        detail = (result.stderr or result.stdout).strip() or "shortcut was not created"
+        report.fail("Start Menu shortcut failed", f"{shortcut}: {detail}")
+        return False
+    report.ok("Start Menu shortcut", str(shortcut))
+    return True
+
+
+def create_entry(report: Report, binary: Path) -> bool:
+    key = current_os()
+    if key == "linux":
+        return create_linux_entry(report, binary)
+    if key == "macos":
+        return create_macos_entry(report, binary)
+    if key == "windows":
+        return create_windows_entry(report, binary)
+    report.warn("entry point skipped", "unsupported platform")
+    return False
+
+
+def _uv_tool_python() -> Path | None:
+    uv = shutil.which("uv")
+    if not uv:
+        return None
+    try:
+        result = subprocess.run(
+            [uv, "tool", "dir"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    root = Path(result.stdout.strip().splitlines()[0])
+    for python in (
+        root / TOOL_NAME / "Scripts" / "python.exe",
+        root / TOOL_NAME / "bin" / "python",
+    ):
+        if python.exists():
+            return python
+    return None
+
+
+def smoke_test(report: Report) -> bool:
+    """Prove the installed tool can open libmpv, with an explicit failure."""
+    uv = shutil.which("uv")
+    python = _uv_tool_python() or venv_python()
+    if python is not None:
+        argv = [str(python), "-c", SMOKE_CODE]
+    elif uv is not None:
+        argv = [uv, "run", "python", "-c", SMOKE_CODE]
+    else:
+        report.fail("launch smoke test could not start", "no Python interpreter found")
+        return False
+    env = dict(os.environ)
+    env.setdefault("QT_QPA_PLATFORM", "offscreen")
+    env.setdefault("DVD_PLAYER_SOFTWARE_RENDER", "1")
+    if current_os() == "windows":
+        env["PATH"] = str(fetch_lib_dir()) + os.pathsep + env.get("PATH", "")
+    try:
+        result = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+            cwd=REPO_ROOT,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        report.fail("launch smoke test crashed", f"{' '.join(argv)}: {error}")
+        return False
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        report.fail(
+            "launch smoke test failed: dvd-player could not open libmpv",
+            (detail[-1] if detail else f"exit {result.returncode}"),
+        )
+        return False
+    report.ok("launch smoke test", "dvd-player opened libmpv")
+    return True
+
+
+def fetch_lib_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA")
+    root = Path(base) if base else Path.home() / "AppData" / "Local"
+    return root / "dvd-player" / "lib"
+
+
+def config_dirs() -> list[Path]:
+    key = current_os()
+    if key == "windows":
+        return [fetch_lib_dir().parent]
+    if key == "macos":
+        return [Path.home() / "Library" / "Application Support" / "dvd-player"]
+    config = os.environ.get("XDG_CONFIG_HOME")
+    data = os.environ.get("XDG_DATA_HOME")
+    return [
+        (Path(config) if config else Path.home() / ".config") / "dvd-player",
+        (Path(data) if data else Path.home() / ".local" / "share") / "dvd-player",
+    ]
+
+
+def entry_paths() -> list[Path]:
+    key = current_os()
+    if key == "linux":
+        base = os.environ.get("XDG_DATA_HOME")
+        root = Path(base) if base else Path.home() / ".local" / "share"
+        return [root / "applications" / "dvd-player.desktop"]
+    if key == "macos":
+        return [Path.home() / "Applications" / "DVD Player.app"]
+    if key == "windows":
+        appdata = os.environ.get("APPDATA")
+        root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return [
+            root / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "DVD Player.lnk"
+        ]
+    return []
+
+
+def remove_path(path: Path, report: Report) -> None:
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            report.ok("removed", str(path))
+        elif path.is_dir():
+            shutil.rmtree(path)
+            report.ok("removed", str(path))
+    except OSError as error:
+        report.fail(f"could not remove {path}", str(error))
+
+
+def uninstall(report: Report, purge: bool) -> int:
+    print("\n== Uninstall ==")
+    uv = shutil.which("uv")
+    if uv:
+        result = run_argv([uv, "tool", "uninstall", TOOL_NAME], capture=True)
+        if result.returncode == 0:
+            report.ok("dvd-player tool", "uninstalled")
+        else:
+            report.warn("dvd-player tool was not installed", (result.stderr or "").strip())
+    else:
+        report.warn("uv not found", "skipping uv tool uninstall")
+
+    for path in entry_paths():
+        remove_path(path, report)
+
+    if purge:
+        for path in config_dirs():
+            remove_path(path, report)
+    else:
+        for path in config_dirs():
+            if path.exists():
+                report.ok("kept config/data", str(path))
+    print(f"\nResult: {'FAIL' if report.failures else 'OK'} — uninstall complete")
+    return 1 if report.failures else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     global _OS_OVERRIDE
     parser = argparse.ArgumentParser(
@@ -839,8 +1422,50 @@ def main(argv: list[str] | None = None) -> int:
             "Windows install-windows.exe so the window stays open"
         ),
     )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--install",
+        dest="mode",
+        action="store_const",
+        const="install",
+        help="install/bootstrap everything (default when stdin is a terminal)",
+    )
+    mode.add_argument(
+        "--check",
+        dest="mode",
+        action="store_const",
+        const="check",
+        help="verify only, make no changes (default when stdin is not a terminal)",
+    )
+    mode.add_argument(
+        "--uninstall",
+        dest="mode",
+        action="store_const",
+        const="uninstall",
+        help="remove the dvd-player tool and its OS entry point",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="consent to package installs and downloads without prompting",
+    )
+    parser.add_argument(
+        "--purge",
+        action="store_true",
+        help="with --uninstall, also delete config/state (default: keep it)",
+    )
+    parser.add_argument(
+        "--offline",
+        metavar="DIR",
+        default=None,
+        help="use pre-downloaded dependencies from DIR; no network access",
+    )
     args = parser.parse_args(argv)
+    args.mode = args.mode or ("install" if is_tty() else "check")
     _OS_OVERRIDE = normalize_platform(args.platform)
+    global _RAW_ARGV, _BOOTSTRAPPED
+    _RAW_ARGV = list(sys.argv[1:] if argv is None else argv)
+    _BOOTSTRAPPED = bool(os.environ.get("DVD_PLAYER_BOOTSTRAPPED"))
 
     code = run(args)
 
@@ -881,18 +1506,36 @@ def run(args: argparse.Namespace) -> int:
         else:
             print(f"will play: {kind} {shown}")
 
+    offline = Path(args.offline).expanduser().resolve() if args.offline else None
+    mode = getattr(args, "mode", "check")
     report = Report()
+
+    if mode == "uninstall":
+        return uninstall(report, args.purge)
+
+    if not ensure_python(report, args.yes):
+        print("\nResult: FAIL — install Python 3.12+ first.")
+        return 1
     if not check_python(report):
         print("\nResult: FAIL — install Python 3.12+ first.")
         return 1
 
-    uv_ok = check_uv(report)
-    if uv_ok:
-        check_sync(report, run_sync=not args.no_sync)
+    uv_ok = ensure_uv(report, args.yes)
+    installed_tool = False
+    if mode == "install":
+        if uv_ok:
+            install_native(report, args.yes, offline)
+            installed_tool = install_tool(report, offline)
+        else:
+            report.warn("install skipped", "uv is required to install dvd-player")
     else:
-        report.warn("uv sync skipped", "uv is required to install Python packages")
+        check_uv(report)
+        if uv_ok:
+            check_sync(report, run_sync=not args.no_sync)
+        else:
+            report.warn("uv sync skipped", "uv is required to install Python packages")
 
-    if venv_python() is not None or uv_ok:
+    if mode == "check" and (venv_python() is not None or uv_ok):
         check_imports(report)
 
     report.section("Native libraries")
@@ -903,6 +1546,18 @@ def run(args: argparse.Namespace) -> int:
 
     PLATFORMS.get(key, platform_other)(report)
 
+    if mode == "install" and installed_tool:
+        report.section("Entry point")
+        binary = tool_binary()
+        if not binary.exists():
+            report.fail(
+                "installed dvd-player binary not found",
+                f"expected {binary}; re-run: uv tool install --force .",
+            )
+        else:
+            create_entry(report, binary)
+            smoke_test(report)
+
     check_disc(report)
 
     if report.failures:
@@ -912,7 +1567,7 @@ def run(args: argparse.Namespace) -> int:
         print(f"\nResult: OK with {report.warnings} warning(s) — see hints above.")
     else:
         print("\nResult: OK — every check passed.")
-    print("Run the player with: uv run dvd-player")
+    print("Run the player with: dvd-player   (or: uv run dvd-player)")
     return 0
 
 

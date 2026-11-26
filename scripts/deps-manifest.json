@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "note": "Pinned Windows runtime libraries. An entry is installable only when sha256 is a 64-hex digest. libmpv is pinned to the shinchiro 20261111 mpv-dev-x86_64 archive. libdvdcss is optional and unverified: VideoLAN publishes no Windows DLL with a checksum, so CSS/encrypted discs stay experimental until a locally built DLL is supplied via --offline with a pinned hash.",
+  "deps": {
+    "windows-amd64": [
+      {
+        "name": "libmpv-2.dll",
+        "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z",
+        "sha256": "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452",
+        "status": "pinned",
+        "member": "libmpv-2.dll",
+        "required": true,
+        "project": "shinchiro/mpv-winbuild-cmake"
+      },
+      {
+        "name": "libdvdcss-2.dll",
+        "url": "https://download.videolan.org/pub/videolan/libdvdcss/1.6.0/libdvdcss-1.6.0.tar.xz",
+        "sha256": null,
+        "status": "unverified",
+        "required": false,
+        "project": "VideoLAN libdvdcss",
+        "note": "VideoLAN publishes source only; no official Windows DLL with a published checksum. Build libdvdcss-2.dll locally and pin its SHA-256, or use --offline."
+      }
+    ],
+    "windows-arm64": [
+      {
+        "name": "libmpv-2.dll",
+        "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-aarch64-20261111-git-bcde6b93cc.7z",
+        "sha256": null,
+        "status": "unverified",
+        "member": "libmpv-2.dll",
+        "required": true,
+        "project": "shinchiro/mpv-winbuild-cmake"
+      }
+    ]
+  }
+}
