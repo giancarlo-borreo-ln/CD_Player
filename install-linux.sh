@@ -6,7 +6,15 @@ set -eu
 # Resolve the physical script path through symlinks (POSIX: macOS readlink has
 # no -f). Works from any cwd and with spaces/unicode in the path.
 SCRIPT=$0
+HOPS=0
 while [ -h "$SCRIPT" ]; do
+    HOPS=$((HOPS + 1))
+    if [ "$HOPS" -ge 40 ]; then
+        printf '%s\n' \
+            "install-linux.sh: too many symbolic links resolving $0" \
+            " (stopped after $HOPS hops; the link chain may be cyclic)." >&2
+        exit 2
+    fi
     LINK_DIR=$(CDPATH= cd -P "$(dirname "$SCRIPT")" && pwd)
     if command -v readlink >/dev/null 2>&1; then
         TARGET=$(readlink "$SCRIPT") || break
