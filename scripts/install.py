@@ -1432,10 +1432,45 @@ def create_macos_entry(report: Report, binary: Path) -> bool:
     return True
 
 
+def _normalized_windows_target(value: str) -> str:
+    text = value.strip().strip('"')
+    return os.path.normcase(os.path.normpath(text))
+
+
+def _windows_shortcut_targets(powershell: str, folder: Path) -> list[tuple[Path, str]]:
+    """List (shortcut, TargetPath) pairs; unreadable links are skipped."""
+    def quote(value: str) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    script = (
+        "$shell=New-Object -ComObject WScript.Shell;"
+        "Get-ChildItem -LiteralPath " + quote(str(folder)) + " -Filter *.lnk -File "
+        "-ErrorAction SilentlyContinue | ForEach-Object {"
+        "try{$target=$shell.CreateShortcut($_.FullName).TargetPath;"
+        "if($target){Write-Output ($_.FullName+\"`t\"+$target)}}catch{}}"
+    )
+    try:
+        result = run_argv(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", script],
+            capture=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    found: list[tuple[Path, str]] = []
+    for line in result.stdout.splitlines():
+        path, separator, target = line.strip().partition("\t")
+        if separator and path and target:
+            found.append((Path(path), target.strip()))
+    return found
+
+
 def create_windows_entry(report: Report, binary: Path) -> bool:
     appdata = os.environ.get("APPDATA")
     root = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
-    shortcut = root / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "DVD Player.lnk"
+    programs = root / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    shortcut = programs / "DVD Player.lnk"
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if powershell is None:
         report.fail("Start Menu shortcut not created", "PowerShell was not found on PATH")
@@ -1445,6 +1480,15 @@ def create_windows_entry(report: Report, binary: Path) -> bool:
     except OSError as error:
         report.fail("Start Menu folder unavailable", f"{shortcut.parent}: {error}")
         return False
+
+    wanted = _normalized_windows_target(str(binary))
+    canonical = os.path.normcase(os.path.abspath(str(shortcut)))
+    stale: list[Path] = []
+    for path, target in _windows_shortcut_targets(powershell, programs):
+        if os.path.normcase(os.path.abspath(str(path))) == canonical:
+            continue
+        if _normalized_windows_target(target) == wanted:
+            stale.append(path)
 
     def quote(value: str) -> str:
         return "'" + value.replace("'", "''") + "'"
@@ -1463,6 +1507,19 @@ def create_windows_entry(report: Report, binary: Path) -> bool:
         detail = (result.stderr or result.stdout).strip() or "shortcut was not created"
         report.fail("Start Menu shortcut failed", f"{shortcut}: {detail}")
         return False
+
+    removed: list[str] = []
+    for path in stale:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            report.fail("stale Start Menu shortcut left behind", f"{path}: {error}")
+            return False
+        removed.append(str(path))
+    if removed:
+        report.ok("removed duplicate Start Menu shortcuts", ", ".join(removed))
     report.ok("Start Menu shortcut", str(shortcut))
     return True
 

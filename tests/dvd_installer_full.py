@@ -202,6 +202,50 @@ def test_windows_launch_exit_propagation_and_notice() -> None:
     check("dvd-player\\dvd-player.log" in ps1_lowered)
 
 
+def test_windows_entry_collapses_duplicates_only() -> None:
+    root = Path(tempfile.mkdtemp())
+    appdata = root / "appdata"
+    programs = appdata / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+    programs.mkdir(parents=True)
+    binary = root / "dvd-player.exe"
+    binary.write_bytes(b"exe")
+    canonical = programs / "DVD Player.lnk"
+    duplicates = [programs / f"dvd-player ({n}).lnk" for n in range(1, 4)]
+    foreign = programs / "Other App.lnk"
+    for path in duplicates + [foreign]:
+        path.write_text("lnk", encoding="utf-8")
+
+    old_which, old_run, old_env = install.shutil.which, install.run_argv, os.environ.get("APPDATA")
+
+    def fake_run(argv: list[str], cwd: Path | None = None, capture: bool = False):
+        script = argv[-1]
+        if "Get-ChildItem" in script:
+            lines = [f"{path}\t{binary}" for path in duplicates]
+            lines.append(f"{foreign}\tC:\\Other\\app.exe")
+            lines.append(f"{programs / 'broken.lnk'}\t")  # unreadable/empty target
+            return install.subprocess.CompletedProcess(argv, 0, "\n".join(lines) + "\n", "")
+        canonical.write_text("lnk", encoding="utf-8")
+        return install.subprocess.CompletedProcess(argv, 0, "", "")
+
+    try:
+        install.shutil.which = lambda name: "powershell" if name == "powershell" else None
+        install.run_argv = fake_run
+        os.environ["APPDATA"] = str(appdata)
+        report = install.Report()
+        check(install.create_windows_entry(report, binary) is True)
+        check(report.failures == 0)
+        check(canonical.exists())
+        check(all(not path.exists() for path in duplicates))
+        check(foreign.exists())
+        check(sorted(p.name for p in programs.iterdir()) == ["DVD Player.lnk", "Other App.lnk"])
+    finally:
+        install.shutil.which, install.run_argv = old_which, old_run
+        if old_env is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = old_env
+
+
 def test_failure_after_tool_install_rolls_back_new_tool() -> None:
     root = Path(tempfile.mkdtemp())
     shortcut = root / "DVD Player.lnk"
@@ -633,6 +677,7 @@ for test in (
     test_manifest_hash_well_formed,
     test_windows_installers_are_independent_and_map_flags,
     test_windows_launch_exit_propagation_and_notice,
+    test_windows_entry_collapses_duplicates_only,
     test_failure_after_tool_install_rolls_back_new_tool,
     test_rollback_keeps_preexisting_tool_and_shortcut,
     test_windows_uv_first_flow_without_system_python,
