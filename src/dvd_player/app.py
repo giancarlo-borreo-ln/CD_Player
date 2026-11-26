@@ -1,5 +1,5 @@
 """Xbox 360-style DVD player for Arch Linux."""
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001 - import order below is intentional
 
 import locale
 import logging
@@ -7,6 +7,8 @@ import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+
+from . import _win_dll  # noqa: F401 - registers DLL dirs before mpv loads
 
 from PyQt6.QtWidgets import QApplication
 

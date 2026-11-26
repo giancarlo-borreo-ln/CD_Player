@@ -10,7 +10,9 @@
         "status": "pinned",
         "member": "libmpv-2.dll",
         "required": true,
-        "project": "shinchiro/mpv-winbuild-cmake"
+        "project": "shinchiro/mpv-winbuild-cmake",
+        "verified_at": "2026-11-26",
+        "verified_by": "GET content-length 31776374; sha256 of body matches"
       },
       {
         "name": "libdvdcss-2.dll",

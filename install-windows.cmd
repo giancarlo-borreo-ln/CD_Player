@@ -50,6 +50,7 @@ if errorlevel 1 exit /b %ERRORLEVEL%
 
 if defined LAUNCH (
     if exist "%USERPROFILE%\.local\bin\dvd-player.exe" (
+        set "PATH=%LOCALAPPDATA%\dvd-player\lib;%PATH%"
         start "" "%USERPROFILE%\.local\bin\dvd-player.exe"
     ) else (
         echo install-windows.cmd: dvd-player.exe was not found after install. 1>&2

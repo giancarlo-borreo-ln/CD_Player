@@ -1023,27 +1023,114 @@ def ensure_uv(report: Report, assume_yes: bool) -> bool:
     return True
 
 
-def install_native(report: Report, assume_yes: bool, offline: Path | None) -> bool:
-    """Install libmpv/libdvdcss: pinned fetch on Windows, packages elsewhere."""
-    key = current_os()
-    if key == "windows":
-        if not consent(
-            assume_yes, "download and verify pinned libmpv/libdvdcss DLLs?"
-        ):
-            report.fail("Windows native library install declined", hint_libmpv())
+def winget_mpv_dirs() -> list[Path]:
+    """WinGet package roots, Program Files\\mpv and the local lib folder."""
+    dirs: list[Path] = []
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        packages = Path(local) / "Microsoft" / "WinGet" / "Packages"
+        try:
+            dirs.extend(
+                entry for entry in packages.iterdir()
+                if entry.is_dir() and "mpv" in entry.name.lower()
+            )
+        except OSError:
+            pass
+        dirs.append(Path(local) / "dvd-player" / "lib")
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if base:
+            dirs.append(Path(base) / "mpv")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for directory in dirs:
+        key = str(directory).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(directory)
+    return unique
+
+
+def find_libmpv_dll() -> Path | None:
+    """Locate libmpv-2.dll in WinGet/Program Files dirs, PATH or local lib."""
+    candidates = winget_mpv_dirs()
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry:
+            candidates.append(Path(entry))
+    for directory in candidates:
+        try:
+            direct = directory / "libmpv-2.dll"
+            if direct.is_file():
+                return direct
+            for match in directory.rglob("libmpv-2.dll"):
+                if match.is_file():
+                    return match
+        except OSError:
+            continue
+    return None
+
+
+def install_windows_native(report: Report, assume_yes: bool, offline: Path | None) -> bool:
+    """Prefer winget's verified mpv; pinned archive is the fallback only."""
+    winget = shutil.which("winget")
+    if offline is None and winget is not None:
+        if not consent(assume_yes, "install mpv with winget (it verifies hashes)?"):
+            report.fail("mpv install declined", hint_libmpv())
             return False
-        argv = [sys.executable, str(FETCH_DEPS), "--yes"]
-        if offline is not None:
-            argv += ["--offline", str(offline)]
-        result = run_argv(argv)
-        if result.returncode != 0:
+        packages = ("mpv", "shinchiro.mpv")
+        for package in packages:
+            result = run_argv(
+                [
+                    winget, "install", "--id", package, "--silent", "--exact",
+                    "--accept-package-agreements", "--accept-source-agreements",
+                ]
+            )
+            if result.returncode == 0:
+                found = find_libmpv_dll()
+                if found is not None:
+                    report.ok("libmpv", str(found))
+                    return True
+                report.warn(
+                    f"winget package {package} did not provide libmpv-2.dll",
+                    "trying the next source",
+                )
+        report.warn(
+            "winget mpv has no libmpv-2.dll",
+            "falling back to the pinned archive (tar/bsdtar or 7z required)",
+        )
+
+    if offline is None:
+        extractor = shutil.which("tar") or shutil.which("bsdtar") or shutil.which("7z")
+        if extractor is None:
             report.fail(
-                "Windows native libraries not installed",
-                "fetch_deps.py refused or failed (see per-URL errors above); "
-                "nothing unverified was written",
+                "cannot install libmpv",
+                "winget mpv did not expose libmpv-2.dll and no tar/bsdtar/7z "
+                "extractor is available; install mpv.net/mpv with winget",
             )
             return False
-        return True
+    if not consent(
+        assume_yes, "download and verify the pinned libmpv/libdvdcss archive?"
+    ):
+        report.fail("Windows native library install declined", hint_libmpv())
+        return False
+    argv = [sys.executable, str(FETCH_DEPS), "--yes"]
+    if offline is not None:
+        argv += ["--offline", str(offline)]
+    result = run_argv(argv)
+    if result.returncode != 0 and find_libmpv_dll() is None:
+        report.fail(
+            "Windows native libraries not installed",
+            "fetch_deps.py refused or failed (see per-URL errors above); "
+            "nothing unverified was written",
+        )
+        return False
+    return True
+
+
+def install_native(report: Report, assume_yes: bool, offline: Path | None) -> bool:
+    """Install libmpv/libdvdcss: package managers, or pinned fetch on Windows."""
+    key = current_os()
+    if key == "windows":
+        return install_windows_native(report, assume_yes, offline)
 
     if key == "macos":
         argv = ["brew", "install", "mpv", "libdvdnav", "libdvdcss"]
