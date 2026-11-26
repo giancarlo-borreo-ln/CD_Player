@@ -1968,7 +1968,12 @@ class ScrubPreviewOsd(Xbox360Osd):
 #   * _handle_key mapping (return False when unmapped; a consumed key
 #     reveals the OSD ONLY while engine.menu_active is FALSE; Qt.Key enum
 #     from PyQt6.QtCore):
-#       Key_Up/Down/Left/Right -> engine.menu_nav('up'/'down'/'left'/'right')
+#       Key_Up/Down -> menu active: menu_nav('up'/'down'); otherwise a
+#       consumed no-op (playback never navigates blind).
+#       Key_Left/Right -> menu active: menu_nav('left'/'right') (unchanged);
+#       otherwise during PLAYING/PAUSED: seek_to(time_pos -/+ 10 s),
+#       clamped to >= 0 and <= duration when non-None (engine.seek_to
+#       coalesces the 350 ms settle). Other states: consumed no-op.
 #       Key_Return/Key_Enter -> menu active: menu_select else play_pause
 #       Key_Space -> play_pause
 #       Key_Backspace -> menu_back
@@ -2703,13 +2708,25 @@ class MainWindow(QMainWindow):
         """Dispatch one key; return True when consumed."""
         codes = Qt.Key
         if key == codes.Key_Up.value:
-            self.engine.menu_nav("up")
+            if self.engine.menu_active:
+                self.engine.menu_nav("up")
         elif key == codes.Key_Down.value:
-            self.engine.menu_nav("down")
-        elif key == codes.Key_Left.value:
-            self.engine.menu_nav("left")
-        elif key == codes.Key_Right.value:
-            self.engine.menu_nav("right")
+            if self.engine.menu_active:
+                self.engine.menu_nav("down")
+        elif key in (codes.Key_Left.value, codes.Key_Right.value):
+            if self.engine.menu_active:
+                self.engine.menu_nav(
+                    "left" if key == codes.Key_Left.value else "right"
+                )
+            elif self.engine.state in (PlayerState.PLAYING, PlayerState.PAUSED):
+                step = -10.0 if key == codes.Key_Left.value else 10.0
+                current = self.engine.time_pos
+                base = 0.0 if current is None else float(current)
+                target = max(0.0, base + step)
+                duration = self.engine.duration
+                if duration is not None:
+                    target = min(target, float(duration))
+                self.engine.seek_to(target)
         elif key in (codes.Key_Return.value, codes.Key_Enter.value):
             if self.engine.menu_active:
                 self.engine.menu_select()

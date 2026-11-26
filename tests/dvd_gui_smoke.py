@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import sys
 import time
 
@@ -235,10 +236,6 @@ for method in (
     setattr(engine, method, recorder(method))
 
 key_cases: list[tuple[str, str, tuple[object, ...]]] = [
-    ("Key_Up", "menu_nav", ("up",)),
-    ("Key_Down", "menu_nav", ("down",)),
-    ("Key_Left", "menu_nav", ("left",)),
-    ("Key_Right", "menu_nav", ("right",)),
     ("Key_Space", "play_pause", ()),
     ("Key_Backspace", "menu_back", ()),
     ("Key_X", "show_root_menu", ()),
@@ -264,17 +261,100 @@ for key_name, method, expected_args in key_cases:
         f"{key_name} outside the menu did not reveal the OSD",
     )
 
-# Inside the menu keys dispatch but never reveal the OSD.
+# Inside the menu arrows stay menu_nav (unchanged) and never reveal the OSD.
 engine._menu_active = True
 window.osd.hide()
-calls.clear()
-check(window._handle_key(Qt.Key.Key_Right.value) is True, "Right not consumed")
-check(calls == [("menu_nav", ("right",))], f"Right in menu -> {calls}")
-check(not window.osd.isVisible(), "menu key revealed the OSD")
+for key_name, direction in (
+    ("Key_Up", "up"),
+    ("Key_Down", "down"),
+    ("Key_Left", "left"),
+    ("Key_Right", "right"),
+):
+    calls.clear()
+    check(
+        window._handle_key(getattr(Qt.Key, key_name).value) is True,
+        f"{key_name} in menu not consumed",
+    )
+    check(calls == [("menu_nav", (direction,))], f"{key_name} in menu -> {calls}")
+    check(not window.osd.isVisible(), f"{key_name} in menu revealed the OSD")
 calls.clear()
 check(window._handle_key(Qt.Key.Key_Return.value) is True, "Return not consumed")
 check(calls == [("menu_select", ())], f"Return in menu -> {calls}")
 check(not window.osd.isVisible(), "Return in menu revealed the OSD")
+
+# Outside the menu Left/Right seek by ∓10 s during PLAYING/PAUSED.
+class _SeekSource:
+    time_pos: float | None = 100.0
+    duration: float | None = 250.0
+
+
+engine._menu_active = False
+engine._player = _SeekSource()
+engine._sm._state = dp.PlayerState.PLAYING
+real_seek_to = engine.seek_to
+seeks: list[float] = []
+engine.seek_to = lambda s: seeks.append(float(s))  # type: ignore[method-assign]
+
+window.osd.hide()
+check(window._handle_key(Qt.Key.Key_Left.value) is True, "Left seek not consumed")
+check(seeks == [90.0], f"Left seek -> {seeks}")
+check(window.osd.isVisible(), "Left seek did not reveal the OSD")
+window.osd.hide()
+check(window._handle_key(Qt.Key.Key_Right.value) is True, "Right seek not consumed")
+check(seeks == [90.0, 110.0], f"Right seek -> {seeks}")
+check(window.osd.isVisible(), "Right seek did not reveal the OSD")
+
+engine._player.time_pos = 3.0
+seeks.clear()
+window._handle_key(Qt.Key.Key_Left.value)
+check(seeks == [0.0], f"Left seek was not clamped to 0 -> {seeks}")
+engine._player.time_pos = 245.0
+seeks.clear()
+window._handle_key(Qt.Key.Key_Right.value)
+check(seeks == [250.0], f"Right seek was not clamped to duration -> {seeks}")
+
+engine._player.time_pos = 50.0
+engine._sm._state = dp.PlayerState.PAUSED
+seeks.clear()
+window._handle_key(Qt.Key.Key_Left.value)
+check(seeks == [40.0], f"Paused Left seek -> {seeks}")
+
+# Up/Down in playback are consumed no-ops (no navigation, no seek).
+engine._sm._state = dp.PlayerState.PLAYING
+engine._player.time_pos = 100.0
+seeks.clear()
+calls.clear()
+for key_name in ("Key_Up", "Key_Down"):
+    check(
+        window._handle_key(getattr(Qt.Key, key_name).value) is True,
+        f"{key_name} in playback not consumed",
+    )
+check(calls == [], f"Up/Down in playback dispatched {calls}")
+check(seeks == [], f"Up/Down in playback seeked {seeks}")
+
+# Arrows are consumed no-ops in every non-playing state.
+for state in (
+    dp.PlayerState.IDLE,
+    dp.PlayerState.LOADING,
+    dp.PlayerState.STOPPED,
+    dp.PlayerState.EJECTED,
+    dp.PlayerState.ERROR,
+):
+    engine._sm._state = state
+    seeks.clear()
+    check(
+        window._handle_key(Qt.Key.Key_Left.value) is True,
+        f"Left in {state} not consumed",
+    )
+    check(
+        window._handle_key(Qt.Key.Key_Right.value) is True,
+        f"Right in {state} not consumed",
+    )
+    check(seeks == [], f"arrows seeked in {state}: {seeks}")
+
+engine.seek_to = real_seek_to  # type: ignore[method-assign]
+engine._player = None
+engine._sm._state = dp.PlayerState.IDLE
 
 # Outside the menu keys reveal the OSD again.
 engine._menu_active = False
@@ -2402,7 +2482,21 @@ check(not splash_window.splash.is_animating(),
       "boot splash left its shimmer timer running after hide")
 
 # Disc load: 'Loading disc…' (+ label when known) until playback advances.
-splash_window._show_loading_splash("/dev/sr0")
+# Pick a real block device: CI hosts and dev boxes without an optical drive
+# must still exercise the "never leak a raw device path as a label" rule.
+_block_source = "/dev/sr0"
+if not (
+    os.path.exists(_block_source)
+    and stat.S_ISBLK(os.stat(_block_source).st_mode)
+):
+    for _candidate in ("/dev/zram0", "/dev/loop0", "/dev/nvme0n1"):
+        try:
+            if stat.S_ISBLK(os.stat(_candidate).st_mode):
+                _block_source = _candidate
+                break
+        except OSError:
+            continue
+splash_window._show_loading_splash(_block_source)
 check(splash_window.splash.isVisible(), "loading splash did not appear")
 check(splash_window.splash.status_text() == "Loading disc…",
       f"wrong loading headline: {splash_window.splash.status_text()!r}")
