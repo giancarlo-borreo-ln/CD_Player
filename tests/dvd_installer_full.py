@@ -154,6 +154,25 @@ def test_manifest_hash_well_formed() -> None:
     )
 
 
+def test_windows_ps1_is_native_and_maps_flags() -> None:
+    text = (REPO / "install-windows.ps1").read_text(encoding="utf-8")
+    lowered = text.lower()
+    check("setlocal" not in lowered)
+    check("@echo" not in lowered)
+    check("%*" not in text)
+    check(text.count("{") == text.count("}"))
+    check(text.count("(") == text.count(")"))
+    check(lowered.lstrip().startswith("#requires"))
+    _, remainder = text.split("param(", 1)
+    param_block = remainder.split("\n)", 1)[0]
+    check(param_block.count("(") == param_block.count(")"))
+    for name in ("$Ask", "$Yes", "$Check", "$Uninstall", "$Purge"):
+        check(name in param_block)
+    for flag in ("--install", "--ask", "--check", "--uninstall", "--purge"):
+        check(flag in text)
+    check("--platform" in text and "'windows'" in text)
+
+
 def _fake_winget_libmpv(payload: bytes) -> tuple[bool, install.Report, list[list[str]], str]:
     root = Path(tempfile.mkdtemp())
     local = root / "local"
@@ -449,6 +468,7 @@ for test in (
     test_required_native_failure_is_hard,
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
+    test_windows_ps1_is_native_and_maps_flags,
     test_bundled_libdvdcss_reports_ok,
     test_missing_dvdcss_marker_warns_once_without_fetch,
 ):

@@ -63,8 +63,21 @@ git clone git@github.com:giancarlo-borreo-ln/CD_Player.git
 cd CD_Player
 ./install-linux.sh      # Linux
 ./install-mac.sh        # macOS
-install-windows.cmd     # Windows (or install-windows.exe, see below)
+install-windows.ps1     # Windows (PowerShell)
 ```
+
+`install-windows.cmd` is a thin wrapper around the native
+`install-windows.ps1`, and a compiled `install-windows.exe` is preferred when
+present. From a PowerShell prompt the one-liner is:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install-windows.ps1
+```
+
+`-ExecutionPolicy Bypass` applies only to that PowerShell process, so no
+machine-wide policy or administrator rights are needed. Pass `-Ask`, `-Yes`,
+`-Check`, `-Uninstall` or `-Purge`; cmd-style `--uninstall` flags forwarded by
+the `.cmd` are accepted too.
 
 Each launcher delegates to `scripts/install.py --platform <os> "$@"`, so extra
 flags pass through, for example `./install-linux.sh --no-sync`. You can also
@@ -132,10 +145,12 @@ py -3 scripts\build_windows_exe.py
 ```
 
 The result lands in `dist\install-windows.exe`; copy it beside
-`install-windows.cmd`, which prefers the exe and otherwise falls back to
-`py -3`/`python`. The exe bakes in `--platform windows --pause`, so a
-double-clicked window stays open. `install-windows.cmd` installs a missing
-Python 3.12+ with winget unattended; add `--ask` to be prompted first.
+`install-windows.cmd`, which prefers the exe and otherwise delegates to
+`install-windows.ps1`. The PowerShell installer locates a repo-relative Python
+3.12+ (`py -3`, `python` or `%LOCALAPPDATA%\Programs\Python\Python31{2,3}`) and
+installs a missing one with winget unattended; add `-Ask` to be prompted
+first. The exe bakes in `--platform windows --pause`, so a double-clicked
+window stays open.
 
 | Platform | Branch behavior | Status |
 |---|---|---|
