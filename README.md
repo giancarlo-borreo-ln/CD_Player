@@ -46,7 +46,7 @@ sudo pacman -S --needed mpv libdvdnav libdvdread libdvdcss python-pyqt6 uv
 | `libdvdnav` / `libdvdread` | DVD VM (menus, navigation) |
 | `libdvdcss` | CSS decryption for commercial (encrypted) discs |
 | `python-pyqt6` | GUI framework (Wayland-compatible via XWayland) |
-| `uv` | project environment (Python 3.12+) |
+| `uv` | project environment (Python 3.13, `.python-version`) |
 
 `python-mpv` and the remaining Python deps are installed by `uv` from
 `pyproject.toml`. Optional gamepad support: `uv sync --extra gamepad`
@@ -67,14 +67,16 @@ install-windows.cmd     # Windows (known-good wrapper)
 install-windows.ps1     # Windows (PowerShell-native, statically validated only)
 ```
 
-On Windows, `install-windows.cmd` is the known-good, self-contained launcher:
-it bootstraps Python via `scripts/install-windows-bootstrap.ps1`, runs
-`scripts/install.py --platform windows` and launches the player; a compiled
+On Windows, `install-windows.cmd` is the known-good, self-contained launcher
+and needs **no system Python**. It finds `uv` (`where uv`, then the winget,
+`~/.local/bin` and cargo locations); if missing it installs `astral-sh.uv`
+with winget silently, lets uv provide CPython with `uv python install 3.13`,
+then runs `uv run --python 3.13 scripts\install.py --platform windows` and
+launches the player only when that succeeds. A compiled
 `install-windows.exe` is preferred when present. `install-windows.ps1` is an
-independent, PowerShell-native entry point for users who prefer it. It finds
-Python, calls the same `scripts/install.py --platform windows`, and launches
-the player. The `.ps1` is statically validated only (it cannot be executed on
-the Linux CI host); the `.cmd` remains the Loki-tested path.
+independent, PowerShell-native entry point with the same uv-first flow. The
+`.ps1` is statically validated only (it cannot be executed on the Linux CI
+host); the `.cmd` remains the Loki-tested path.
 
 From a PowerShell prompt the one-liner is:
 
@@ -102,8 +104,9 @@ uv run dvd-player /path/to/VIDEO_TS
 uv run python -m dvd_player           # equivalent module entry point
 ```
 
-Missing bootstrap dependencies (**Python 3.12+**, `uv` and `mpv`/libmpv) are
-installed unattended by default, so double-clicking or piping the installer
+Missing bootstrap dependencies (**uv**, a uv-managed Python 3.13 and
+`mpv`/libmpv) are installed unattended by default, so double-clicking or
+piping the installer
 works without answers. Pass `--ask` to be prompted before each install; `--yes`
 is kept as a no-op alias. Uninstall and `--purge` never install anything.
 
@@ -153,13 +156,13 @@ py -3 scripts\build_windows_exe.py
 ```
 
 The result lands in `dist\install-windows.exe`; copy it beside
-`install-windows.cmd`, which prefers the exe and otherwise runs its own
-bootstrap (`scripts/install-windows-bootstrap.ps1`) before calling
-`scripts/install.py`. The separate `install-windows.ps1` locates a
-repo-relative Python 3.12+ (`py -3`, `python` or
-`%LOCALAPPDATA%\Programs\Python\Python31{2,3}`) and installs a missing one with
-winget unattended; add `-Ask` to be prompted first. The exe bakes in
-`--platform windows --pause`, so a double-clicked window stays open.
+`install-windows.cmd`, which prefers the exe and otherwise resolves `uv`
+(installing `astral-sh.uv` with winget when missing), runs
+`uv python install 3.13` and then
+`uv run --python 3.13 scripts\install.py --platform windows`. The separate
+`install-windows.ps1` uses the same uv-first flow and requires no system
+Python either. The exe bakes in `--platform windows --pause`, so a
+double-clicked window stays open.
 
 | Platform | Branch behavior | Status |
 |---|---|---|

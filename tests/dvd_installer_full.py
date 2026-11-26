@@ -170,7 +170,6 @@ def test_windows_installers_are_independent_and_map_flags() -> None:
     for name in ("$Ask", "$Yes", "$Check", "$Uninstall", "$Purge"):
         check(name in param_block)
     check("install-windows.ps1" not in cmd)
-    check("scripts\\install-windows-bootstrap.ps1" in cmd)
     check("scripts\\install.py" in cmd)
     flags = ("--install", "--ask", "--check", "--uninstall", "--purge")
     for flag in flags:
@@ -178,6 +177,63 @@ def test_windows_installers_are_independent_and_map_flags() -> None:
         check(flag in cmd)
     check("--platform" in text and "'windows'" in text)
     check("--platform windows" in cmd)
+
+
+def test_windows_uv_first_flow_without_system_python() -> None:
+    """Fakes winget/uv: uv is resolved or installed silently, no system Python."""
+    cmd = (REPO / "install-windows.cmd").read_text(encoding="utf-8")
+    ps1 = (REPO / "install-windows.ps1").read_text(encoding="utf-8")
+    lowered = cmd.lower()
+    ps1_lowered = ps1.lower()
+    check((REPO / ".python-version").read_text(encoding="utf-8").strip() == "3.13")
+
+    # No prompts and no system Python bootstrap in the batch launcher.
+    check("set /p" not in lowered)
+    check("powershell" not in lowered)
+    check("read-host" not in ps1_lowered)
+    check("python.exe" not in lowered)
+    check("programs\\python" not in lowered)
+    for text in (lowered, ps1_lowered):
+        check("astral-sh.uv" in text)
+        check("--disable-interactivity" in text)
+        check("python install 3.13" in text)
+        check("--python" in text and "3.13" in text)
+
+    # uv resolution order: PATH, winget links, uv's own bin, cargo bin.
+    check("where uv" in lowered)
+    check("microsoft\\winget\\links\\uv.exe" in lowered)
+    check("userprofile%\\.local\\bin\\uv.exe" in lowered)
+    check("userprofile%\\.cargo\\bin\\uv.exe" in lowered)
+
+    # Missing uv -> a single silent winget install -> re-resolve -> uv run.
+    winget_line = (
+        "winget install --id astral-sh.uv --exact --silent "
+        "--accept-package-agreements --accept-source-agreements "
+        "--disable-interactivity"
+    )
+    check(winget_line in lowered)
+    install_at = lowered.index('"%uv%" python install 3.13')
+    run_at = lowered.index('"%uv%" run --python 3.13')
+    first_lookup = lowered.index("call :find_uv")
+    check(first_lookup < lowered.index(winget_line) < install_at < run_at)
+    check("where uv" in lowered[first_lookup:])
+    check("scripts\\install.py" in lowered[run_at:])
+
+    # Launch only after install.py exits 0, and never for check/uninstall.
+    failed_at = lowered.index("if errorlevel 1 exit /b %errorlevel%", run_at)
+    launch_at = lowered.index("if defined launch", failed_at)
+    check(run_at < failed_at < launch_at)
+    check('start ""' in lowered[launch_at:])
+    check('"%args:--check=%"=="%args%" set "launch="' in lowered)
+    check('"%args:--uninstall=%"=="%args%" set "launch="' in lowered)
+
+    # The PowerShell entry point follows the same uv-first flow.
+    check("function find-uv" in ps1_lowered)
+    check("function install-uv" in ps1_lowered)
+    check("& $uv python install 3.13" in ps1)
+    check("$installargs.add('run')" in ps1_lowered)
+    check("find-python" not in ps1_lowered)
+    check("test-python" not in ps1_lowered)
 
 
 def _fake_winget_libmpv(payload: bytes) -> tuple[bool, install.Report, list[list[str]], str]:
@@ -476,6 +532,7 @@ for test in (
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
     test_windows_installers_are_independent_and_map_flags,
+    test_windows_uv_first_flow_without_system_python,
     test_bundled_libdvdcss_reports_ok,
     test_missing_dvdcss_marker_warns_once_without_fetch,
 ):

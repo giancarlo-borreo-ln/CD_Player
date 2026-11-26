@@ -4,12 +4,13 @@
     Native PowerShell installer for DVD Player on Windows.
 
 .DESCRIPTION
-    Finds Python 3.12+ (installing it with winget when missing), then runs
-    scripts/install.py --platform windows and launches dvd-player.exe.
-    No administrator rights are required or requested.
+    Finds uv (installing it with winget when missing), lets uv provide a
+    managed CPython 3.13, then runs scripts/install.py --platform windows
+    through `uv run` and launches dvd-player.exe. No system Python is needed
+    and no administrator rights are required or requested.
 
 .PARAMETER Ask
-    Prompt before installing missing Python, uv or mpv.
+    Prompt before install.py's own dependency steps (uv/winget stays silent).
 
 .PARAMETER Yes
     Accepted for compatibility; unattended installs are the default.
@@ -49,68 +50,39 @@ function Write-Err {
     [Console]::Error.WriteLine("install-windows.ps1: $Message")
 }
 
-function Test-PythonExe {
-    param(
-        [string]$File,
-        [string[]]$Prefix
-    )
-    $code = 'import sys; raise SystemExit(0 if sys.version_info >= (3, 12) else 1)'
-    try {
-        & $File @Prefix -c $code 2>$null
-        return ($LASTEXITCODE -eq 0)
-    } catch {
-        return $false
+function Find-Uv {
+    $command = Get-Command uv -ErrorAction SilentlyContinue
+    if ($null -ne $command) {
+        return [string]$command.Source
     }
-}
-
-function Find-Python {
-    $candidates = @()
-    $candidates += ,@{ File = 'py'; Prefix = @('-3') }
-    $candidates += ,@{ File = 'python'; Prefix = @() }
+    $candidates = New-Object System.Collections.Generic.List[string]
     if ($env:LOCALAPPDATA) {
-        foreach ($version in @('312', '313')) {
-            $exe = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$version\python.exe"
-            if (Test-Path -LiteralPath $exe -PathType Leaf) {
-                $candidates += ,@{ File = $exe; Prefix = @() }
-            }
-        }
+        $candidates.Add((Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\uv.exe'))
+    }
+    if ($env:USERPROFILE) {
+        $candidates.Add((Join-Path $env:USERPROFILE '.local\bin\uv.exe'))
+        $candidates.Add((Join-Path $env:USERPROFILE '.cargo\bin\uv.exe'))
     }
     foreach ($candidate in $candidates) {
-        $file = [string]$candidate.File
-        $prefix = @($candidate.Prefix)
-        if ($file -eq 'py' -or $file -eq 'python') {
-            if (-not (Get-Command $file -ErrorAction SilentlyContinue)) {
-                continue
-            }
-        } elseif (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-            continue
-        }
-        if (Test-PythonExe -File $file -Prefix $prefix) {
-            return @{ File = $file; Prefix = $prefix }
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
         }
     }
     return $null
 }
 
-function Install-Python {
+function Install-Uv {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Write-Err 'Python 3.12+ is missing and winget is not available.'
-        Write-Err 'Install Python 3.12+ from https://www.python.org/downloads/ and re-run.'
+        Write-Err 'uv is missing and winget is not available.'
+        Write-Err 'Install uv from https://docs.astral.sh/uv/ and re-run.'
         return $null
     }
-    if ($Ask) {
-        $reply = Read-Host 'Python 3.12+ is missing. Install it now with winget? [y/N]'
-        if ($reply -notmatch '^(?i:y|yes)$') {
-            Write-Err 'Python installation declined; nothing changed.'
-            return $null
-        }
-    }
-    & winget install --id Python.Python.3.12 -e --source winget --silent --accept-package-agreements --accept-source-agreements
+    & winget install --id astral-sh.uv --exact --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
     if ($LASTEXITCODE -ne 0) {
-        Write-Err 'winget could not install Python 3.12+.'
+        Write-Err 'winget could not install uv.'
         return $null
     }
-    return (Find-Python)
+    return (Find-Uv)
 }
 
 # Accept cmd-style flags (--uninstall, --ask, ...) forwarded by install-windows.cmd.
@@ -162,22 +134,18 @@ if ([string]::IsNullOrWhiteSpace($Repo)) {
 }
 
 try {
-    $python = Find-Python
-    if ($null -eq $python) {
-        $python = Install-Python
+    $uv = Find-Uv
+    if ($null -eq $uv) {
+        $uv = Install-Uv
     }
-    if ($null -eq $python) {
-        Write-Err 'Python 3.12+ was not found.'
+    if ($null -eq $uv) {
+        Write-Err 'uv was not found. Install it from https://docs.astral.sh/uv/ and re-run.'
         exit 1
     }
-
-    # Verify the interpreter again before trusting it.
-    if (-not (Test-PythonExe -File ([string]$python.File) -Prefix @($python.Prefix))) {
-        Write-Err 'the selected Python is older than 3.12.'
+    if (-not (Test-Path -LiteralPath $uv -PathType Leaf)) {
+        Write-Err "the selected uv is not usable: $uv"
         exit 1
     }
-    $pyFile = [string]$python.File
-    $pyPrefix = @($python.Prefix)
 
     $installer = Join-Path $Repo 'scripts/install.py'
     if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
@@ -185,7 +153,16 @@ try {
         exit 1
     }
 
+    & $uv python install 3.13
+    if ($LASTEXITCODE -ne 0) {
+        exit $LASTEXITCODE
+    }
+
     $installArgs = New-Object System.Collections.Generic.List[string]
+    $installArgs.Add('run')
+    $installArgs.Add('--python')
+    $installArgs.Add('3.13')
+    $installArgs.Add($installer)
     $installArgs.Add('--platform')
     $installArgs.Add('windows')
     if ($Uninstall) {
@@ -209,7 +186,7 @@ try {
     }
 
     $finalArgs = $installArgs.ToArray()
-    & $pyFile @pyPrefix $installer @finalArgs
+    & $uv @finalArgs
     $code = $LASTEXITCODE
     if ($code -ne 0) {
         exit $code
