@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from enum import Enum, auto
 from pathlib import Path
 from typing import ClassVar
@@ -14,10 +15,29 @@ log = logging.getLogger("dvd_player")
 
 __version__ = "0.1.0"
 APP_NAME = "dvd_player"
-CONFIG_DIR = Path(
-    os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
-) / APP_NAME
+
+# SPEC for C3 (config paths) — platform-derived, RESUME_FILE stays derived:
+#   Linux:   $XDG_CONFIG_HOME/dvd_player or ~/.config/dvd_player (unchanged)
+#   macOS:   ~/Library/Application Support/dvd_player
+#   Windows: %APPDATA%/dvd_player (fallback ~/AppData/Roaming/dvd_player)
+# ── [AGENT1: C3 BEGIN] ──
+def _config_dir(platform: str) -> Path:
+    """Return the per-OS config directory (C3)."""
+    if platform == "win32":
+        appdata = os.environ.get("APPDATA")
+        base = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+        return base / APP_NAME
+    if platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    # Linux (and unknown platforms): preserve the historical XDG path.
+    return Path(
+        os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))
+    ) / APP_NAME
+
+
+CONFIG_DIR = _config_dir(sys.platform)
 RESUME_FILE = CONFIG_DIR / "resume.json"
+# ── [AGENT1: C3 END] ──
 RESUME_MAX_ENTRIES = 16  # cap stored per-disc entries
 OSD_TIMEOUT_MS = 4000  # Xbox-style OSD auto-hide delay
 GAMEPAD_POLL_MS = 50

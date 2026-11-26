@@ -38,6 +38,7 @@ from dvd_player import (
     eject_device,
 )
 from dvd_player import hardware
+from dvd_player import state as state_mod
 
 COUNT = 0
 
@@ -208,6 +209,247 @@ with mock.patch.object(hardware.ctypes.util, "find_library", return_value=None):
 # ── e. device helpers ──────────────────────────────────────────────
 check(disc_present("/dev/nonexistent0") is None)
 expect_playback_error(eject_device, "/dev/nonexistent0")
+
+# ── e2. platform dispatch (C1/C2/C3), faked — no real hardware ─────
+# Linux parity golden: alias nodes collapse to their real /dev/sr* target.
+linux_nodes = {
+    "/dev/cdrom": "/dev/sr0",
+    "/dev/dvd": "/dev/sr1",
+    "/dev/sr0": "/dev/sr0",
+    "/dev/sr1": "/dev/sr1",
+}
+with (
+    mock.patch.object(hardware.sys, "platform", "linux"),
+    mock.patch.object(hardware.os, "listdir", return_value=["sr0", "sr1"]),
+    mock.patch.object(hardware.os.path, "exists", side_effect=lambda p: p in linux_nodes),
+    mock.patch.object(hardware.os.path, "realpath", side_effect=lambda p: linux_nodes[p]),
+):
+    check(hardware.list_dvd_devices() == ["/dev/cdrom", "/dev/dvd"])
+
+for cd_status, want in (
+    (hardware.CDS_DISC_OK, True),
+    (hardware.CDS_NO_DISC, False),
+    (hardware.CDS_TRAY_OPEN, None),
+    (hardware.CDS_DRIVE_NOT_READY, None),
+):
+    with (
+        mock.patch.object(hardware.sys, "platform", "linux"),
+        mock.patch.object(hardware.os, "open", return_value=9),
+        mock.patch.object(hardware.os, "close"),
+        mock.patch.object(hardware.fcntl, "ioctl", return_value=cd_status),
+    ):
+        check(hardware.disc_present("/dev/sr0") == want)
+
+# Eject fallback chain: ioctl succeeds -> no subprocess.
+with (
+    mock.patch.object(hardware.sys, "platform", "linux"),
+    mock.patch.object(hardware.os, "open", return_value=9),
+    mock.patch.object(hardware.os, "close"),
+    mock.patch.object(hardware.fcntl, "ioctl"),
+    mock.patch.object(hardware.subprocess, "run") as run,
+):
+    hardware.eject_device("/dev/sr0")
+    check(not run.called)
+# ioctl fails -> the `eject` binary, list form, exactly one argv element.
+with (
+    mock.patch.object(hardware.sys, "platform", "linux"),
+    mock.patch.object(hardware.os, "open", return_value=9),
+    mock.patch.object(hardware.os, "close"),
+    mock.patch.object(hardware.fcntl, "ioctl", side_effect=OSError(5, "io")),
+    mock.patch.object(hardware.shutil, "which", return_value="/usr/bin/eject"),
+    mock.patch.object(
+        hardware.subprocess, "run",
+        return_value=types.SimpleNamespace(returncode=0),
+    ) as run,
+):
+    hardware.eject_device("/dev/sr0")
+    check(run.call_args.args[0] == ["/usr/bin/eject", "/dev/sr0"])
+# Both fail -> PlaybackError, never a leaked OSError.
+with (
+    mock.patch.object(hardware.sys, "platform", "linux"),
+    mock.patch.object(hardware.os, "open", side_effect=OSError(2, "missing")),
+    mock.patch.object(hardware.shutil, "which", return_value=None),
+):
+    expect_playback_error(hardware.eject_device, "/dev/sr0")
+
+# macOS discovery: only whole disks reported by drutil status.
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(
+        hardware.os, "listdir",
+        return_value=["disk2", "disk3", "disk0s1", "rdisk2"],
+    ),
+    mock.patch.object(hardware.os.path, "exists", return_value=True),
+    mock.patch.object(hardware.os.path, "realpath", side_effect=lambda p: p),
+    mock.patch.object(hardware.shutil, "which", return_value="/usr/bin/drutil"),
+    mock.patch.object(
+        hardware, "_run_command",
+        return_value=types.SimpleNamespace(
+            returncode=0, stdout="Name: /dev/disk2\nType: DVD-R\n"
+        ),
+    ),
+):
+    check(hardware.list_dvd_devices() == ["/dev/disk2"])
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.os, "listdir", return_value=["disk2"]),
+    mock.patch.object(hardware.shutil, "which", return_value=None),
+):
+    check(hardware.list_dvd_devices() == [])  # drutil absent -> degrade, no raise
+
+# macOS presence: mount-table hit/miss/unknown.
+mounts = types.SimpleNamespace(
+    returncode=0, stdout="/dev/disk2 on /Volumes/DVD (cd9660, local)\n"
+)
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.os.path, "exists", return_value=True),
+    mock.patch.object(hardware.os.path, "realpath", side_effect=lambda p: p),
+    mock.patch.object(hardware, "_run_command", return_value=mounts),
+):
+    check(hardware.disc_present("/dev/disk2") is True)
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.os.path, "exists", return_value=True),
+    mock.patch.object(hardware.os.path, "realpath", side_effect=lambda p: p),
+    mock.patch.object(
+        hardware, "_run_command",
+        return_value=types.SimpleNamespace(returncode=0, stdout="/dev/disk3 on /Volumes/X\n"),
+    ),
+):
+    check(hardware.disc_present("/dev/disk2") is False)
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.os.path, "exists", return_value=True),
+    mock.patch.object(hardware, "_run_command", return_value=None),
+):
+    check(hardware.disc_present("/dev/disk2") is None)
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.os.path, "exists", return_value=False),
+):
+    check(hardware.disc_present("/dev/disk2") is None)
+
+# macOS eject: drutil tray eject; failure becomes PlaybackError.
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.shutil, "which", return_value="/usr/bin/drutil"),
+    mock.patch.object(
+        hardware, "_run_command",
+        return_value=types.SimpleNamespace(returncode=0),
+    ) as run,
+):
+    hardware.eject_device("/dev/disk2")
+    check(run.call_args.args[0] == ["/usr/bin/drutil", "tray", "eject"])
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.shutil, "which", return_value="/usr/bin/drutil"),
+    mock.patch.object(
+        hardware, "_run_command",
+        return_value=types.SimpleNamespace(returncode=1),
+    ),
+):
+    expect_playback_error(hardware.eject_device, "/dev/disk2")
+
+# Windows discovery: GetLogicalDrives bits -> "D:\\" letters.
+class _FakeKernel:
+    def __init__(self, mask=0, create=123, ioctl=1):
+        self.GetLogicalDrives = mock.Mock(return_value=mask)
+        self.CreateFileW = mock.Mock(return_value=create)
+        self.DeviceIoControl = mock.Mock(return_value=ioctl)
+        self.CloseHandle = mock.Mock(return_value=1)
+
+
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware, "_windows_kernel32", return_value=_FakeKernel(0b11100)),
+):
+    check(hardware.list_dvd_devices() == ["C:\\", "D:\\", "E:\\"])
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware, "_windows_kernel32", side_effect=OSError("no kernel32")),
+):
+    check(hardware.list_dvd_devices() == [])
+
+# Windows presence: VIDEO_TS folder on the drive root; unknown on error.
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware.os.path, "exists", return_value=True),
+    mock.patch.object(
+        hardware.os.path, "isdir",
+        side_effect=lambda p: p == "D:\\VIDEO_TS",
+    ),
+):
+    check(hardware.disc_present("D:\\") is True)
+    check(hardware.disc_present("E:\\") is False)
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware.os.path, "exists", return_value=False),
+):
+    check(hardware.disc_present("D:\\") is None)
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware.os.path, "exists", side_effect=OSError("denied")),
+):
+    check(hardware.disc_present("D:\\") is None)
+
+# Windows eject: DeviceIoControl on \\.\D:, clean PlaybackError on failure.
+kernel = _FakeKernel()
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware, "_windows_kernel32", return_value=kernel),
+):
+    hardware.eject_device("D:\\")
+    check(kernel.CreateFileW.call_args.args[0] == "\\\\.\\D:")
+    check(
+        kernel.DeviceIoControl.call_args.args[1]
+        == hardware.IOCTL_STORAGE_EJECT_MEDIA
+    )
+    check(kernel.CloseHandle.called)
+kernel = _FakeKernel(ioctl=0)
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware, "_windows_kernel32", return_value=kernel),
+):
+    expect_playback_error(hardware.eject_device, "D:\\")
+    check(kernel.CloseHandle.called)
+kernel = _FakeKernel(create=-1)
+with (
+    mock.patch.object(hardware.sys, "platform", "win32"),
+    mock.patch.object(hardware, "_windows_kernel32", return_value=kernel),
+):
+    expect_playback_error(hardware.eject_device, "D:\\")
+    check(not kernel.CloseHandle.called)
+
+# C3: CONFIG_DIR per OS, RESUME_FILE stays derived (Linux golden values).
+with (
+    mock.patch.object(state_mod.Path, "home", return_value=Path("/home/alice")),
+    mock.patch.dict(os.environ, {}, clear=True),
+):
+    check(state_mod._config_dir("linux") == Path("/home/alice/.config/dvd_player"))
+    check(
+        state_mod._config_dir("darwin")
+        == Path("/home/alice/Library/Application Support/dvd_player")
+    )
+    check(
+        state_mod._config_dir("win32")
+        == Path("/home/alice/AppData/Roaming/dvd_player")
+    )
+with (
+    mock.patch.object(state_mod.Path, "home", return_value=Path("/home/alice")),
+    mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/xdg"}, clear=True),
+):
+    check(state_mod._config_dir("linux") == Path("/xdg/dvd_player"))
+with mock.patch.dict(
+    os.environ,
+    {"APPDATA": "C:\\Users\\alice\\AppData\\Roaming"},
+    clear=True,
+):
+    check(
+        state_mod._config_dir("win32")
+        == Path("C:\\Users\\alice\\AppData\\Roaming") / "dvd_player"
+    )
+check(state_mod.RESUME_FILE == state_mod.CONFIG_DIR / "resume.json")
 
 # ── f. engine offscreen ────────────────────────────────────────────
 app = QCoreApplication([])
