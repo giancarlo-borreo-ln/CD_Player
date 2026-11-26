@@ -109,8 +109,9 @@ def note_defect(text: str) -> None:
 # SCOPE (A1): every module under src/dvd_player, recursively, via realpath.
 # The collected set must equal a committed snapshot, not merely be non-empty.
 EXPECTED_SOURCE_FILES = sorted([
-    "__init__.py", "__main__.py", "app.py", "engine.py", "hardware.py",
-    "identity.py", "mpris.py", "osd.py", "render.py", "state.py", "window.py",
+    "__init__.py", "__main__.py", "_win_dll.py", "app.py", "engine.py",
+    "hardware.py", "identity.py", "mpris.py", "osd.py", "render.py",
+    "state.py", "window.py",
 ])
 EXPECTED_DIRECTORIES = ["."]
 PACKAGE_ROOT = PKG.resolve()
@@ -260,12 +261,18 @@ for node in ast.walk(tree):
         and isinstance(value.func, ast.Name) and value.func.id == "getattr"
         and len(value.args) >= 2
         and isinstance(value.args[0], ast.Name)
-        and value.args[0].id in subprocess_modules
+        and value.args[0].id in (subprocess_modules | os_modules)
         and isinstance(value.args[1], ast.Constant)
-        and value.args[1].value == "run"
-        and len(targets) == 1
-        and isinstance(targets[0], ast.Name)
-        and targets[0].id == "_subprocess_run"
+        and (
+            (value.args[1].value == "run" and len(targets) == 1
+             and isinstance(targets[0], ast.Name)
+             and targets[0].id == "_subprocess_run")
+            or (value.args[0].id in os_modules
+                and value.args[1].value == "add_dll_directory"
+                and len(targets) == 1
+                and isinstance(targets[0], ast.Name)
+                and targets[0].id == "adder")
+        )
     ):
         continue
     sanctioned_getattr.add(id(value))
@@ -1051,7 +1058,7 @@ check(EXEMPT_MODULES == [PKG / "__init__.py"])
 check([Path(os.path.realpath(item)).resolve() for item in EXEMPT_MODULES] == [FACADE_PATH])
 # The ~20 getattr(obj, "attr", None) sites are legitimate, not exempt; pin
 # their count and prove none is immediately invoked through.
-EXPECTED_GETATTR_CALLS = 33
+EXPECTED_GETATTR_CALLS = 34
 GETATTR_CALLS: list[ast.Call] = []
 for module_path in SOURCE_PATHS:
     module = ast.parse(module_path.read_text(encoding="utf-8"))
