@@ -56,43 +56,175 @@ def note_defect(text: str) -> None:
 # ════════════════════════════════════════════════════════════════════
 # 0. Static injection audit (AST, not just grep)
 # ════════════════════════════════════════════════════════════════════
-# The application is a package: audit every module's source as one text.
-source_text = "\n".join(
-    path.read_text(encoding="utf-8") for path in sorted(PKG.glob("*.py"))
-)
+# SCOPE: every module under src/dvd_player, recursively (subpackages included).
+# A non-recursive glob silently skipped injected files one directory down.
+SOURCE_PATHS = sorted(PKG.rglob("*.py"))
+assert SOURCE_PATHS, "static audit scope is empty"
+assert all(PKG in path.parents for path in SOURCE_PATHS), "audit escaped the package"
+source_text = "\n".join(path.read_text(encoding="utf-8") for path in SOURCE_PATHS)
 tree = ast.parse(source_text)
 
-banned_os = {"system", "popen", "execl", "execle", "execlp", "execlpe",
-             "execv", "execve", "execvp", "execvpe", "spawnl", "spawnv"}
-subprocess_calls: list[ast.Call] = []
-shell_true: list[ast.Call] = []
+# parent map, used to tell an attribute base / sanctioned reflection from a
+# module object being passed around as a value.
+PARENT: dict[int, ast.AST] = {}
+for _parent in ast.walk(tree):
+    for _child in ast.iter_child_nodes(_parent):
+        PARENT[id(_child)] = _parent
+
+SPAWN_ATTRS = {"run", "call", "Popen", "check_call", "check_output",
+               "getoutput", "getstatusoutput"}
+SUBPROCESS_ATTRS = {"run", "SubprocessError", "TimeoutExpired", "CalledProcessError"}
+ALLOWED_SUBPROCESS_IMPORTS = SUBPROCESS_ATTRS | {"CompletedProcess"}
+banned_os = {"system", "popen"}
+
+subprocess_modules: set[str] = {"subprocess"}
+subprocess_from: dict[str, str] = {}
+os_modules: set[str] = {"os"}
+os_from: dict[str, str] = {}
 imported: set[str] = set()
 
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
-        imported.update(alias.name.split(".")[0] for alias in node.names)
+        for alias in node.names:
+            top = alias.name.split(".")[0]
+            imported.add(top)
+            if top == "subprocess":
+                subprocess_modules.add(alias.asname or "subprocess")
+            elif top == "os":
+                os_modules.add(alias.asname or "os")
     elif isinstance(node, ast.ImportFrom) and node.module:
-        imported.add(node.module.split(".")[0])
-    elif isinstance(node, ast.Call):
+        top = node.module.split(".")[0]
+        imported.add(top)
+        for alias in node.names:
+            bound = alias.asname or alias.name
+            if top == "subprocess":
+                if alias.name not in ALLOWED_SUBPROCESS_IMPORTS:
+                    raise AssertionError(
+                        f"forbidden 'from subprocess import {alias.name}' - "
+                        "only run and exception classes are permitted"
+                    )
+                subprocess_from[bound] = alias.name
+            elif top == "os":
+                if alias.name in banned_os or alias.name.startswith(("exec", "spawn")):
+                    raise AssertionError(f"forbidden 'from os import {alias.name}'")
+                os_from[bound] = alias.name
+
+# The app legitimately reflects on engine/context objects (~20 sites); only
+# reflection aimed at a process/import module is dangerous.  The single
+# exception is hardware.py's documented ``getattr(subprocess, "run")`` alias,
+# whose result must be named _subprocess_run; computed or rebound forms fail.
+sanctioned_getattr: set[int] = set()
+for node in ast.walk(tree):
+    value = None
+    targets: list[ast.expr] = []
+    if isinstance(node, ast.Assign):
+        value, targets = node.value, node.targets
+    elif isinstance(node, ast.AnnAssign) and node.value is not None:
+        value, targets = node.value, [node.target]
+    if not (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name) and value.func.id == "getattr"
+        and len(value.args) >= 2
+        and isinstance(value.args[0], ast.Name)
+        and value.args[0].id in subprocess_modules
+        and isinstance(value.args[1], ast.Constant)
+        and value.args[1].value == "run"
+        and len(targets) == 1
+        and isinstance(targets[0], ast.Name)
+        and targets[0].id == "_subprocess_run"
+    ):
+        continue
+    sanctioned_getattr.add(id(value))
+
+subprocess_calls: list[ast.Call] = []
+shell_true: list[ast.Call] = []
+SENSITIVE_MODULES = subprocess_modules | os_modules | {"shutil", "importlib"}
+
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call):
         func = node.func
-        if isinstance(func, ast.Name) and func.id in {"eval", "exec"}:
-            raise AssertionError(f"forbidden builtin {func.id} call at line {node.lineno}")
+        if isinstance(func, ast.Name):
+            if func.id in {"eval", "exec", "compile", "__import__"}:
+                raise AssertionError(f"forbidden builtin {func.id} call at line {node.lineno}")
+            if func.id in subprocess_from and subprocess_from[func.id] in SPAWN_ATTRS:
+                subprocess_calls.append(node)
+            if func.id in os_from and (
+                os_from[func.id] in banned_os
+                or os_from[func.id].startswith(("exec", "spawn"))
+            ):
+                raise AssertionError(f"forbidden os.{os_from[func.id]} call at line {node.lineno}")
+            if func.id in {"getattr", "setattr"} and node.args:
+                first = node.args[0]
+                if isinstance(first, ast.Name) and first.id in SENSITIVE_MODULES:
+                    if func.id == "getattr" and id(node) in sanctioned_getattr:
+                        pass
+                    else:
+                        raise AssertionError(
+                            f"forbidden {func.id}({first.id}, ...) reflection "
+                            f"at line {node.lineno}"
+                        )
         if isinstance(func, ast.Attribute):
             base = func.value
-            if isinstance(base, ast.Name) and base.id == "os" and func.attr in banned_os:
+            if isinstance(base, ast.Name) and base.id in subprocess_modules:
+                if func.attr not in SUBPROCESS_ATTRS:
+                    raise AssertionError(
+                        f"forbidden subprocess.{func.attr} at line {node.lineno}"
+                    )
+                if func.attr in SPAWN_ATTRS:
+                    subprocess_calls.append(node)
+            if isinstance(base, ast.Name) and base.id in os_modules and (
+                func.attr in banned_os or func.attr.startswith(("exec", "spawn"))
+            ):
                 raise AssertionError(f"forbidden os.{func.attr} at line {node.lineno}")
-            if isinstance(base, ast.Name) and base.id == "subprocess" and func.attr in {
-                "run", "call", "Popen", "check_call", "check_output"
-            }:
-                subprocess_calls.append(node)
         for keyword in node.keywords:
             if keyword.arg == "shell":
                 shell_true.append(node)
+
+# Binding subprocess/os attributes to a bare name creates an untracked call
+# route (``run = subprocess.run; run(...)``), so it is banned outright.
+for node in ast.walk(tree):
+    value = None
+    if isinstance(node, ast.Assign):
+        value = node.value
+    elif isinstance(node, ast.AnnAssign):
+        value = node.value
+    if value is None:
+        continue
+    if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and (
+        value.value.id in subprocess_modules or value.value.id in os_modules
+    ):
+        raise AssertionError(f"forbidden module-attribute alias at line {node.lineno}")
+    if isinstance(value, ast.Name) and value.id in os_modules:
+        raise AssertionError(f"forbidden os module alias at line {node.lineno}")
+
+# A module object may only appear as an attribute base (or via the sanctioned
+# getattr above); ``x = subprocess``, ``vars(subprocess)``, ``getattr(subprocess,
+# "P" + "open")`` and passing it around all fail here.
+for node in ast.walk(tree):
+    if not (isinstance(node, ast.Name) and node.id in subprocess_modules):
+        continue
+    parent = PARENT.get(id(node))
+    if isinstance(parent, ast.Attribute) and parent.value is node:
+        continue
+    if isinstance(parent, ast.Call) and id(parent) in sanctioned_getattr:
+        continue
+    raise AssertionError(f"forbidden use of subprocess module object at line {node.lineno}")
+
+# globals()["subprocess"] / locals()["subprocess"] style string indirection.
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and isinstance(node.slice.value, str)
+        and node.slice.value in subprocess_modules
+    ):
+        raise AssertionError(f"forbidden string-keyed subprocess access at line {node.lineno}")
 
 check(len(subprocess_calls) == 1)
 check(len(shell_true) == 0)
 check("pickle" not in imported)
 check("yaml" not in imported)
+check("importlib" not in imported)
 check("os" in imported and "subprocess" in imported)
 
 # The single subprocess call must be the list-form eject fallback with the
@@ -147,8 +279,13 @@ FORBIDDEN_TEXT = (
     ("subprocess.check_output", r"\bsubprocess\.check_output\s*\("),
     ("os.system", r"\bos\.system\b"),
     ("os.popen", r"\bos\.popen\b"),
+    ("os.exec*", r"\bos\.exec\w*"),
+    ("os.spawn*", r"\bos\.spawn\w*"),
+    ("__import__", r"\b__import__\b"),
+    ("importlib", r"\bimportlib\b"),
     ("builtin eval()", r"(?<![\w.])eval\s*\("),
     ("builtin exec()", r"(?<![\w.])exec\s*\("),
+    ("builtin compile()", r"(?<![\w.])compile\s*\("),
     ("shell=True", r"\bshell\s*=\s*True\b"),
 )
 for label, pattern in FORBIDDEN_TEXT:
@@ -157,23 +294,8 @@ for label, pattern in FORBIDDEN_TEXT:
         raise AssertionError(f"forbidden {label} found in source text")
 # the one allowed call site is still visible to the textual layer
 check(len(re.findall(r"\bsubprocess\.run\s*\(", code_only)) == 1)
-# no other subprocess API may be referenced through the module (calls or
-# aliases); only the run entry point and exception classes are permitted.
-_ALLOWED_SUBPROCESS_ATTRS = {
-    "run", "SubprocessError", "TimeoutExpired", "CalledProcessError",
-    "CompletedProcess",
-}
-for node in ast.walk(tree):
-    if (
-        isinstance(node, ast.Attribute)
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "subprocess"
-        and node.attr not in _ALLOWED_SUBPROCESS_ATTRS
-    ):
-        raise AssertionError(f"forbidden subprocess.{node.attr} reference at line {node.lineno}")
 check("import pickle" not in code_only)
 check("import yaml" not in code_only and "from yaml" not in code_only)
-
 # ════════════════════════════════════════════════════════════════════
 # 1. Qt app + marker file
 # ════════════════════════════════════════════════════════════════════
