@@ -19,11 +19,12 @@ if exist "%HERE%\install-windows.exe" (
     exit /b
 )
 
-rem Find Python 3.12+; the helper asks before installing it with winget.
+rem Find Python 3.12+; the helper installs it with winget if missing (unattended;
+rem pass --ask to be prompted first).
 set "PYFILE=%TEMP%\dvd-player-python-%RANDOM%-%RANDOM%.txt"
-set "ASSUME="
-if not "%*:--yes=%"=="%*" set "ASSUME=-AssumeYes"
-powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HERE%\scripts\install-windows-bootstrap.ps1" -Repo "%HERE%" -OutFile "%PYFILE%" %ASSUME%
+set "BOOTMODE=-AssumeYes"
+if not "%*:--ask=%"=="%*" set "BOOTMODE=-Ask"
+powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%HERE%\scripts\install-windows-bootstrap.ps1" -Repo "%HERE%" -OutFile "%PYFILE%" %BOOTMODE%
 if errorlevel 1 (
     if exist "%PYFILE%" del /q "%PYFILE%" >nul 2>nul
     exit /b 1

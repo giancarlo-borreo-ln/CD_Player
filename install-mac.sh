@@ -35,6 +35,12 @@ done
 REPO_DIR=$(CDPATH= cd -P "$(dirname "$SCRIPT")" && pwd)
 OS_NAME=$(uname -s 2>/dev/null || echo unknown)
 
+# Missing bootstrap deps are installed unattended by default; --ask opts out.
+ASK=0
+case " $* " in
+    *" --ask "*) ASK=1 ;;
+esac
+
 case "$OS_NAME" in
     Darwin) ;;
     *)
@@ -69,18 +75,22 @@ if [ -z "${PYTHON:-}" ]; then
             "Install Homebrew from https://brew.sh, then re-run this script." >&2
         exit 1
     fi
-    printf '%s' "Python 3.12+ is missing. Install it with 'brew install python@3.12'? [y/N] "
-    ANSWER=
-    if [ -r /dev/tty ]; then
-        read -r ANSWER </dev/tty || ANSWER=
+    if [ "$ASK" -eq 1 ]; then
+        printf '%s' "Python 3.12+ is missing. Install it with 'brew install python@3.12'? [y/N] "
+        ANSWER=
+        if [ -r /dev/tty ]; then
+            read -r ANSWER </dev/tty || ANSWER=
+        fi
+        case $ANSWER in
+            y|Y|yes|YES) ;;
+            *)
+                printf '%s\n' "install-mac.sh: Python 3.12+ is required." >&2
+                exit 1
+                ;;
+        esac
+    else
+        printf '%s\n' "Python 3.12+ is missing; installing it with brew (pass --ask to prompt)."
     fi
-    case $ANSWER in
-        y|Y|yes|YES) ;;
-        *)
-            printf '%s\n' "install-mac.sh: Python 3.12+ is required." >&2
-            exit 1
-            ;;
-    esac
     brew install python@3.12
     BREW_PREFIX=$(brew --prefix python@3.12)
     PYTHON=$BREW_PREFIX/bin/python3.12

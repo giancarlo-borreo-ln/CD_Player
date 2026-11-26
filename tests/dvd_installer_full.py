@@ -4,6 +4,7 @@ Run: python3 tests/dvd_installer_full.py
 """
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import os
 import sys
@@ -133,9 +134,90 @@ def test_manifest_hash_well_formed() -> None:
     int(entry["sha256"], 16)
 
 
+def test_bootstrap_consent_defaults_true_without_prompt() -> None:
+    old_tty, old_input = install.is_tty, builtins.input
+    prompts: list[str] = []
+
+    def forbidden_input(prompt: str) -> str:
+        prompts.append(prompt)
+        raise AssertionError("bootstrap consent must not prompt by default")
+
+    try:
+        install.is_tty = lambda: True
+        builtins.input = forbidden_input
+        check(install.consent(False, "install uv with winget?") is True)
+        check(prompts == [])
+    finally:
+        install.is_tty, builtins.input = old_tty, old_input
+
+
+def test_bootstrap_ask_prompts() -> None:
+    old_tty, old_input = install.is_tty, builtins.input
+    prompts: list[str] = []
+
+    try:
+        install.is_tty = lambda: True
+
+        def decline(prompt: str) -> str:
+            prompts.append(prompt)
+            return "n"
+
+        builtins.input = decline
+        check(install.consent(True, "install mpv?") is False)
+        check(prompts == ["install mpv? [y/N] "])
+
+        builtins.input = lambda prompt: "y"
+        check(install.consent(True, "install mpv?") is True)
+    finally:
+        install.is_tty, builtins.input = old_tty, old_input
+
+
+def test_windows_native_missing_stubs_does_not_prompt() -> None:
+    old_which, old_tty, old_input = install.shutil.which, install.is_tty, builtins.input
+
+    def forbidden_input(prompt: str) -> str:
+        raise AssertionError("missing stubs must not prompt without --ask")
+
+    try:
+        install.shutil.which = lambda name: None
+        install.is_tty = lambda: True
+        builtins.input = forbidden_input
+        report = install.Report()
+        ok = install.install_windows_native(report, False, None)
+        check(not ok)
+        check(report.failures == 1)
+    finally:
+        install.shutil.which, install.is_tty, builtins.input = old_which, old_tty, old_input
+
+
+def test_windows_native_ask_prompts_on_missing_mpv() -> None:
+    old_which, old_tty, old_input = install.shutil.which, install.is_tty, builtins.input
+    prompts: list[str] = []
+
+    def decline(prompt: str) -> str:
+        prompts.append(prompt)
+        return "n"
+
+    try:
+        install.shutil.which = lambda name: "tar" if name == "tar" else None
+        install.is_tty = lambda: True
+        builtins.input = decline
+        report = install.Report()
+        ok = install.install_windows_native(report, True, None)
+        check(not ok)
+        check(len(prompts) == 1)
+        check("pinned libmpv" in prompts[0])
+    finally:
+        install.shutil.which, install.is_tty, builtins.input = old_which, old_tty, old_input
+
+
 for test in (
     test_winget_preferred_without_7z,
     test_no_winget_no_extractor_fails_closed,
+    test_bootstrap_consent_defaults_true_without_prompt,
+    test_bootstrap_ask_prompts,
+    test_windows_native_missing_stubs_does_not_prompt,
+    test_windows_native_ask_prompts_on_missing_mpv,
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
 ):

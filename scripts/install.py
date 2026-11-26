@@ -816,14 +816,18 @@ def is_tty() -> bool:
     return sys.stdin is not None and sys.stdin.isatty()
 
 
-def consent(assume_yes: bool, message: str) -> bool:
-    """Ask before any system change; --yes is explicit unattended consent."""
-    if assume_yes:
-        print(f"[consent] --yes: {message}")
+def consent(ask: bool, message: str) -> bool:
+    """Bootstrap deps install unattended by default; --ask opts into prompting.
+
+    Only use this for missing Python/uv/mpv. Destructive actions such as
+    --uninstall or --purge must never call it.
+    """
+    if not ask:
+        print(f"[consent] installing without prompting: {message}")
         return True
     if not is_tty():
         print(
-            "[refuse] no terminal to ask for consent; re-run with --yes "
+            "[refuse] no terminal to ask for consent; re-run without --ask "
             "for unattended installs",
             file=sys.stderr,
         )
@@ -951,7 +955,7 @@ def with_privilege(argv: list[str]) -> list[str]:
     return argv
 
 
-def ensure_python(report: Report, assume_yes: bool) -> bool:
+def ensure_python(report: Report, ask: bool) -> bool:
     """Find (or bootstrap, with consent) a Python >= 3.12 and re-exec into it."""
     if sys.version_info >= MIN_PYTHON:
         return True
@@ -975,7 +979,7 @@ def ensure_python(report: Report, assume_yes: bool) -> bool:
         )
         return False
     argv = with_privilege(argv)
-    if not consent(assume_yes, f"install Python 3.12+ with {' '.join(argv)}?"):
+    if not consent(ask, f"install Python 3.12+ with {' '.join(argv)}?"):
         report.fail("Python bootstrap refused", hint_python())
         return False
     result = run_argv(argv)
@@ -997,7 +1001,7 @@ def ensure_python(report: Report, assume_yes: bool) -> bool:
     return False
 
 
-def ensure_uv(report: Report, assume_yes: bool) -> bool:
+def ensure_uv(report: Report, ask: bool) -> bool:
     uv = shutil.which("uv")
     if uv:
         return True
@@ -1006,7 +1010,7 @@ def ensure_uv(report: Report, assume_yes: bool) -> bool:
         report.fail("uv not found", hint_uv())
         return False
     argv = with_privilege(argv)
-    if not consent(assume_yes, f"install uv with {' '.join(argv)}?"):
+    if not consent(ask, f"install uv with {' '.join(argv)}?"):
         report.fail("uv bootstrap refused", hint_uv())
         return False
     result = run_argv(argv)
@@ -1069,11 +1073,11 @@ def find_libmpv_dll() -> Path | None:
     return None
 
 
-def install_windows_native(report: Report, assume_yes: bool, offline: Path | None) -> bool:
+def install_windows_native(report: Report, ask: bool, offline: Path | None) -> bool:
     """Prefer winget's verified mpv; pinned archive is the fallback only."""
     winget = shutil.which("winget")
     if offline is None and winget is not None:
-        if not consent(assume_yes, "install mpv with winget (it verifies hashes)?"):
+        if not consent(ask, "install mpv with winget (it verifies hashes)?"):
             report.fail("mpv install declined", hint_libmpv())
             return False
         packages = ("mpv", "shinchiro.mpv")
@@ -1108,7 +1112,7 @@ def install_windows_native(report: Report, assume_yes: bool, offline: Path | Non
             )
             return False
     if not consent(
-        assume_yes, "download and verify the pinned libmpv/libdvdcss archive?"
+        ask, "download and verify the pinned libmpv/libdvdcss archive?"
     ):
         report.fail("Windows native library install declined", hint_libmpv())
         return False
@@ -1126,11 +1130,11 @@ def install_windows_native(report: Report, assume_yes: bool, offline: Path | Non
     return True
 
 
-def install_native(report: Report, assume_yes: bool, offline: Path | None) -> bool:
+def install_native(report: Report, ask: bool, offline: Path | None) -> bool:
     """Install libmpv/libdvdcss: package managers, or pinned fetch on Windows."""
     key = current_os()
     if key == "windows":
-        return install_windows_native(report, assume_yes, offline)
+        return install_windows_native(report, ask, offline)
 
     if key == "macos":
         argv = ["brew", "install", "mpv", "libdvdnav", "libdvdcss"]
@@ -1158,7 +1162,7 @@ def install_native(report: Report, assume_yes: bool, offline: Path | None) -> bo
         report.fail(f"{argv[0]} not found", f"install the libraries manually: {hint_libmpv()}")
         return False
     argv = with_privilege(argv)
-    if not consent(assume_yes, f"install native libraries with {' '.join(argv)}?"):
+    if not consent(ask, f"install native libraries with {' '.join(argv)}?"):
         report.fail("native library install declined", hint_libmpv())
         return False
     result = run_argv(argv)
@@ -1534,7 +1538,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="consent to package installs and downloads without prompting",
+        help="no-op alias; missing Python, uv and mpv are installed unattended by default",
+    )
+    parser.add_argument(
+        "--ask",
+        action="store_true",
+        help="prompt before installing missing Python, uv or mpv (opt out of unattended)",
     )
     parser.add_argument(
         "--purge",
@@ -1600,18 +1609,18 @@ def run(args: argparse.Namespace) -> int:
     if mode == "uninstall":
         return uninstall(report, args.purge)
 
-    if not ensure_python(report, args.yes):
+    if not ensure_python(report, args.ask):
         print("\nResult: FAIL — install Python 3.12+ first.")
         return 1
     if not check_python(report):
         print("\nResult: FAIL — install Python 3.12+ first.")
         return 1
 
-    uv_ok = ensure_uv(report, args.yes)
+    uv_ok = ensure_uv(report, args.ask)
     installed_tool = False
     if mode == "install":
         if uv_ok:
-            install_native(report, args.yes, offline)
+            install_native(report, args.ask, offline)
             installed_tool = install_tool(report, offline)
         else:
             report.warn("install skipped", "uv is required to install dvd-player")

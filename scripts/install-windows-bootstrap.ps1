@@ -1,8 +1,9 @@
 # Bootstrap Python 3.12+ on Windows for install-windows.cmd.
-# Consent is explicit: never installs silently (unless -AssumeYes is passed).
+# Installs silently by default; pass -Ask to prompt. -AssumeYes is a no-op alias.
 param(
     [string]$Repo = "",
     [string]$OutFile = "",
+    [switch]$Ask,
     [switch]$AssumeYes
 )
 $ErrorActionPreference = "Stop"
@@ -42,8 +43,8 @@ if (-not $python) {
         Write-Error "Python 3.12+ is missing and winget is unavailable. Install Python 3.12+ from python.org, then re-run."
         exit 1
     }
-    $approved = $AssumeYes.IsPresent
-    if (-not $approved) {
+    $approved = $true
+    if ($Ask.IsPresent) {
         $answer = Read-Host "Python 3.12+ is missing. Install it now with winget? [y/N]"
         $approved = $answer -match "^(y|yes)$"
     }

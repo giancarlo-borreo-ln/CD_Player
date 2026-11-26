@@ -73,11 +73,17 @@ call the script directly:
 ```sh
 python3 scripts/install.py            # detect the OS + `uv sync`
 python3 scripts/install.py --no-sync  # verify an existing environment
+python3 scripts/install.py --ask      # prompt before installing anything
 uv run dvd-player                     # auto-boots any disc in the drive
 uv run dvd-player /path/to/movie.iso
 uv run dvd-player /path/to/VIDEO_TS
 uv run python -m dvd_player           # equivalent module entry point
 ```
+
+Missing bootstrap dependencies (**Python 3.12+**, `uv` and `mpv`/libmpv) are
+installed unattended by default, so double-clicking or piping the installer
+works without answers. Pass `--ask` to be prompted before each install; `--yes`
+is kept as a no-op alias. Uninstall and `--purge` never install anything.
 
 Wrong-OS launchers exit `2` with a message naming the right one.
 
@@ -127,7 +133,8 @@ py -3 scripts\build_windows_exe.py
 The result lands in `dist\install-windows.exe`; copy it beside
 `install-windows.cmd`, which prefers the exe and otherwise falls back to
 `py -3`/`python`. The exe bakes in `--platform windows --pause`, so a
-double-clicked window stays open.
+double-clicked window stays open. `install-windows.cmd` installs a missing
+Python 3.12+ with winget unattended; add `--ask` to be prompted first.
 
 | Platform | Branch behavior | Status |
 |---|---|---|
