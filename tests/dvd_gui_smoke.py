@@ -1674,9 +1674,17 @@ dec_x11 = _winmod.decide_attach_mode(platform="xcb", wid=4242, env={})
 check(dec_x11.mode == "wid" and dec_x11.wid == 4242,
       f"auto x11 did not choose wid: {dec_x11}")
 check("xcb" in dec_x11.reason, f"x11 reason lost the platform: {dec_x11.reason}")
+for _x11_name in ("xwayland", "xwayland-egl", "xcb-xwayland"):
+    _x11_alias = _winmod.decide_attach_mode(platform=_x11_name, wid=4242, env={})
+    check(_x11_alias.mode == "wid" and _x11_alias.wid == 4242,
+          f"{_x11_name} was not classified as x11: {_x11_alias}")
 dec_wayland = _winmod.decide_attach_mode(platform="wayland", wid=4242, env={})
 check(dec_wayland.mode == "render" and dec_wayland.wid is None,
       f"auto Wayland leaked a wid: {dec_wayland}")
+_wayland_egl = _winmod.decide_attach_mode(
+    platform="wayland-egl", wid=4242, env={})
+check(_wayland_egl.mode == "render" and _wayland_egl.wid is None,
+      f"wayland-egl was not render-only: {_wayland_egl}")
 check("Wayland" in dec_wayland.reason and "BadWindow" in dec_wayland.reason,
       f"Wayland reason is not explicit: {dec_wayland.reason}")
 dec_darwin = _winmod.decide_attach_mode(platform="darwin", wid=4242, env={})

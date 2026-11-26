@@ -997,6 +997,14 @@ from dvd_player import window as dp_window  # noqa: E402
 
 check(dp_window.decide_attach_mode(platform="xcb", wid=77, env={}).mode == "wid",
       "x11 auto attach no longer uses wid")
+for _plat in ("xwayland", "xwayland-egl", "xcb-xwayland"):
+    _x11 = dp_window.decide_attach_mode(platform=_plat, wid=77, env={})
+    check(_x11.mode == "wid" and _x11.wid == 77,
+          f"{_plat} was not classified as x11: {_x11}")
+for _plat in ("wayland", "wayland-egl"):
+    _wl = dp_window.decide_attach_mode(platform=_plat, wid=77, env={})
+    check(_wl.mode == "render" and _wl.wid is None,
+          f"{_plat} was not render-only: {_wl}")
 check(dp_window.decide_attach_mode(platform="windows", wid=77, env={}).mode == "wid",
       "Windows auto attach did not use the HWND")
 for _plat in ("wayland", "darwin", "unexpected"):

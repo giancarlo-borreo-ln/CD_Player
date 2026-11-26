@@ -1332,10 +1332,14 @@ def _platform_family(platform: str | None = None) -> str:
     if not name:
         # No QApplication (headless unit tests): keep the historical wid path.
         return "offscreen"
-    if "wayland" in name:
-        return "wayland"
-    if name in ("xcb", "x11", "xwayland") or name.startswith("xcb"):
+    # X11/XWayland first: "xwayland" and "xwayland-egl" are X11-family
+    # names even though they contain the substring "wayland". We treat any
+    # xwayland* prefix as x11 (the XWayland surface is backed by Xlib), while
+    # only the native wayland*/"wayland-egl" prefix is render-only Wayland.
+    if name in ("xcb", "x11", "xwayland") or name.startswith(("xcb", "xwayland")):
         return "x11"
+    if name == "wayland" or name.startswith("wayland"):
+        return "wayland"
     if name in ("windows", "win32", "win64"):
         return "windows"
     if name in ("cocoa", "darwin", "macos", "osx"):
