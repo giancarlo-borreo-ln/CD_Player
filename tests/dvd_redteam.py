@@ -4,8 +4,18 @@ Attacks are inert data only.  A marker file proves no shell ever ran.
 Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 """
 # ── STATIC AUDIT CHARTER ──────────────────────────────────────────────
-# This is a REGRESSION TRIPWIRE, not a sandbox.  For ordinary (non-obfuscated)
-# code committed to src/dvd_player it checks, over EVERY **/*.py recursively:
+# This audit is a tripwire, not a sandbox: it detects literal, statically
+# resolvable process-spawn constructs in the scanned Python sources and
+# observes calls actually executed during the test run. It makes no claim
+# against obfuscated or dynamically constructed calls, C extensions, vendored
+# binaries, modified audit code, or paths not executed; a green result asserts
+# only that the enumerated static and executed dynamic checks passed, and does
+# not prove the absence of process spawning.
+# Boundary (A2): string-computed getattr, __dict__, importlib, exec-built
+# names, ctypes symbol strings and C-extension spawns are statically
+# undetectable and are declared out of scope above; runtime sentinel coverage
+# is limited to paths actually executed here.
+# Enforced over EVERY **/*.py recursively:
 #   * the set of process-spawn sites equals EXPECTED_SPAWN_SITES exactly -
 #     three enumerated sites in hardware.py: _linux_eject (literal run),
 #     _subprocess_run (sanctioned alias) and _run_command (wrapper).  Alias
@@ -39,6 +49,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import contextlib
 import io
 import json
 import locale
@@ -91,13 +102,46 @@ def note_defect(text: str) -> None:
 # ════════════════════════════════════════════════════════════════════
 # 0. Static injection audit (AST, not just grep)
 # ════════════════════════════════════════════════════════════════════
-# SCOPE: every module under src/dvd_player, recursively (subpackages included).
-# A non-recursive glob silently skipped injected files one directory down.
+# SCOPE (A1): every module under src/dvd_player, recursively, via realpath.
+# The collected set must equal a committed snapshot, not merely be non-empty.
+EXPECTED_SOURCE_FILES = sorted([
+    "__init__.py", "__main__.py", "app.py", "engine.py", "hardware.py",
+    "identity.py", "mpris.py", "osd.py", "render.py", "state.py", "window.py",
+])
+PACKAGE_ROOT = PKG.resolve()
 SOURCE_PATHS = sorted(PKG.rglob("*.py"))
 assert SOURCE_PATHS, "static audit scope is empty"
-assert all(PKG in path.parents for path in SOURCE_PATHS), "audit escaped the package"
+for _path in SOURCE_PATHS:
+    if _path.is_symlink():
+        raise AssertionError(f"symlinked source file forbidden: {_path}")
+    _real = Path(os.path.realpath(_path)).resolve()
+    if _real != PACKAGE_ROOT and PACKAGE_ROOT not in _real.parents:
+        raise AssertionError(f"source path escapes package root: {_path} -> {_real}")
+    if _real.is_symlink():
+        raise AssertionError(f"symlinked source target forbidden: {_real}")
+ACTUAL_SOURCE_FILES = sorted(
+    str(Path(os.path.realpath(path)).relative_to(PACKAGE_ROOT))
+    for path in SOURCE_PATHS
+)
+check(ACTUAL_SOURCE_FILES == EXPECTED_SOURCE_FILES)
 source_text = "\n".join(path.read_text(encoding="utf-8") for path in SOURCE_PATHS)
 tree = ast.parse(source_text)
+
+A7_CHARTER_TEXT = (
+    "This audit is a tripwire, not a sandbox: it detects literal, statically "
+    "resolvable process-spawn constructs in the scanned Python sources and "
+    "observes calls actually executed during the test run. It makes no claim "
+    "against obfuscated or dynamically constructed calls, C extensions, "
+    "vendored binaries, modified audit code, or paths not executed; a green "
+    "result asserts only that the enumerated static and executed dynamic "
+    "checks passed, and does not prove the absence of process spawning."
+)
+_AUDIT_SOURCE = Path(os.environ.get("AUDIT_SOURCE", __file__))
+_normalized_self = " ".join(
+    line[2:] if line.startswith("# ") else line
+    for line in _AUDIT_SOURCE.read_text(encoding="utf-8").splitlines()
+)
+check(A7_CHARTER_TEXT in _normalized_self)
 
 # parent map, used to tell an attribute base / sanctioned reflection from a
 # module object being passed around as a value.
@@ -108,10 +152,11 @@ for _parent in ast.walk(tree):
 
 SPAWN_ATTRS = {"run", "call", "Popen", "check_call", "check_output",
                "getoutput", "getstatusoutput"}
+ASYNCIO_SPAWN = {"create_subprocess_exec", "create_subprocess_shell"}
 SUBPROCESS_ATTRS = {"run", "SubprocessError", "TimeoutExpired",
                     "CalledProcessError", "CompletedProcess"}
 ALLOWED_SUBPROCESS_IMPORTS = SUBPROCESS_ATTRS | {"CompletedProcess"}
-banned_os = {"system", "popen", "fork", "forkpty",
+banned_os = {"system", "popen", "fork", "forkpty", "startfile",
              "posix_spawn", "posix_spawnp"}
 
 subprocess_modules: set[str] = {"subprocess"}
@@ -323,12 +368,18 @@ for _file, _symbol, _kind, _node in SPAWN_SITE_NODES:
     if _kind == "literal-run":
         assert isinstance(_node, ast.Call)
         check(len(_node.args) == 1)
-        check(isinstance(_node.args[0], ast.List))
-        check(all(kw.arg != "shell" for kw in _node.keywords))
+        check(isinstance(_node.args[0], (ast.List, ast.Tuple)))
+        check(all(kw.arg != "shell" for kw in _node.keywords))  # not even shell=False
         check(not any(isinstance(arg, ast.Constant) and isinstance(arg.value, str) for arg in _node.args))
+        check(not any(isinstance(arg, ast.JoinedStr) for arg in _node.args))
+        check(all(kw.arg is not None for kw in _node.keywords))  # no **kwargs
+        check(not any(
+            isinstance(item, ast.Constant) and item.value is False
+            for item in _node.args
+        ))
         if _symbol == "_linux_eject":
             _argv = _node.args[0]
-            assert isinstance(_argv, ast.List)
+            assert isinstance(_argv, (ast.List, ast.Tuple))
             check(len(_argv.elts) == 2)
             check(isinstance(_argv.elts[0], ast.Name) and _argv.elts[0].id == "eject_bin")
             check(isinstance(_argv.elts[1], ast.Name) and _argv.elts[1].id == "device")
@@ -356,6 +407,142 @@ for _file, _symbol, _kind, _node in SPAWN_SITE_NODES:
         check(len(_node.args) == 1)
         check(isinstance(_node.args[0], ast.Name) and _node.args[0].id == _params[0].arg)
         check(all(kw.arg != "shell" for kw in _node.keywords))
+
+def _dotted(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return ""
+
+
+# ── A3: every Call whose callee resolves to a banned family is a site ──
+EJECT_SITE = ("hardware.py", "_linux_eject", "subprocess.run")
+SPAWN_FAMILIES = ("subprocess.", "os.", "asyncio.", "multiprocessing.", "pty.")
+_SUSPICIOUS = ("spawn", "execp", "popen", "system", "fork", "subprocess")
+
+
+def _assignment_parts(node: ast.AST) -> tuple[ast.expr | None, list[ast.Name]]:
+    if isinstance(node, ast.Assign):
+        return node.value, [item for item in node.targets if isinstance(item, ast.Name)]
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.value, [node.target]
+    return None, []
+
+
+def _resolve_callee(
+    expr: ast.expr | None,
+    aliases: dict[str, ast.expr],
+    sub_modules: set[str],
+    os_mods: set[str],
+    asyncio_mods: set[str],
+    from_names: dict[str, str],
+    depth: int = 0,
+) -> str | None:
+    if expr is None or depth > 20:
+        return None
+    if isinstance(expr, ast.Name):
+        if from_names.get(expr.id) in SPAWN_ATTRS:
+            return "subprocess." + from_names[expr.id]
+        if from_names.get(expr.id) in ASYNCIO_SPAWN:
+            return "asyncio." + from_names[expr.id]
+        if expr.id in aliases:
+            return _resolve_callee(
+                aliases[expr.id], aliases, sub_modules, os_mods,
+                asyncio_mods, from_names, depth + 1,
+            )
+        return None
+    if isinstance(expr, ast.Attribute):
+        base = _dotted(expr.value)
+        if base in sub_modules and expr.attr in SPAWN_ATTRS:
+            return "subprocess." + expr.attr
+        if base in os_mods and (
+            expr.attr in banned_os
+            or expr.attr.startswith(("exec", "spawn", "posix_spawn"))
+        ):
+            return "os." + expr.attr
+        if base in asyncio_mods and expr.attr in ASYNCIO_SPAWN:
+            return "asyncio." + expr.attr
+        return None
+    if (
+        isinstance(expr, ast.Call)
+        and _dotted(expr.func) == "getattr"
+        and len(expr.args) >= 2
+        and isinstance(expr.args[0], ast.Name)
+        and expr.args[0].id in sub_modules
+        and isinstance(expr.args[1], ast.Constant)
+        and expr.args[1].value == "run"
+    ):
+        return "subprocess.run"
+    return None
+
+
+_resolved_sites: list[tuple[str, str, str]] = []
+for module_path in SOURCE_PATHS:
+    module = ast.parse(module_path.read_text(encoding="utf-8"))
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(module):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    sub_modules: set[str] = {"subprocess"}
+    os_mods: set[str] = {"os"}
+    asyncio_mods: set[str] = {"asyncio"}
+    from_names: dict[str, str] = {}
+    aliases: dict[str, ast.expr] = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top == "subprocess":
+                    sub_modules.add(alias.asname or "subprocess")
+                elif top == "os":
+                    os_mods.add(alias.asname or "os")
+                elif top == "asyncio":
+                    asyncio_mods.add(alias.asname or "asyncio")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            if top in {"subprocess", "asyncio"}:
+                for alias in node.names:
+                    from_names[alias.asname or alias.name] = alias.name
+        value, targets = _assignment_parts(node)
+        for target in targets:
+            aliases[target.id] = value  # type: ignore[assignment]
+        if isinstance(node, ast.Lambda) and node.args.defaults:
+            for arg, default in zip(node.args.args[-len(node.args.defaults):], node.args.defaults):
+                aliases[arg.arg] = default
+        if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            for gen in node.generators:
+                if isinstance(gen.target, ast.Name) and isinstance(gen.iter, (ast.List, ast.Tuple)):
+                    if len(gen.iter.elts) == 1:
+                        aliases[gen.target.id] = gen.iter.elts[0]
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        resolved = _resolve_callee(
+            node.func, aliases, sub_modules, os_mods, asyncio_mods, from_names,
+        )
+        symbol = _enclosing_symbol(node, parents)
+        if resolved is not None:
+            if module_path.name == "hardware.py" and symbol == "_linux_eject":
+                _resolved_sites.append(EJECT_SITE)
+            elif (
+                module_path.name == "hardware.py"
+                and symbol == "_run_command"
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "_subprocess_run"
+            ):
+                _resolved_sites.append(EJECT_SITE)
+            else:
+                _resolved_sites.append((module_path.name, symbol, resolved))
+        elif isinstance(node.func, ast.Name) and any(
+            part in node.func.id.lower() for part in _SUSPICIOUS
+        ) and node.func.id not in aliases:
+            raise AssertionError(
+                f"{module_path.name}: INDETERMINATE spawn-like callee {node.func.id!r}"
+            )
+check(len(set(_resolved_sites)) == 1)
+check(set(_resolved_sites) == {EJECT_SITE})
 
 subprocess_calls: list[ast.Call] = []
 shell_true: list[ast.Call] = []
@@ -534,6 +721,11 @@ FORBIDDEN_ATTRS = {
     "__globals__", "__call__", "__get__",
 }
 ASYNCIO_SPAWN = {"create_subprocess_exec", "create_subprocess_shell"}
+BANNED_IMPORTS = {"multiprocessing", "pty", "sh", "pexpect", "plumbum"}
+MULTIPROCESSING_SPAWN = {"Process", "Pool", "ProcessPoolExecutor"}
+PTY_SPAWN = {"spawn", "fork", "openpty"}
+
+
 for module_path in SOURCE_PATHS:
     module_text = module_path.read_text(encoding="utf-8")
     module_tree = ast.parse(module_text)
@@ -544,14 +736,14 @@ for module_path in SOURCE_PATHS:
     sys_aliases: set[str] = {"sys"}
     asyncio_aliases: set[str] = {"asyncio"}
     asyncio_from: dict[str, str] = {}
-    imports_subprocess = False
+    imports_subprocess_module = False
     uses_multiprocessing = False
     for node in ast.walk(module_tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
                 if top == "subprocess":
-                    imports_subprocess = True
+                    imports_subprocess_module = True
                     module_aliases.add(alias.asname or "subprocess")
                 elif top in {"os", "shutil"}:
                     module_aliases.add(alias.asname or top)
@@ -559,23 +751,24 @@ for module_path in SOURCE_PATHS:
                     sys_aliases.add(alias.asname or "sys")
                 elif top == "asyncio":
                     asyncio_aliases.add(alias.asname or "asyncio")
-                elif top == "multiprocessing":
+                elif top in BANNED_IMPORTS:
                     uses_multiprocessing = True
         elif isinstance(node, ast.ImportFrom) and node.module:
             top = node.module.split(".")[0]
-            if top == "subprocess":
-                imports_subprocess = True
-            elif top == "asyncio":
+            if top == "asyncio":
                 for alias in node.names:
                     asyncio_from[alias.asname or alias.name] = alias.name
-            elif top == "multiprocessing":
+            elif top in BANNED_IMPORTS:
                 uses_multiprocessing = True
-    if imports_subprocess and module_path.name != "hardware.py":
+    if imports_subprocess_module and module_path.name != "hardware.py":
         raise AssertionError(
             f"{module_path.name}: subprocess may only be imported by hardware.py"
         )
     if uses_multiprocessing:
-        raise AssertionError(f"{module_path.name}: multiprocessing imports are forbidden")
+        raise AssertionError(
+            f"{module_path.name}: banned import family "
+            f"({', '.join(sorted(BANNED_IMPORTS))}) is forbidden"
+        )
     for node in ast.walk(module_tree):
         if isinstance(node, ast.Call):
             func = node.func
@@ -588,6 +781,15 @@ for module_path in SOURCE_PATHS:
                 raise AssertionError(f"{module_path.name}: forbidden asyncio.{func.attr}")
             if isinstance(func, ast.Name) and asyncio_from.get(func.id) in ASYNCIO_SPAWN:
                 raise AssertionError(f"{module_path.name}: forbidden asyncio {func.id}")
+        if isinstance(node, ast.Call):
+            dotted = _dotted(node.func)
+            if dotted.endswith(("CDLL", "cdll.LoadLibrary", "LoadLibrary")):
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        if "libc" in arg.value.lower():
+                            raise AssertionError(
+                                f"{module_path.name}: ctypes libc spawn surface forbidden"
+                            )
         if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
             raise AssertionError(f"{module_path.name}: forbidden {node.id}")
         if isinstance(node, ast.Attribute):
@@ -614,6 +816,48 @@ for module_path in SOURCE_PATHS:
                     f"{module_path.name}: non-ASCII identifier {value!r} (homoglyph?)"
                 )
 check(EXEMPT_MODULES == [PKG / "__init__.py"])
+check([Path(os.path.realpath(item)).resolve() for item in EXEMPT_MODULES] == [FACADE_PATH])
+# The ~20 getattr(obj, "attr", None) sites are legitimate, not exempt; pin
+# their count and prove none is immediately invoked through.
+EXPECTED_GETATTR_CALLS = 33
+GETATTR_CALLS: list[ast.Call] = []
+for module_path in SOURCE_PATHS:
+    module = ast.parse(module_path.read_text(encoding="utf-8"))
+    _parents: dict[int, ast.AST] = {}
+    for _parent in ast.walk(module):
+        for _child in ast.iter_child_nodes(_parent):
+            _parents[id(_child)] = _parent
+    for _node in ast.walk(module):
+        if (
+            isinstance(_node, ast.Call)
+            and isinstance(_node.func, ast.Name)
+            and _node.func.id == "getattr"
+        ):
+            GETATTR_CALLS.append(_node)
+            _parent = _parents.get(id(_node))
+            if isinstance(_parent, ast.Call) and _parent.func is _node:
+                raise AssertionError("getattr(...) result is immediately called through")
+check(len(GETATTR_CALLS) == EXPECTED_GETATTR_CALLS)
+# The facade has exactly one sys.modules lazy-loader read (plus one class
+# rebinding statement); both are pinned, so an added loader use fails.
+_facade_tree = ast.parse((PKG / "__init__.py").read_text(encoding="utf-8"))
+_facade_parents: dict[int, ast.AST] = {}
+for _parent in ast.walk(_facade_tree):
+    for _child in ast.iter_child_nodes(_parent):
+        _facade_parents[id(_child)] = _parent
+_sys_modules_attrs = [
+    item for item in ast.walk(_facade_tree)
+    if isinstance(item, ast.Attribute)
+    and item.attr == "modules"
+    and isinstance(item.value, ast.Name)
+    and item.value.id == "sys"
+]
+check(len(_sys_modules_attrs) == 2)
+check(sum(
+    1 for item in _sys_modules_attrs
+    if isinstance(_facade_parents.get(id(item)), ast.Attribute)
+    and _facade_parents[id(item)].attr == "get"
+) == 1)
 
 # ════════════════════════════════════════════════════════════════════
 # 0b. Runtime sentinel: catches dynamic routes static AST cannot see
@@ -643,7 +887,41 @@ class _RecordingModule:
         return self._result
 
 
-def _sentinel(action) -> tuple[list[str], list[str]]:
+EJECT_LINE = next(
+    node.lineno
+    for node in ast.walk(ast.parse(Path(hardware.__file__).read_text(encoding="utf-8")))
+    if isinstance(node, ast.Call)
+    and isinstance(node.func, ast.Attribute)
+    and node.func.attr == "run"
+    and isinstance(node.func.value, ast.Name)
+    and node.func.value.id == "subprocess"
+)
+
+
+def _sentinel_guards() -> list[tuple[object, str]]:
+    import asyncio
+    import ctypes
+    import multiprocessing
+    import pty
+
+    targets: list[tuple[object, str]] = [
+        (os, name) for name in (
+            "system", "popen", "fork", "forkpty", "posix_spawn", "posix_spawnp",
+            "startfile", "execl", "execle", "execlp", "execlpe", "execv",
+            "execve", "execvp", "execvpe", "spawnl", "spawnv",
+        ) if hasattr(os, name)
+    ]
+    targets += [(asyncio, name) for name in ASYNCIO_SPAWN if hasattr(asyncio, name)]
+    targets += [
+        (multiprocessing, name) for name in MULTIPROCESSING_SPAWN
+        if hasattr(multiprocessing, name)
+    ]
+    targets += [(pty, name) for name in PTY_SPAWN if hasattr(pty, name)]
+    targets += [(ctypes, "CDLL"), (ctypes.cdll, "LoadLibrary")]
+    return targets
+
+
+def _sentinel(action) -> tuple[list[str], list[str], int]:
     proxy = _RecordingModule(
         hardware.subprocess,
         SimpleNamespace(returncode=0, stdout="", stderr=""),
@@ -668,16 +946,47 @@ def _sentinel(action) -> tuple[list[str], list[str]]:
         forbidden.append("compile")
         return real_compile(*args, **kwargs)
 
-    with (
-        mock.patch.object(hardware, "subprocess", proxy),
-        mock.patch.object(hardware, "_subprocess_run", proxy.run),
-        mock.patch.object(builtins, "__import__", _record_import),
-        mock.patch.object(builtins, "eval", _record_eval),
-        mock.patch.object(builtins, "exec", _record_exec),
-        mock.patch.object(builtins, "compile", _record_compile),
-    ):
-        action()
-    return proxy.accessed, forbidden
+    def _forbidden(label: str):
+        def _raise(*args, **kwargs):
+            forbidden.append(label)
+            raise AssertionError(f"sentinel: forbidden spawn entry point {label} called")
+        return _raise
+
+    hits: list[int] = []
+    seen: set[tuple[int, int]] = set()
+    target_file = hardware.__file__
+
+    def _tracer(frame, event, arg):
+        if (
+            event == "line"
+            and frame.f_lineno == EJECT_LINE
+            and frame.f_code.co_filename == target_file
+        ):
+            key = (id(frame), frame.f_lineno)
+            if key not in seen:
+                seen.add(key)
+                hits.append(frame.f_lineno)
+        return _tracer
+
+    guardians = _sentinel_guards()  # import lazily BEFORE wrapping builtins
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch.object(hardware, "subprocess", proxy))
+        stack.enter_context(mock.patch.object(hardware, "_subprocess_run", proxy.run))
+        for target, name in guardians:
+            stack.enter_context(
+                mock.patch.object(target, name, side_effect=_forbidden(f"{name}"))
+            )
+        stack.enter_context(mock.patch.object(builtins, "__import__", _record_import))
+        stack.enter_context(mock.patch.object(builtins, "eval", _record_eval))
+        stack.enter_context(mock.patch.object(builtins, "exec", _record_exec))
+        stack.enter_context(mock.patch.object(builtins, "compile", _record_compile))
+        previous = sys.gettrace()
+        sys.settrace(_tracer)
+        try:
+            action()
+        finally:
+            sys.settrace(previous)
+    return proxy.accessed, forbidden, len(hits)
 
 
 def _exercise_hardware() -> int:
@@ -695,19 +1004,21 @@ def _exercise_hardware() -> int:
     return len(devices)
 
 
-_sentinel_accessed, _sentinel_forbidden = _sentinel(_exercise_hardware)
+_sentinel_accessed, _sentinel_forbidden, _eject_hits = _sentinel(_exercise_hardware)
 check("run" in _sentinel_accessed)
 check(set(_sentinel_accessed) <= SENTINEL_ALLOWED_ATTRS)
 check(_sentinel_forbidden == [])
+check(_eject_hits == 1)  # executed eject-site line coverage is exactly once
+for _optional in ("sh", "pexpect", "plumbum"):
+    check(_optional not in sys.modules)
 
 
 def _dynamic_import_route() -> None:
     table = __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)
-    table["__import__"]("os").system("true")  # system is faked by the test
+    table["__import__"]("os")  # import is the detectable dynamic step
 
 
-with mock.patch.object(os, "system", return_value=0):
-    _, _dynamic_forbidden = _sentinel(_dynamic_import_route)
+_, _dynamic_forbidden, _ = _sentinel(_dynamic_import_route)
 check("__import__" in _dynamic_forbidden)
 
 # ════════════════════════════════════════════════════════════════════
