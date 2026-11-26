@@ -1668,6 +1668,55 @@ check(isinstance(gl_window.video, _winmod.VideoGLWidget),
 check(gl_window.video.parentWidget() is not gl_window,
       "GL surface must sit inside the central widget, below the overlays")
 
+# C4 attach matrix: decide_attach_mode is the single source of truth.
+_ATTACH = {"DVD_PLAYER_ATTACH": "wid"}
+dec_x11 = _winmod.decide_attach_mode(platform="xcb", wid=4242, env={})
+check(dec_x11.mode == "wid" and dec_x11.wid == 4242,
+      f"auto x11 did not choose wid: {dec_x11}")
+check("xcb" in dec_x11.reason, f"x11 reason lost the platform: {dec_x11.reason}")
+dec_wayland = _winmod.decide_attach_mode(platform="wayland", wid=4242, env={})
+check(dec_wayland.mode == "render" and dec_wayland.wid is None,
+      f"auto Wayland leaked a wid: {dec_wayland}")
+check("Wayland" in dec_wayland.reason and "BadWindow" in dec_wayland.reason,
+      f"Wayland reason is not explicit: {dec_wayland.reason}")
+dec_darwin = _winmod.decide_attach_mode(platform="darwin", wid=4242, env={})
+check(dec_darwin.mode == "render" and dec_darwin.wid is None,
+      f"auto macOS leaked a wid: {dec_darwin}")
+dec_windows = _winmod.decide_attach_mode(platform="windows", wid=4242, env={})
+check(dec_windows.mode == "wid" and dec_windows.wid == 4242,
+      f"auto Windows HWND did not choose wid: {dec_windows}")
+dec_x11_ready = _winmod.decide_attach_mode(
+    platform="xcb", wid=4242, env={}, render_ready=True)
+check(dec_x11_ready.mode == "render" and dec_x11_ready.wid is None,
+      f"auto x11 did not keep an initialised render API: {dec_x11_ready}")
+dec_zero = _winmod.decide_attach_mode(platform="xcb", wid=0, env={})
+check(dec_zero.mode == "render" and "non-zero" in dec_zero.reason,
+      f"zero wid was not rejected: {dec_zero}")
+dec_unknown = _winmod.decide_attach_mode(platform="not-a-qt-platform", wid=4242, env={})
+check(dec_unknown.mode == "render" and "unknown" in dec_unknown.reason,
+      f"unknown platform did not fall back to render: {dec_unknown}")
+for _plat in ("xcb", "wayland", "darwin", "windows", "unknown"):
+    _forced = _winmod.decide_attach_mode(
+        platform=_plat, wid=4242, env={"DVD_PLAYER_ATTACH": "render"})
+    check(_forced.mode == "render" and _forced.wid is None,
+          f"forced render leaked wid on {_plat}: {_forced}")
+for _plat, _why in (("wayland", "Wayland"), ("darwin", "macOS")):
+    _refused = _winmod.decide_attach_mode(
+        platform=_plat, wid=4242, env=_ATTACH)
+    check(_refused.mode == "render" and _refused.wid is None,
+          f"forced wid was not refused on {_plat}: {_refused}")
+    check("refused" in _refused.reason and _why in _refused.reason,
+          f"forced wid refusal lost its reason on {_plat}: {_refused.reason}")
+check(_winmod.decide_attach_mode(
+    platform="xcb", wid=4242, env=_ATTACH).mode == "wid",
+    "forced wid did not work on x11")
+check(_winmod.render_surface_required(
+    dp.DvdPlaybackEngine(), {"DVD_PLAYER_ATTACH": "render"}) is True,
+    "forced render did not request the GL surface")
+check(_winmod.render_surface_required(
+    dp.DvdPlaybackEngine(), {"DVD_PLAYER_ATTACH": "wid"}) is False,
+    "forced wid built a GL surface on a wid-safe platform")
+
 # R6: widget-space coordinates scale by the device pixel ratio.
 render_engine._menu_active = True
 render_calls: list[tuple[str, tuple[object, ...]]] = []
@@ -1800,6 +1849,63 @@ broken_widget.initializeGL()
 check(broken_widget._render_attached is False,
       "failed wid fallback marked the surface attached")
 broken_window.close()
+
+# C4: forced render never falls back to wid; forced wid is refused on
+# Wayland/macOS and retries the render API with the refusal reason logged.
+_orig_attach_env = os.environ.get("DVD_PLAYER_ATTACH")
+_orig_qt_platform = _winmod._qt_platform_name
+try:
+    os.environ["DVD_PLAYER_ATTACH"] = "render"
+    forced_render_engine = dp.DvdPlaybackEngine()
+    forced_render_engine.render_mode = "render"  # type: ignore[attr-defined]
+    forced_render_wids: list[int] = []
+    forced_render_engine.attach_render = lambda proc, fbo=None: False  # type: ignore[method-assign]
+    forced_render_engine.attach_widget = (  # type: ignore[method-assign]
+        lambda wid: forced_render_wids.append(wid)
+    )
+    forced_render_window = dp.MainWindow(forced_render_engine)
+    forced_render_window._auto_detected = True
+    forced_render_widget = forced_render_window.video
+    check(isinstance(forced_render_widget, _winmod.VideoGLWidget),
+          "forced render did not build the GL surface")
+    forced_render_widget.initializeGL()
+    check(forced_render_wids == [],
+          f"forced render fell back to wid: {forced_render_wids}")
+    check(forced_render_widget._render_attached is False,
+          "failed forced render marked the surface attached")
+    check("render" in forced_render_widget.last_attach_reason,
+          f"forced render reason missing: {forced_render_widget.last_attach_reason!r}")
+    forced_render_window.close()
+
+    os.environ["DVD_PLAYER_ATTACH"] = "wid"
+    _winmod._qt_platform_name = lambda: "wayland"  # type: ignore[assignment]
+    refused_engine = dp.DvdPlaybackEngine()
+    refused_engine.render_mode = "render"  # type: ignore[attr-defined]
+    refused_wids: list[int] = []
+    refused_renders: list[object] = []
+    refused_engine.attach_render = (  # type: ignore[method-assign]
+        lambda proc, fbo=None: (refused_renders.append(proc), True)[1]
+    )
+    refused_engine.attach_widget = lambda wid: refused_wids.append(wid)  # type: ignore[method-assign]
+    refused_window = dp.MainWindow(refused_engine)
+    refused_window._auto_detected = True
+    refused_widget = refused_window.video
+    check(isinstance(refused_widget, _winmod.VideoGLWidget),
+          "refused wid on Wayland did not build the GL surface")
+    refused_widget.initializeGL()
+    check(refused_wids == [],
+          f"Wayland was given a raw wid despite the refusal: {refused_wids}")
+    check(len(refused_renders) == 1 and refused_widget._render_attached is True,
+          "refused wid did not fall back to the render API")
+    check("refused" in refused_widget.last_attach_reason,
+          f"refused wid reason missing: {refused_widget.last_attach_reason!r}")
+    refused_window.close()
+finally:
+    _winmod._qt_platform_name = _orig_qt_platform
+    if _orig_attach_env is None:
+        os.environ.pop("DVD_PLAYER_ATTACH", None)
+    else:
+        os.environ["DVD_PLAYER_ATTACH"] = _orig_attach_env
 
 # FBO wiring: initializeGL hands the engine a callable that re-reads the
 # widget's live defaultFramebufferObject; the recorder proves it is invoked

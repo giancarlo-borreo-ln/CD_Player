@@ -122,7 +122,9 @@ MPVError = ValueError
 #     the half-built player, log (non-fatal) and, when wid is given, fall
 #     back to attach_widget(wid); ALWAYS return False in that case so the
 #     caller can continue the ordered render -> wid -> software chain.
-#     attach_widget stays the fallback and is unchanged.
+#     attach_widget stays the fallback and is unchanged. The C4 attach
+#     matrix owns the platform decision: callers pass a wid only on
+#     x11/Windows and only when it is non-zero; a zero id is ignored here.
 #   * update()/render_frame(width, height): GUI-thread-only drivers for
 #     paintGL. update() reports whether a frame is ready; render_frame()
 #     rebinds the context's FBO (the callable is re-invoked per frame) with
@@ -505,7 +507,7 @@ class DvdPlaybackEngine(QObject):
                 except Exception:  # noqa: BLE001 - teardown must not mask
                     log.debug("could not terminate the failed render player")
             self._player = None
-            if wid is not None:
+            if wid is not None and int(wid) != 0:
                 try:
                     self.attach_widget(int(wid))
                 except PlaybackError:

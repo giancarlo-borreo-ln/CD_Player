@@ -949,6 +949,18 @@ check(
 )
 check(
     dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "DVD_PLAYER_ATTACH": "render"}
+    ) == "wayland",
+    "forced render attach did not prefer native Wayland",
+)
+check(
+    dp_app.choose_platform(
+        {"WAYLAND_DISPLAY": "wayland-0", "DVD_PLAYER_ATTACH": "wid"}
+    ) == "xcb",
+    "forced wid attach did not select xcb on Wayland",
+)
+check(
+    dp_app.choose_platform(
         {"WAYLAND_DISPLAY": "wayland-0", "QT_QPA_PLATFORM": "xcb"}
     ) is None,
     "explicit xcb choice was overridden",
@@ -978,6 +990,29 @@ check(
     ) == "xcb",
     "blank QT_QPA_PLATFORM did not fall through to the matrix",
 )
+
+# C4 attach matrix: only x11/Windows may receive a raw wid; Wayland/macOS
+# always use the render API, and unknown platforms fall back to render.
+from dvd_player import window as dp_window  # noqa: E402
+
+check(dp_window.decide_attach_mode(platform="xcb", wid=77, env={}).mode == "wid",
+      "x11 auto attach no longer uses wid")
+check(dp_window.decide_attach_mode(platform="windows", wid=77, env={}).mode == "wid",
+      "Windows auto attach did not use the HWND")
+for _plat in ("wayland", "darwin", "unexpected"):
+    _decision = dp_window.decide_attach_mode(platform=_plat, wid=77, env={})
+    check(_decision.mode == "render" and _decision.wid is None,
+          f"{_plat} auto attach leaked a raw wid: {_decision}")
+for _plat in ("wayland", "darwin"):
+    _refused = dp_window.decide_attach_mode(
+        platform=_plat, wid=77, env={"DVD_PLAYER_ATTACH": "wid"})
+    check(_refused.mode == "render" and "refused" in _refused.reason,
+          f"{_plat} forced wid was not refused with a reason: {_refused}")
+check(dp_window.decide_attach_mode(
+    platform="xcb", wid=77, env={"DVD_PLAYER_ATTACH": "render"}).mode == "render",
+    "forced render attach still selected wid")
+check(dp_window.decide_attach_mode(platform="xcb", wid=0, env={}).mode == "render",
+    "zero window id was passed to mpv")
 
 app.processEvents()
 print(f"VERIFICATION-GUI OK {_count}")

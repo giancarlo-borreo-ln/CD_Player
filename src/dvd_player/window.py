@@ -1283,6 +1283,14 @@ class BootSplash(QWidget):
 # wid_embedding_safe() (xcb). On native Wayland render mode NEVER calls
 # attach_widget; software on Wayland still attempts attach_render once,
 # then shows the graceful renderer-unavailable status.
+# Attach matrix (C4): DVD_PLAYER_ATTACH=auto|render|wid selects the policy.
+# decide_attach_mode() is the single source of truth and returns the mode
+# plus a human-readable reason. auto: xcb/x11 and Windows HWND -> wid
+# (render API preferred when already initialised), native Wayland and macOS
+# -> render API, unknown -> render. A raw wid is NEVER passed on Wayland or
+# macOS (the historical BadWindow crash class). Forced wid is refused there
+# and falls back to the render API; a failed preferred mode retries the
+# render API, then logs a clear reason instead of crashing.
 # Proc seam: Qt's QOpenGLContext.getProcAddress() takes bytes (QByteArray),
 # while the render.py callback hands over the GL name as str. The loader
 # wrapper below re-encodes it, so every Qt lookup receives bytes and never a
@@ -1292,11 +1300,163 @@ class BootSplash(QWidget):
 # ``auto``/``render`` ask for the GL render surface; ``software``/``wid``
 # keep the native-window path whenever the platform can embed it.
 RENDER_MODE_ENV = "DVD_PLAYER_RENDER"
+ATTACH_MODE_ENV = "DVD_PLAYER_ATTACH"
+_ATTACH_MODES: tuple[str, ...] = ("auto", "render", "wid")
 _RENDER_MODES: tuple[str, ...] = ("render", "gl", "opengl", "auto")
 # Legacy spellings stay accepted so older launch scripts do not silently
 # fall back to wid embedding.
 _RENDER_MODE_ENV_ALIAS = "DVD_PLAYER_RENDER_MODE"
 _RENDER_API_ENV_ALIAS = "DVD_PLAYER_RENDER_API"
+
+
+def _qt_platform_name() -> str:
+    """Return the active Qt platform name (empty when no app exists)."""
+    app: QApplication | None = QApplication.instance()
+    return app.platformName() if app is not None else ""
+
+
+def attach_mode_requested(env: Mapping[str, str] | None = None) -> str:
+    """Return the requested attach policy: ``auto``, ``render`` or ``wid``.
+
+    Unknown/blank values fall back to ``auto`` so a typo can never pick the
+    unsafe path on native Wayland or macOS.
+    """
+    source = os.environ if env is None else env
+    mode = source.get(ATTACH_MODE_ENV, "").strip().lower()
+    return mode if mode in _ATTACH_MODES else "auto"
+
+
+def _platform_family(platform: str | None = None) -> str:
+    """Classify a Qt platform name into an attach-matrix family."""
+    name = (_qt_platform_name() if platform is None else platform).strip().lower()
+    if not name:
+        # No QApplication (headless unit tests): keep the historical wid path.
+        return "offscreen"
+    if "wayland" in name:
+        return "wayland"
+    if name in ("xcb", "x11", "xwayland") or name.startswith("xcb"):
+        return "x11"
+    if name in ("windows", "win32", "win64"):
+        return "windows"
+    if name in ("cocoa", "darwin", "macos", "osx"):
+        return "darwin"
+    if name in ("offscreen", "minimal", "vnc", "eglfs"):
+        return "offscreen"
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class AttachDecision:
+    """The chosen video attach mode plus the reason shown to a human."""
+
+    mode: str
+    wid: int | None
+    reason: str
+    platform: str
+
+
+def decide_attach_mode(
+    platform: str | None = None,
+    wid: int | None = None,
+    env: Mapping[str, str] | None = None,
+    render_ready: bool = False,
+) -> AttachDecision:
+    """Choose ``render`` or ``wid`` for this platform and environment.
+
+    C4 contract: a raw window id is returned only for x11/Windows (and the
+    legacy headless offscreen path) and only when it is non-zero. Native
+    Wayland and macOS always use the render API, and a forced ``wid`` there
+    is refused with a reason rather than handed to Xlib. ``render_ready``
+    means a GL surface/context already exists, so auto prefers keeping the
+    render API on X11. Linux auto behavior is unchanged from the old
+    ``wid_embedding_safe()`` dispatch.
+    """
+    requested = attach_mode_requested(env)
+    label = _qt_platform_name() if platform is None else platform
+    family = _platform_family(label)
+    shown = label or "none"
+    native_wid = int(wid) if wid is not None else None
+    wid_ok = family in ("x11", "windows", "offscreen")
+    if requested == "render":
+        return AttachDecision(
+            "render", None,
+            f"DVD_PLAYER_ATTACH=render: using the render API on {shown}",
+            shown,
+        )
+    if requested == "wid":
+        if not wid_ok:
+            if family == "wayland":
+                why = "native Wayland surfaces have no X11 window id"
+            elif family == "darwin":
+                why = "macOS exposes no reliable NSView id to mpv"
+            else:
+                why = f"platform {shown!r} has no safe native window id"
+            return AttachDecision(
+                "render", None,
+                f"DVD_PLAYER_ATTACH=wid refused: {why}; using the render API",
+                shown,
+            )
+        if native_wid is None or native_wid == 0:
+            return AttachDecision(
+                "render", None,
+                "DVD_PLAYER_ATTACH=wid refused: no non-zero window id; "
+                "using the render API",
+                shown,
+            )
+        return AttachDecision(
+            "wid", native_wid,
+            f"DVD_PLAYER_ATTACH=wid: native window id {native_wid} on {shown}",
+            shown,
+        )
+    # auto
+    if family == "wayland":
+        return AttachDecision(
+            "render", None,
+            "auto: native Wayland winId() is a wl_surface, not an X Window "
+            "(BadWindow guard); using the render API",
+            shown,
+        )
+    if family == "darwin":
+        return AttachDecision(
+            "render", None,
+            "auto: macOS has no reliable NSView id for mpv; using the render API",
+            shown,
+        )
+    if family == "windows":
+        if native_wid is not None and native_wid != 0:
+            return AttachDecision(
+                "wid", native_wid,
+                f"auto: Windows HWND {native_wid} is a valid mpv window id",
+                shown,
+            )
+        return AttachDecision(
+            "render", None,
+            "auto: Windows has no non-zero HWND; using the render API",
+            shown,
+        )
+    if family in ("x11", "offscreen"):
+        if render_ready:
+            return AttachDecision(
+                "render", None,
+                f"auto: render API already initialised on {shown}; keeping it",
+                shown,
+            )
+        if native_wid is not None and native_wid != 0:
+            return AttachDecision(
+                "wid", native_wid,
+                f"auto: {shown} window id {native_wid} is safe for mpv",
+                shown,
+            )
+        return AttachDecision(
+            "render", None,
+            f"auto: {shown} has no non-zero window id; using the render API",
+            shown,
+        )
+    return AttachDecision(
+        "render", None,
+        f"auto: unknown Qt platform {shown!r}; using the render API",
+        shown,
+    )
 
 
 def render_mode_requested(env: Mapping[str, str] | None = None) -> bool:
@@ -1325,18 +1485,16 @@ def render_mode_active(
     return render_mode_requested(env)
 
 
-def wid_embedding_safe() -> bool:
-    """Whether the active Qt platform supplies real X11 window ids for mpv.
+def wid_embedding_safe(platform: str | None = None) -> bool:
+    """Whether the active Qt platform supplies real native window ids for mpv.
 
     Native Wayland ``winId()`` is a wl_surface pointer, not an X Window:
     handing it to mpv's x11 EGL video output makes Xlib abort the process
-    with ``BadWindow`` on ``X_DestroyWindow``. Only xcb (or a platform
-    without native windows, e.g. offscreen tests) may use the wid path.
+    with ``BadWindow`` on ``X_DestroyWindow``. macOS ``winId()`` is not a
+    reliable NSView handle for mpv's cocoa helper either. Only xcb/X11,
+    Windows HWND (or the headless/offscreen test platform) may use wid.
     """
-    app: QApplication | None = QApplication.instance()
-    if app is None:
-        return True
-    return bool(app.platformName() != "wayland")
+    return _platform_family(platform) in ("x11", "windows", "offscreen")
 
 
 def render_surface_required(
@@ -1344,12 +1502,18 @@ def render_surface_required(
 ) -> bool:
     """Whether MainWindow must build the GL render surface.
 
-    ``DVD_PLAYER_RENDER=auto``/``render`` always asks for it. On a platform
-    where wid embedding is unsafe (native Wayland) the GL surface is the
-    only viable path even for ``software``, so the window still attempts
-    ``attach_render`` and then degrades to the graceful status instead of
-    handing a wl_surface id to Xlib.
+    ``DVD_PLAYER_RENDER=auto``/``render`` always asks for it. A forced
+    ``DVD_PLAYER_ATTACH=render`` asks for it on every platform. A forced
+    ``wid`` still builds it where wid is unsafe (Wayland/macOS/unknown), so
+    the refused wid can fall back to the render API. In auto, a platform
+    where wid embedding is unsafe gets the GL surface even for ``software``
+    and then degrades gracefully instead of handing a wl_surface to Xlib.
     """
+    requested = attach_mode_requested(env)
+    if requested == "render":
+        return True
+    if requested == "wid":
+        return not wid_embedding_safe()
     return render_mode_active(engine, env) or not wid_embedding_safe()
 
 
@@ -1395,6 +1559,8 @@ class VideoGLWidget(QOpenGLWidget):
         self._engine = engine
         self._render_attached = False
         self._closed = False
+        # Human-readable reason from the last attach decision (for the log/OSD).
+        self.last_attach_reason = ""
         self.setMouseTracking(True)
         # A GL surface only repaints when asked, so a rendered video would
         # freeze on its first frame. This driver asks again every ~33 ms
@@ -1412,15 +1578,45 @@ class VideoGLWidget(QOpenGLWidget):
     def initializeGL(self) -> None:
         """Hand the GL proc-address loader to the engine, once.
 
-        Ordered chain: ``attach_render`` -> one software-GL retry on native
-        Wayland -> ``attach_widget(winId())`` when wid embedding is safe.
-        ``attach_complete(attached)`` always fires, so MainWindow can release
-        queued loads or show the graceful renderer-unavailable status.
+        The attach decision (``decide_attach_mode``) picks the preferred
+        mode; every raw wid is obtained only on a platform where it is safe.
+        Ordered chain: preferred wid -> render API -> one software-GL retry
+        on native Wayland -> wid fallback only when the matrix allows it.
+        ``attach_complete(attached)`` always fires with a logged reason, so
+        MainWindow can release queued loads or show the graceful status.
         """
         if self._render_attached:
             return
         started = time.monotonic()
-        log.info("milestone attach attempt: render api platform=%s", self._platform_name())
+        wid = int(self.winId()) if wid_embedding_safe() else None
+        decision = decide_attach_mode(wid=wid, render_ready=True)
+        self.last_attach_reason = decision.reason
+        log.info(
+            "milestone attach decision: mode=%s platform=%s render_ready=True "
+            "reason=%s",
+            decision.mode,
+            decision.platform,
+            decision.reason,
+        )
+        log.info(
+            "milestone attach attempt: %s api platform=%s",
+            "render" if decision.mode == "render" else "wid",
+            self._platform_name(),
+        )
+        wid_tried = False
+        if decision.mode == "wid" and decision.wid is not None:
+            wid_tried = True
+            if self._attach_wid(decision.wid):
+                log.info(
+                    "milestone attach result: wid duration=%.1fms",
+                    (time.monotonic() - started) * 1000.0,
+                )
+                self._emit_attach_complete(True)
+                return
+            log.warning(
+                "preferred wid attach failed (%s); retrying with the render API",
+                decision.reason,
+            )
         if self._try_attach_render():
             self._render_attached = True
             log.info(
@@ -1447,42 +1643,48 @@ class VideoGLWidget(QOpenGLWidget):
                 self._platform_name(),
                 os.environ.get("LIBGL_ALWAYS_SOFTWARE"),
             )
-        if not wid_embedding_safe():
+        if attach_mode_requested() == "render":
             log.warning(
-                "render attach failed on native Wayland: wid embedding is "
-                "unavailable, refusing to pass a Wayland surface id to Xlib"
+                "forced render attach failed and wid fallback is disabled: %s",
+                decision.reason,
             )
-            log.info(
-                "milestone attach result: failed wayland duration=%.1fms",
-                (time.monotonic() - started) * 1000.0,
+        elif not wid_embedding_safe():
+            log.warning(
+                "render attach failed on platform %r: wid embedding is "
+                "unsafe, refusing to pass a Wayland/macOS id to Xlib (%s)",
+                self._platform_name(),
+                decision.reason,
             )
-            self._emit_attach_complete(False)
-            return
-        fallback = getattr(self._engine, "attach_widget", None)
-        if not callable(fallback):
-            log.warning("render attach refused and no wid fallback exists")
-            log.info(
-                "milestone attach result: failed duration=%.1fms",
-                (time.monotonic() - started) * 1000.0,
-            )
-            self._emit_attach_complete(False)
-            return
-        try:
-            fallback(int(self.winId()))
-        except Exception as exc:  # noqa: BLE001 - wid fallback is best effort
-            log.warning("wid fallback after render failure failed: %s", exc)
-            log.info(
-                "milestone attach result: failed duration=%.1fms",
-                (time.monotonic() - started) * 1000.0,
-            )
-            self._emit_attach_complete(False)
+        elif not wid_tried:
+            fallback_wid = int(self.winId())
+            if self._attach_wid(fallback_wid):
+                log.info("render attach refused; using the wid video path")
+                log.info(
+                    "milestone attach result: wid duration=%.1fms",
+                    (time.monotonic() - started) * 1000.0,
+                )
+                self._emit_attach_complete(True)
+                return
+            log.warning("wid fallback after render failure failed")
         else:
-            log.info("render attach refused; using the wid video path")
-            log.info(
-                "milestone attach result: wid duration=%.1fms",
-                (time.monotonic() - started) * 1000.0,
-            )
-            self._emit_attach_complete(True)
+            log.warning("wid and render attach both failed: %s", decision.reason)
+        log.info(
+            "milestone attach result: failed duration=%.1fms",
+            (time.monotonic() - started) * 1000.0,
+        )
+        self._emit_attach_complete(False)
+
+    def _attach_wid(self, wid: int) -> bool:
+        """Attach the engine to a native window id, swallowing backend faults."""
+        fallback = getattr(self._engine, "attach_widget", None)
+        if not callable(fallback) or int(wid) == 0:
+            return False
+        try:
+            fallback(int(wid))
+        except Exception as exc:  # noqa: BLE001 - wid fallback is best effort
+            log.warning("wid attach failed: %s", exc)
+            return False
+        return True
 
     def _try_attach_render(self) -> bool:
         """Attempt the render handshake once, swallowing any backend fault."""
@@ -1510,8 +1712,7 @@ class VideoGLWidget(QOpenGLWidget):
     @staticmethod
     def _platform_name() -> str:
         """Return the active Qt platform name (empty when no app exists)."""
-        app: QApplication | None = QApplication.instance()
-        return app.platformName() if app is not None else ""
+        return _qt_platform_name()
 
     def _software_retry_feasible(self) -> bool:
         """Software GL is worth one retry only on native Wayland, once."""
@@ -1935,6 +2136,16 @@ class ScrubPreviewOsd(Xbox360Osd):
 #     _attach_engine() is also called at the start of _load_source so a
 #     fresh mpv is rebuilt after eject() (attach_widget no-ops while
 #     already attached).
+#   * ATTACH MATRIX (C4 addendum): every attach site first calls
+#     decide_attach_mode(platform, wid, env, render_ready), which returns
+#     mode + reason. DVD_PLAYER_ATTACH=auto|render|wid overrides the policy.
+#     auto uses wid on xcb/X11 and Windows HWND (render API preferred when
+#     already initialised), the render API on native Wayland and macOS, and
+#     the render API for unknown platforms. A raw wid is read/passed only
+#     when wid_embedding_safe() and the id is non-zero; Wayland and macOS
+#     never receive one. Forced wid there is refused with the reason, and a
+#     failed preferred mode retries the render API before the graceful
+#     'renderer unavailable' status; nothing raises out of the attach chain.
 #   * Video mouse: install eventFilter on self.video (_on_video_mouse):
 #     MouseMove -> when NOT engine.menu_active: osd.show_osd(); when
 #     engine.menu_active: engine.menu_mouse_move(pos.x(), pos.y()) only.
@@ -3733,59 +3944,92 @@ class MainWindow(QMainWindow):
         return None
 
     def _attach_engine(self) -> None:
-        """Bind mpv to the video widget, then honour an initial source."""
+        """Bind mpv to the video widget, then honour an initial source.
+
+        Every attach site goes through ``decide_attach_mode``: a raw wid is
+        read and passed only on x11/Windows (and the legacy offscreen test
+        platform), never on native Wayland or macOS.
+        """
         started = time.monotonic()
         has_render = callable(getattr(self.engine, "attach_render", None))
-        platform = VideoGLWidget._platform_name()
+        gl_video = self.video if isinstance(self.video, VideoGLWidget) else None
+        gl_surface = gl_video is not None
+        platform = _qt_platform_name()
+        wid = int(self.video.winId()) if wid_embedding_safe() else None
+        decision = decide_attach_mode(
+            platform=platform, wid=wid, render_ready=gl_surface and has_render
+        )
+        if gl_video is not None:
+            gl_video.last_attach_reason = decision.reason
+        log.info(
+            "milestone attach decision: mode=%s platform=%s render_ready=%s "
+            "reason=%s",
+            decision.mode,
+            platform,
+            gl_surface and has_render,
+            decision.reason,
+        )
         log.info(
             "milestone attach attempt: mode=%s platform=%s",
-            "render" if isinstance(self.video, VideoGLWidget) else "wid",
+            decision.mode,
             platform,
         )
-        if isinstance(self.video, VideoGLWidget) and has_render:
-            # The GL context is ready only after show(); initializeGL()
-            # performs the attach_render() handshake.
-            log.info(
-                "milestone attach result: render surface armed duration=%.1fms",
-                (time.monotonic() - started) * 1000.0,
-            )
-            log.debug("render API surface armed for GL attach")
-        else:
-            if isinstance(self.video, VideoGLWidget):
-                log.info("render API unavailable; falling back to wid embedding")
-            if not wid_embedding_safe():
-                log.error(
-                    "wid embedding cannot work on Qt platform %r: set "
-                    "DVD_PLAYER_RENDER=auto or use xcb",
-                    platform,
-                )
-                self._attach_failed = True
-                self._engine_attached = False
+        if decision.mode == "render":
+            if gl_surface and has_render:
+                # The GL context is ready only after show(); initializeGL()
+                # performs the attach_render() handshake.
                 log.info(
-                    "milestone attach result: failed wayland duration=%.1fms",
+                    "milestone attach result: render surface armed duration=%.1fms",
                     (time.monotonic() - started) * 1000.0,
                 )
-                self._renderer_unavailable()
+                log.debug("render API surface armed for GL attach")
                 return
-            try:
-                self.engine.attach_widget(int(self.video.winId()))
-            except PlaybackError as exc:
-                log.exception("could not attach the video widget: %s", exc)
-                self._attach_failed = True
-                self._engine_attached = False
-                log.info(
-                    "milestone attach result: failed duration=%.1fms",
-                    (time.monotonic() - started) * 1000.0,
-                )
-                self._renderer_unavailable()
-                return
-            self._engine_attached = True
-            self._attach_failed = False
+            log.error(
+                "render attach requested but no GL surface is available: %s",
+                decision.reason,
+            )
+            self._attach_failed = True
+            self._engine_attached = False
             log.info(
-                "milestone attach result: wid attached duration=%.1fms",
+                "milestone attach result: failed render duration=%.1fms",
                 (time.monotonic() - started) * 1000.0,
             )
-            log.debug("mpv attached to video window %#x", int(self.video.winId()))
+            self._renderer_unavailable()
+            return
+        if decision.wid is None:
+            log.error("attach decision selected wid without a window id: %s",
+                      decision.reason)
+            self._attach_failed = True
+            self._engine_attached = False
+            log.info(
+                "milestone attach result: failed duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
+            self._renderer_unavailable()
+            return
+        try:
+            self.engine.attach_widget(decision.wid)
+        except PlaybackError as exc:
+            log.exception(
+                "could not attach the video widget (%s): %s",
+                decision.reason,
+                exc,
+            )
+            self._attach_failed = True
+            self._engine_attached = False
+            log.info(
+                "milestone attach result: failed wid duration=%.1fms",
+                (time.monotonic() - started) * 1000.0,
+            )
+            self._renderer_unavailable()
+            return
+        self._engine_attached = True
+        self._attach_failed = False
+        log.info(
+            "milestone attach result: wid attached duration=%.1fms",
+            (time.monotonic() - started) * 1000.0,
+        )
+        log.debug("mpv attached to video window %#x", decision.wid)
         initial = self._initial_source
         self._initial_source = None
         if initial:

@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import QApplication
 
 from .engine import DvdPlaybackEngine
 from .state import APP_NAME, log
-from .window import MainWindow, render_mode_requested
+from .window import MainWindow, attach_mode_requested, render_mode_requested
 
 # SECTION 7 — main() entry point
 # ════════════════════════════════════════════════════════════════════
@@ -123,20 +123,26 @@ def choose_platform(env: Mapping[str, str] | None = None) -> str | None:
     1. any non-empty QT_QPA_PLATFORM is honored verbatim (xcb, wayland,
        offscreen, minimal, vnc, foo, ...): the user/CI override wins;
     2. no WAYLAND_DISPLAY -> untouched (native X11/offscreen);
-    3. render API requested (DVD_PLAYER_RENDER_MODE/API) -> ``wayland``:
-       the GL surface owns its context, so no wid/XWayland is needed;
-    4. otherwise (wid embedding, with software fallback) -> ``xcb``.
+    3. DVD_PLAYER_ATTACH=render, or a render API request
+       (DVD_PLAYER_RENDER_MODE/API) -> ``wayland``: the GL surface owns its
+       context, so no wid/XWayland is needed;
+    4. otherwise (DVD_PLAYER_ATTACH=wid or auto with wid embedding, with
+       software fallback) -> ``xcb``.
 
     wid embedding needs xcb on Wayland (XWayland); the render API can use
     native Wayland, so it is preferred there. This decision must run before
     QApplication exists and is never pre-empted by an import-time mutation:
-    a refused wid attach is handled at runtime by ``attach_widget``.
+    a refused wid attach is handled at runtime by the attach matrix.
     """
     source = os.environ if env is None else env
     if source.get("QT_QPA_PLATFORM", "").strip():
         return None
     if not source.get("WAYLAND_DISPLAY"):
         return None
+    if attach_mode_requested(source) == "render":
+        return "wayland"
+    if attach_mode_requested(source) == "wid":
+        return "xcb"
     return "wayland" if render_mode_requested(source) else "xcb"
 
 
