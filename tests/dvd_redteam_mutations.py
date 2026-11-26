@@ -103,6 +103,7 @@ def a8_unresolved(root: Path, audit: str) -> str:
     return audit
 
 
+EXPECTED_MUTANTS = ("A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8")
 MUTANTS = [
     ("A1", a1_symlink_dir),
     ("A2", a2_ctypes_pydll),
@@ -140,6 +141,16 @@ def run_mutant(clause: str, builder) -> tuple[bool, str]:
 
 
 def main() -> int:
+    ids = [clause for clause, _ in MUTANTS]
+    if ids != list(EXPECTED_MUTANTS):
+        print(f"MANIFEST MISMATCH: {ids} != {list(EXPECTED_MUTANTS)}")
+        return 1
+    # A no-op mutant must not be classified RED: if it is, the harness itself
+    # or the baseline is broken and the manifest proof is meaningless.
+    noop_red, _ = run_mutant("NOOP", lambda root, audit: audit)
+    if noop_red:
+        print("NO-OP MUTANT CLASSIFIED RED - manifest guard broken")
+        return 1
     survived: list[str] = []
     for clause, builder in MUTANTS:
         red, tail = run_mutant(clause, builder)

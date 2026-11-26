@@ -568,6 +568,7 @@ for module_path in SOURCE_PATHS:
                 if isinstance(gen.target, ast.Name) and isinstance(gen.iter, (ast.List, ast.Tuple)):
                     if len(gen.iter.elts) == 1:
                         aliases[gen.target.id] = gen.iter.elts[0]
+    sanctioned_call_ids: set[int] = set()
     for node in ast.walk(module):
         if not isinstance(node, ast.Call):
             continue
@@ -578,6 +579,7 @@ for module_path in SOURCE_PATHS:
         if resolved is not None:
             if module_path.name == "hardware.py" and symbol == "_linux_eject":
                 _resolved_sites.append(EJECT_SITE)
+                sanctioned_call_ids.add(id(node))
             elif (
                 module_path.name == "hardware.py"
                 and symbol == "_run_command"
@@ -585,6 +587,7 @@ for module_path in SOURCE_PATHS:
                 and node.func.id == "_subprocess_run"
             ):
                 _resolved_sites.append(EJECT_SITE)
+                sanctioned_call_ids.add(id(node))
             else:
                 _resolved_sites.append((module_path.name, symbol, resolved))
         elif isinstance(node.func, ast.Name) and any(
@@ -593,6 +596,31 @@ for module_path in SOURCE_PATHS:
             raise AssertionError(
                 f"{module_path.name}: INDETERMINATE spawn-like callee {node.func.id!r}"
             )
+    # REFERENCE rule: a spawn callable may appear ONLY as the direct callee
+    # of an enumerated site.  Defaults, keyword/positional arguments,
+    # containers, returns, non-sanctioned assignments, decorators, partial()
+    # and getattr() arguments are all value uses and fail.
+    for node in ast.walk(module):
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            continue
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            continue
+        ref = _resolve_callee(
+            node, aliases, sub_modules, os_mods, asyncio_mods, from_names,
+        )
+        if ref is None or not ref.startswith(SPAWN_FAMILIES):
+            continue
+        parent = parents.get(id(node))
+        if (
+            isinstance(parent, ast.Call)
+            and parent.func is node
+            and id(parent) in sanctioned_call_ids
+        ):
+            continue
+        raise AssertionError(
+            f"{module_path.name}:{node.lineno}: spawn callable {ref!r} "
+            "used as a value outside an enumerated site"
+        )
 if len(set(_resolved_sites)) != 1 or set(_resolved_sites) != {EJECT_SITE}:
     raise AssertionError(
         f"resolved spawn sites != {{EJECT_SITE}}: {sorted(set(_resolved_sites))}"
