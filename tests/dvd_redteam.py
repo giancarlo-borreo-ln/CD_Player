@@ -11,22 +11,27 @@ Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 #     _subprocess_run (sanctioned alias) and _run_command (wrapper).  Alias
 #     chains are followed transitively (cycles rejected).  Adding, removing,
 #     renaming or moving a spawn path fails the audit, which names the diff.
-#   * spawn families: os.system/popen/exec*/spawn*/posix_spawn*/fork/forkpty,
-#     asyncio.create_subprocess_exec/shell, and any multiprocessing import are
-#     rejected in tainted modules.  No family is silently excluded.
+#   * the SAME rules apply to every module (no taint gating): subprocess may
+#     be imported only by hardware.py; any multiprocessing import is rejected;
+#     os.system/popen/exec*/spawn*/posix_spawn*/fork/forkpty and asyncio
+#     create_subprocess_exec/_shell (module or from-import form) are rejected
+#     everywhere.  No family is silently excluded.
 #   * each call site takes exactly one argv list, never shell=True and never a
 #     captured command string; the eject argv is [eject_bin, device].  The
 #     alias definition resolves to subprocess.run only through the literal
 #     sanctioned getattr; the wrapper takes a list[...] parameter and forwards
 #     it as one positional argument.
-#   * eval/exec/compile/__import__, and no dynamic-escape idioms in modules
-#     importing subprocess/os/shutil.
-# Deliberate exemptions, stated so the claims stay literal: ONLY the exact
-# path src/dvd_player/__init__.py is exempt (the facade that re-exports these
-# modules and owns the lazy loader; its sys.modules/globals use is legitimate,
-# and the audit asserts no other file inherits this).  hardware.py's
-# getattr(subprocess, "run") alias is the one sanctioned reflection, pinned to
-# the name _subprocess_run.
+#   * everywhere else: eval/exec/compile/__import__/importlib,
+#     __builtins__/__dict__/__getattribute__/__subclasses__/__globals__/
+#     vars/globals/locals, sys.modules, dynamic subscripts on a module alias,
+#     and non-ASCII identifiers are rejected.  from-imported classes (e.g.
+#     CompletedProcess[str]) are annotations, not dynamic module access.
+# The SINGLE exemption, asserted to be exactly one path, is the package facade
+# src/dvd_player/__init__.py: it re-exports subprocess/os/shutil and owns the
+# lazy loader, so its sys.modules/globals use is legitimate and sentinel-
+# covered; no subpackage __init__.py inherits it.  hardware.py's
+# getattr(subprocess, "run") remains the only sanctioned reflection, pinned to
+# the name _subprocess_run.  Every claim above has an assertion in this file.
 # It does NOT stop deliberate obfuscation, edits to this file, or runtime
 # behaviour outside section 0b's executed paths - hence the runtime sentinel.
 # ──────────────────────────────────────────────────────────────────────
@@ -103,7 +108,8 @@ for _parent in ast.walk(tree):
 
 SPAWN_ATTRS = {"run", "call", "Popen", "check_call", "check_output",
                "getoutput", "getstatusoutput"}
-SUBPROCESS_ATTRS = {"run", "SubprocessError", "TimeoutExpired", "CalledProcessError"}
+SUBPROCESS_ATTRS = {"run", "SubprocessError", "TimeoutExpired",
+                    "CalledProcessError", "CompletedProcess"}
 ALLOWED_SUBPROCESS_IMPORTS = SUBPROCESS_ATTRS | {"CompletedProcess"}
 banned_os = {"system", "popen", "fork", "forkpty",
              "posix_spawn", "posix_spawnp"}
@@ -238,20 +244,24 @@ for module_path in SOURCE_PATHS:
     name_edges: dict[str, str] = {}
     name_nodes: dict[str, ast.AST] = {}
     for node in ast.walk(module):
-        target = value = None
-        if isinstance(node, ast.Assign) and len(node.targets) == 1:
-            if isinstance(node.targets[0], ast.Name):
-                target, value = node.targets[0], node.value
+        targets: list[ast.Name] = []
+        value = None
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = [item for item in node.targets if isinstance(item, ast.Name)]
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            target, value = node.target, node.value
-        if target is None:
+            value = node.value
+            targets = [node.target]
+        if not targets:
             continue
         if _is_subprocess_attr_alias(value, modules) or _is_sanctioned_run_getattr(value, modules):
-            alias_names.add(target.id)
-            direct_aliases[target.id] = node
+            for target in targets:
+                alias_names.add(target.id)
+                direct_aliases[target.id] = node
         elif isinstance(value, ast.Name):
-            name_edges[target.id] = value.id
-            name_nodes[target.id] = node
+            for target in targets:
+                name_edges[target.id] = value.id
+                name_nodes[target.id] = node
     # Reject alias cycles (a = b; b = a) instead of looping forever.
     _visiting: set[str] = set()
     _done: set[str] = set()
@@ -510,103 +520,89 @@ for label, pattern in FORBIDDEN_TEXT:
 check(len(re.findall(r"\bsubprocess\.run\s*\(", code_only)) == 1)
 check("import pickle" not in code_only)
 check("import yaml" not in code_only and "from yaml" not in code_only)
-# ── Taint-scoped static rules ─────────────────────────────────────────
-# Modules that import subprocess/os/shutil get extra dynamic-escape bans;
-# modules that do not (the __init__ re-export/lazy-loader facade) are left
-# alone.  sys.modules is legitimate in that facade, so it is banned only here.
-PROCESS_MODULES = {"subprocess", "os", "shutil"}
-FORBIDDEN_TAINT_NAMES = {
+# ── Global static rules: one rule set for EVERY module ───────────────
+# No taint gating.  Every .py under src/dvd_player is checked; the single
+# exemption is the exact package facade path, asserted below.
+FACADE_PATH = (PKG / "__init__.py").resolve()
+EXEMPT_MODULES: list[Path] = []
+FORBIDDEN_NAMES = {
     "__builtins__", "__getattribute__", "__subclasses__", "__globals__",
     "vars", "globals", "locals",
 }
-FORBIDDEN_TAINT_ATTRS = {
+FORBIDDEN_ATTRS = {
     "__dict__", "__builtins__", "__getattribute__", "__subclasses__",
     "__globals__", "__call__", "__get__",
 }
-FACADE_PATH = (PKG / "__init__.py").resolve()
-EXEMPT_MODULES: list[Path] = []
 ASYNCIO_SPAWN = {"create_subprocess_exec", "create_subprocess_shell"}
 for module_path in SOURCE_PATHS:
     module_text = module_path.read_text(encoding="utf-8")
     module_tree = ast.parse(module_text)
+    if module_path.resolve() == FACADE_PATH:
+        EXEMPT_MODULES.append(module_path)
+        continue
     module_aliases: set[str] = set()
     sys_aliases: set[str] = {"sys"}
     asyncio_aliases: set[str] = {"asyncio"}
     asyncio_from: dict[str, str] = {}
-    multiprocessing_used = False
-    tainted = False
+    imports_subprocess = False
+    uses_multiprocessing = False
     for node in ast.walk(module_tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 top = alias.name.split(".")[0]
-                if top in PROCESS_MODULES:
-                    tainted = True
+                if top == "subprocess":
+                    imports_subprocess = True
+                    module_aliases.add(alias.asname or "subprocess")
+                elif top in {"os", "shutil"}:
                     module_aliases.add(alias.asname or top)
-                if top == "sys":
+                elif top == "sys":
                     sys_aliases.add(alias.asname or "sys")
-                if top == "asyncio":
+                elif top == "asyncio":
                     asyncio_aliases.add(alias.asname or "asyncio")
-                if top == "multiprocessing":
-                    multiprocessing_used = True
+                elif top == "multiprocessing":
+                    uses_multiprocessing = True
         elif isinstance(node, ast.ImportFrom) and node.module:
             top = node.module.split(".")[0]
-            if top in PROCESS_MODULES:
-                tainted = True
-            if top == "asyncio":
+            if top == "subprocess":
+                imports_subprocess = True
+            elif top == "asyncio":
                 for alias in node.names:
                     asyncio_from[alias.asname or alias.name] = alias.name
-            if top == "multiprocessing":
-                multiprocessing_used = True
-    # ONLY the exact package facade is exempt; a subpackage __init__.py does
-    # not inherit it.  The facade re-exports these modules and owns the lazy
-    # loader, so its sys.modules use is legitimate and sentinel-covered.
-    if module_path.resolve() == FACADE_PATH:
-        tainted = False
-        EXEMPT_MODULES.append(module_path)
-    if not tainted:
-        continue
-    if multiprocessing_used:
+            elif top == "multiprocessing":
+                uses_multiprocessing = True
+    if imports_subprocess and module_path.name != "hardware.py":
         raise AssertionError(
-            f"{module_path.name}: multiprocessing is forbidden in process-touching modules"
+            f"{module_path.name}: subprocess may only be imported by hardware.py"
         )
+    if uses_multiprocessing:
+        raise AssertionError(f"{module_path.name}: multiprocessing imports are forbidden")
     for node in ast.walk(module_tree):
         if isinstance(node, ast.Call):
-            _func = node.func
+            func = node.func
             if (
-                isinstance(_func, ast.Attribute)
-                and isinstance(_func.value, ast.Name)
-                and _func.value.id in asyncio_aliases
-                and _func.attr in ASYNCIO_SPAWN
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id in asyncio_aliases
+                and func.attr in ASYNCIO_SPAWN
             ):
-                raise AssertionError(
-                    f"{module_path.name}: forbidden asyncio.{_func.attr}"
-                )
-            if (
-                isinstance(_func, ast.Name)
-                and asyncio_from.get(_func.id) in ASYNCIO_SPAWN
-            ):
-                raise AssertionError(
-                    f"{module_path.name}: forbidden asyncio {_func.id}"
-                )
-        if isinstance(node, ast.Name) and node.id in FORBIDDEN_TAINT_NAMES:
-            raise AssertionError(
-                f"{module_path.name}: forbidden {node.id} in process-touching module"
-            )
+                raise AssertionError(f"{module_path.name}: forbidden asyncio.{func.attr}")
+            if isinstance(func, ast.Name) and asyncio_from.get(func.id) in ASYNCIO_SPAWN:
+                raise AssertionError(f"{module_path.name}: forbidden asyncio {func.id}")
+        if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+            raise AssertionError(f"{module_path.name}: forbidden {node.id}")
         if isinstance(node, ast.Attribute):
-            if node.attr in FORBIDDEN_TAINT_ATTRS:
-                raise AssertionError(
-                    f"{module_path.name}: forbidden .{node.attr} in process-touching module"
-                )
+            if node.attr in FORBIDDEN_ATTRS:
+                raise AssertionError(f"{module_path.name}: forbidden .{node.attr}")
             if (
                 node.attr == "modules"
                 and isinstance(node.value, ast.Name)
                 and node.value.id in sys_aliases
             ):
-                raise AssertionError(
-                    f"{module_path.name}: forbidden sys.modules in process-touching module"
-                )
+                raise AssertionError(f"{module_path.name}: forbidden sys.modules")
         if isinstance(node, ast.Subscript):
             base = node.value
+            # Only real module objects; from-imported classes such as
+            # CompletedProcess[str] are annotations, not dynamic module access.
             if isinstance(base, ast.Name) and base.id in module_aliases:
                 raise AssertionError(
                     f"{module_path.name}: dynamic subscript on module alias {base.id}"
@@ -617,7 +613,6 @@ for module_path in SOURCE_PATHS:
                 raise AssertionError(
                     f"{module_path.name}: non-ASCII identifier {value!r} (homoglyph?)"
                 )
-
 check(EXEMPT_MODULES == [PKG / "__init__.py"])
 
 # ════════════════════════════════════════════════════════════════════
