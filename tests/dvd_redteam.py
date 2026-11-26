@@ -108,21 +108,38 @@ EXPECTED_SOURCE_FILES = sorted([
     "__init__.py", "__main__.py", "app.py", "engine.py", "hardware.py",
     "identity.py", "mpris.py", "osd.py", "render.py", "state.py", "window.py",
 ])
+EXPECTED_DIRECTORIES = ["."]
 PACKAGE_ROOT = PKG.resolve()
-SOURCE_PATHS = sorted(PKG.rglob("*.py"))
+SOURCE_PATHS: list[Path] = []
+ACTUAL_DIRECTORIES: list[str] = []
+for _root, _dirs, _files in os.walk(PKG, followlinks=False):
+    _root_path = Path(_root)
+    _dirs[:] = sorted(item for item in _dirs if item != "__pycache__")
+    _files = sorted(_files)
+    _real_root = Path(os.path.realpath(_root_path)).resolve()
+    if _real_root != PACKAGE_ROOT and PACKAGE_ROOT not in _real_root.parents:
+        raise AssertionError(f"walk escaped package root: {_root_path} -> {_real_root}")
+    ACTUAL_DIRECTORIES.append(str(_root_path.relative_to(PKG)))
+    for _name in _dirs:
+        _entry = _root_path / _name
+        if _entry.is_symlink():
+            raise AssertionError(f"symlinked directory forbidden: {_entry}")
+    for _name in _files:
+        _entry = _root_path / _name
+        if _entry.is_symlink() or Path(os.path.realpath(_entry)).is_symlink():
+            raise AssertionError(f"symlinked file forbidden: {_entry}")
+        if _entry.suffix == ".py":
+            _real = Path(os.path.realpath(_entry)).resolve()
+            if _real != PACKAGE_ROOT and PACKAGE_ROOT not in _real.parents:
+                raise AssertionError(f"source path escapes package root: {_entry} -> {_real}")
+            SOURCE_PATHS.append(_entry)
 assert SOURCE_PATHS, "static audit scope is empty"
-for _path in SOURCE_PATHS:
-    if _path.is_symlink():
-        raise AssertionError(f"symlinked source file forbidden: {_path}")
-    _real = Path(os.path.realpath(_path)).resolve()
-    if _real != PACKAGE_ROOT and PACKAGE_ROOT not in _real.parents:
-        raise AssertionError(f"source path escapes package root: {_path} -> {_real}")
-    if _real.is_symlink():
-        raise AssertionError(f"symlinked source target forbidden: {_real}")
+SOURCE_PATHS.sort()
 ACTUAL_SOURCE_FILES = sorted(
     str(Path(os.path.realpath(path)).relative_to(PACKAGE_ROOT))
     for path in SOURCE_PATHS
 )
+check(ACTUAL_DIRECTORIES == sorted(EXPECTED_DIRECTORIES))
 check(ACTUAL_SOURCE_FILES == EXPECTED_SOURCE_FILES)
 source_text = "\n".join(path.read_text(encoding="utf-8") for path in SOURCE_PATHS)
 tree = ast.parse(source_text)
@@ -136,12 +153,23 @@ A7_CHARTER_TEXT = (
     "result asserts only that the enumerated static and executed dynamic "
     "checks passed, and does not prove the absence of process spawning."
 )
-_AUDIT_SOURCE = Path(os.environ.get("AUDIT_SOURCE", __file__))
+_AUDIT_SOURCE = Path(__file__).resolve()
 _normalized_self = " ".join(
     line[2:] if line.startswith("# ") else line
     for line in _AUDIT_SOURCE.read_text(encoding="utf-8").splitlines()
 )
 check(A7_CHARTER_TEXT in _normalized_self)
+# A7: no environment variable may redirect what the charter check reads.
+_ENV_TOKEN = "os." + "environ"
+_ENV_ALLOWED = _ENV_TOKEN + '.setdefault("QT_QPA_PLATFORM"'
+_env_lines = [
+    line.strip() for line in Path(__file__).read_text(encoding="utf-8").splitlines()
+    if _ENV_TOKEN in line
+]
+check(all(
+    line.startswith(_ENV_ALLOWED) or line == "**" + _ENV_TOKEN + ","
+    for line in _env_lines
+))
 
 # parent map, used to tell an attribute base / sanctioned reflection from a
 # module object being passed around as a value.
@@ -465,6 +493,30 @@ def _resolve_callee(
         if base in asyncio_mods and expr.attr in ASYNCIO_SPAWN:
             return "asyncio." + expr.attr
         return None
+    if isinstance(expr, ast.Subscript):
+        container = expr.value
+        if (
+            isinstance(container, (ast.List, ast.Tuple))
+            and isinstance(expr.slice, ast.Constant)
+            and isinstance(expr.slice.value, int)
+        ):
+            index = expr.slice.value
+            if -len(container.elts) <= index < len(container.elts):
+                return _resolve_callee(
+                    container.elts[index], aliases, sub_modules, os_mods,
+                    asyncio_mods, from_names, depth + 1,
+                )
+        return None
+    if isinstance(expr, ast.IfExp):
+        left = _resolve_callee(
+            expr.body, aliases, sub_modules, os_mods, asyncio_mods, from_names, depth + 1,
+        )
+        right = _resolve_callee(
+            expr.orelse, aliases, sub_modules, os_mods, asyncio_mods, from_names, depth + 1,
+        )
+        if left == right:
+            return left
+        return left or right  # a spawn on either branch is still a spawn
     if (
         isinstance(expr, ast.Call)
         and _dotted(expr.func) == "getattr"
@@ -541,6 +593,10 @@ for module_path in SOURCE_PATHS:
             raise AssertionError(
                 f"{module_path.name}: INDETERMINATE spawn-like callee {node.func.id!r}"
             )
+if len(set(_resolved_sites)) != 1 or set(_resolved_sites) != {EJECT_SITE}:
+    raise AssertionError(
+        f"resolved spawn sites != {{EJECT_SITE}}: {sorted(set(_resolved_sites))}"
+    )
 check(len(set(_resolved_sites)) == 1)
 check(set(_resolved_sites) == {EJECT_SITE})
 
@@ -722,6 +778,19 @@ FORBIDDEN_ATTRS = {
 }
 ASYNCIO_SPAWN = {"create_subprocess_exec", "create_subprocess_shell"}
 BANNED_IMPORTS = {"multiprocessing", "pty", "sh", "pexpect", "plumbum"}
+CTYPES_LOADERS = {"CDLL", "PyDLL", "WinDLL", "OleDLL", "LoadLibrary"}
+CTYPES_SPAWN_SYMBOLS = ("system", "exec", "fork", "posix_spawn", "popen", "_exit")
+
+
+def _is_ctypes_loader(call: ast.AST) -> bool:
+    if not isinstance(call, ast.Call) or _dotted(call.func).split(".")[-1] not in CTYPES_LOADERS:
+        return False
+    for arg in call.args:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, (str, bytes)):
+            text = arg.value.decode() if isinstance(arg.value, bytes) else arg.value
+            if "libc" in text.lower():
+                return True
+    return False
 MULTIPROCESSING_SPAWN = {"Process", "Pool", "ProcessPoolExecutor"}
 PTY_SPAWN = {"spawn", "fork", "openpty"}
 
@@ -738,6 +807,7 @@ for module_path in SOURCE_PATHS:
     asyncio_from: dict[str, str] = {}
     imports_subprocess_module = False
     uses_multiprocessing = False
+    ctypes_handles: set[str] = set()
     for node in ast.walk(module_tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -770,6 +840,11 @@ for module_path in SOURCE_PATHS:
             f"({', '.join(sorted(BANNED_IMPORTS))}) is forbidden"
         )
     for node in ast.walk(module_tree):
+        _value, _targets = _assignment_parts(node)
+        if _is_ctypes_loader(_value):
+            for _target in _targets:
+                ctypes_handles.add(_target.id)
+    for node in ast.walk(module_tree):
         if isinstance(node, ast.Call):
             func = node.func
             if (
@@ -781,15 +856,23 @@ for module_path in SOURCE_PATHS:
                 raise AssertionError(f"{module_path.name}: forbidden asyncio.{func.attr}")
             if isinstance(func, ast.Name) and asyncio_from.get(func.id) in ASYNCIO_SPAWN:
                 raise AssertionError(f"{module_path.name}: forbidden asyncio {func.id}")
-        if isinstance(node, ast.Call):
-            dotted = _dotted(node.func)
-            if dotted.endswith(("CDLL", "cdll.LoadLibrary", "LoadLibrary")):
-                for arg in node.args:
-                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                        if "libc" in arg.value.lower():
-                            raise AssertionError(
-                                f"{module_path.name}: ctypes libc spawn surface forbidden"
-                            )
+        if _is_ctypes_loader(node):
+            raise AssertionError(
+                f"{module_path.name}: ctypes libc spawn surface forbidden"
+            )
+        if isinstance(node, ast.Attribute) and any(
+            node.attr == symbol or node.attr.startswith(symbol + "_")
+            for symbol in CTYPES_SPAWN_SYMBOLS
+        ):
+            _handle = (
+                isinstance(node.value, ast.Name) and node.value.id in ctypes_handles
+            )
+            _direct = any(_is_ctypes_loader(item) for item in ast.walk(node.value))
+            if _handle or _direct:
+                raise AssertionError(
+                    f"{module_path.name}: ctypes handle exposes spawn symbol "
+                    f"{(node.attr)!r}"
+                )
         if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
             raise AssertionError(f"{module_path.name}: forbidden {node.id}")
         if isinstance(node, ast.Attribute):
