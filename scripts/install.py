@@ -497,7 +497,8 @@ def main(argv: list[str] | None = None) -> int:
 
     code = run(args)
 
-    if args.pause:
+    # Only a real terminal can answer: a piped or closed stdin must never block.
+    if args.pause and sys.stdin.isatty():
         try:
             input("\nPress Enter to close...")
         except EOFError:

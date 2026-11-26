@@ -3,7 +3,26 @@
 # Wrong OS is refused with exit code 2; missing Python exits 1.
 set -eu
 
-REPO_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Resolve the physical script path through symlinks (POSIX: macOS readlink has
+# no -f). Works from any cwd and with spaces/unicode in the path.
+SCRIPT=$0
+while [ -h "$SCRIPT" ]; do
+    LINK_DIR=$(CDPATH= cd -P "$(dirname "$SCRIPT")" && pwd)
+    if command -v readlink >/dev/null 2>&1; then
+        TARGET=$(readlink "$SCRIPT") || break
+    elif [ -x /usr/bin/readlink ]; then
+        TARGET=$(/usr/bin/readlink "$SCRIPT") || break
+    elif [ -x /bin/readlink ]; then
+        TARGET=$(/bin/readlink "$SCRIPT") || break
+    else
+        break
+    fi
+    case $TARGET in
+        /*) SCRIPT=$TARGET ;;
+        *) SCRIPT=$LINK_DIR/$TARGET ;;
+    esac
+done
+REPO_DIR=$(CDPATH= cd -P "$(dirname "$SCRIPT")" && pwd)
 OS_NAME=$(uname -s 2>/dev/null || echo unknown)
 
 case "$OS_NAME" in
