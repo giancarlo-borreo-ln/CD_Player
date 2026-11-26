@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import contextlib
 import importlib.util
+import io
 import os
 import sys
 import tempfile
@@ -133,6 +135,69 @@ def test_manifest_hash_well_formed() -> None:
     check(entry["status"] == "pinned")
     check(len(entry["sha256"]) == 64)
     int(entry["sha256"], 16)
+    check(entry["github_asset_digest"] == entry["sha256"])
+    names = [
+        dep["name"]
+        for deps in manifest["deps"].values()
+        for dep in deps
+    ]
+    check(not any("dvdcss" in name.lower() for name in names))
+
+
+def _fake_winget_libmpv(payload: bytes) -> tuple[bool, install.Report, list[list[str]], str]:
+    root = Path(tempfile.mkdtemp())
+    local = root / "local"
+    package = local / "Microsoft" / "WinGet" / "Packages" / "shinchiro.mpv_1"
+    package.mkdir(parents=True)
+    (package / "libmpv-2.dll").write_bytes(payload)
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], cwd: Path | None = None, capture: bool = False):
+        calls.append(list(argv))
+        return install.subprocess.CompletedProcess(argv, 0, "", "")
+
+    old_run, old_which = install.run_argv, install.shutil.which
+    old_consent = install.consent
+    old_env = os.environ.get("LOCALAPPDATA")
+    output = io.StringIO()
+    try:
+        install.run_argv = fake_run
+        install.shutil.which = lambda name: "winget" if name == "winget" else None
+        install.consent = lambda assume, message: True
+        os.environ["LOCALAPPDATA"] = str(local)
+        report = install.Report()
+        with contextlib.redirect_stdout(output):
+            ok = install.install_windows_native(report, True, None)
+    finally:
+        install.run_argv, install.shutil.which = old_run, old_which
+        install.consent = old_consent
+        if old_env is None:
+            os.environ.pop("LOCALAPPDATA", None)
+        else:
+            os.environ["LOCALAPPDATA"] = old_env
+    return ok, report, calls, output.getvalue()
+
+
+def test_bundled_libdvdcss_reports_ok() -> None:
+    ok, report, calls, output = _fake_winget_libmpv(
+        b"prefix-DVDCSS_METHOD-suffix"
+    )
+    check(ok)
+    check(report.failures == 0)
+    check(report.warnings == 0)
+    check("bundled in libmpv" in output)
+    check(all("dvdcss" not in " ".join(call).lower() for call in calls))
+    check(all(call[0] != sys.executable for call in calls))
+
+
+def test_missing_dvdcss_marker_warns_once_without_fetch() -> None:
+    ok, report, calls, output = _fake_winget_libmpv(b"plain libmpv bytes")
+    check(ok)
+    check(report.failures == 0)
+    check(report.warnings == 1)
+    check("--dvdcss PATH" in output)
+    check(all("dvdcss" not in " ".join(call).lower() for call in calls))
+    check(all(call[0] != sys.executable for call in calls))
 
 
 def test_bootstrap_consent_defaults_true_without_prompt() -> None:
@@ -292,7 +357,7 @@ def test_native_failure_aborts_before_install_tool() -> None:
         install.ensure_python = lambda report, ask: True
         install.check_python = lambda report: True
         install.ensure_uv = lambda report, ask: True
-        install.install_native = lambda report, ask, offline: False
+        install.install_native = lambda report, ask, offline, dvdcss=None: False
         install.install_tool = lambda report, offline: calls.append("tool") or True
         check(install.run(_install_args()) == 1)
         check(calls == [])
@@ -374,6 +439,8 @@ for test in (
     test_required_native_failure_is_hard,
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
+    test_bundled_libdvdcss_reports_ok,
+    test_missing_dvdcss_marker_warns_once_without_fetch,
 ):
     test()
 

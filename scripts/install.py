@@ -31,6 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 MIN_PYTHON = (3, 12)
 FETCH_DEPS = Path(__file__).resolve().parent / "fetch_deps.py"
 TOOL_NAME = "dvd-player"
+# shinchiro's libmpv-2.dll statically links libdvdcss; the marker proves it.
+DVDCSS_MARKER = b"DVDCSS_METHOD"
 
 # Set from --platform so the launchers and the Windows .exe can force a branch
 # even when the interpreter reports a different sys.platform (e.g. MSYS).
@@ -121,9 +123,9 @@ def hint_libdvdcss() -> str:
     distro = distro_family()
     if key == "windows":
         return (
-            "experimental: CSS decryption needs libdvdcss-2.dll from the VideoLAN "
-            "project in %LOCALAPPDATA%\\dvd-player\\lib or the venv's Scripts "
-            "directory (or on PATH); unencrypted discs work without it."
+            "the pinned libmpv-2.dll bundles libdvdcss (DVDCSS_METHOD); if a "
+            "different libmpv is used, supply --dvdcss PATH to a libdvdcss-2.dll "
+            "you trust. Unencrypted discs work without it."
         )
     if key == "macos":
         return "brew install libdvdcss"
@@ -177,6 +179,7 @@ class Report:
     def __init__(self) -> None:
         self.failures = 0
         self.warnings = 0
+        self.dvdcss_checked = False
 
     def ok(self, title: str, detail: str = "") -> None:
         print(f"  [ok]   {title}" + (f" — {detail}" if detail else ""))
@@ -347,6 +350,53 @@ def check_native(report: Report, names: tuple[str, ...], label: str, hint: str, 
         report.fail(f"{label} not found", hint)
     else:
         report.warn(f"{label} not found (optional)", hint)
+
+
+def contains_marker(path: str | Path, marker: bytes = DVDCSS_MARKER) -> bool:
+    """Scan a file (1 MiB chunks) for marker, tolerating chunk boundaries."""
+    try:
+        with open(path, "rb") as handle:
+            tail = b""
+            while chunk := handle.read(1024 * 1024):
+                if marker in tail + chunk:
+                    return True
+                tail = chunk[-(len(marker) - 1):]
+    except OSError:
+        return False
+    return False
+
+
+def report_windows_dvdcss(
+    report: Report, libmpv: str | Path | None, dvdcss: str | None = None
+) -> None:
+    """Report CSS support once: bundled, user-supplied, or a single warning."""
+    if report.dvdcss_checked:
+        return
+    report.dvdcss_checked = True
+    if dvdcss:
+        supplied = Path(dvdcss).expanduser()
+        if not supplied.is_file():
+            report.warn(
+                f"libdvdcss file not found: {supplied}",
+                "pass --dvdcss PATH with a libdvdcss-2.dll you built or trust; "
+                "nothing unverified is downloaded.",
+            )
+        elif not contains_marker(supplied):
+            report.warn(
+                f"libdvdcss supplied file lacks DVDCSS_METHOD: {supplied}",
+                "verify it is a real libdvdcss-2.dll, then re-run with --dvdcss PATH.",
+            )
+        else:
+            report.ok("libdvdcss", f"user-supplied {supplied}")
+        return
+    if libmpv is not None and contains_marker(libmpv):
+        report.ok("libdvdcss", "bundled in libmpv")
+        return
+    report.warn(
+        "libdvdcss not bundled in libmpv",
+        "encrypted DVDs need a user-supplied libdvdcss-2.dll: re-run with "
+        "--dvdcss PATH. Nothing unverified is downloaded.",
+    )
 
 
 def platform_linux(report: Report) -> None:
@@ -1095,7 +1145,9 @@ def find_libmpv_dll() -> Path | None:
     return None
 
 
-def install_windows_native(report: Report, ask: bool, offline: Path | None) -> bool:
+def install_windows_native(
+    report: Report, ask: bool, offline: Path | None, dvdcss: str | None = None
+) -> bool:
     """Prefer winget's verified mpv; pinned archive is the fallback only."""
     winget = shutil.which("winget")
     if offline is None and winget is not None:
@@ -1114,6 +1166,7 @@ def install_windows_native(report: Report, ask: bool, offline: Path | None) -> b
                 found = find_libmpv_dll()
                 if found is not None:
                     report.ok("libmpv", str(found))
+                    report_windows_dvdcss(report, found, dvdcss)
                     return True
                 report.warn(
                     f"winget package {package} did not provide libmpv-2.dll",
@@ -1134,7 +1187,7 @@ def install_windows_native(report: Report, ask: bool, offline: Path | None) -> b
             )
             return False
     if not consent(
-        ask, "download and verify the pinned libmpv/libdvdcss archive?"
+        ask, "download and verify the pinned libmpv archive?"
     ):
         report.fail("Windows native library install declined", hint_libmpv())
         return False
@@ -1142,21 +1195,27 @@ def install_windows_native(report: Report, ask: bool, offline: Path | None) -> b
     if offline is not None:
         argv += ["--offline", str(offline)]
     result = run_argv(argv)
-    if result.returncode != 0 and find_libmpv_dll() is None:
+    found = find_libmpv_dll()
+    if result.returncode != 0 and found is None:
         report.fail(
             "Windows native libraries not installed",
             "fetch_deps.py refused or failed (see per-URL errors above); "
             "nothing unverified was written",
         )
         return False
+    if found is not None:
+        report.ok("libmpv", str(found))
+        report_windows_dvdcss(report, found, dvdcss)
     return True
 
 
-def install_native(report: Report, ask: bool, offline: Path | None) -> bool:
+def install_native(
+    report: Report, ask: bool, offline: Path | None, dvdcss: str | None = None
+) -> bool:
     """Install libmpv/libdvdcss: package managers, or pinned fetch on Windows."""
     key = current_os()
     if key == "windows":
-        return install_windows_native(report, ask, offline)
+        return install_windows_native(report, ask, offline, dvdcss)
 
     if key == "macos":
         cmd = ["brew", "install"]
@@ -1586,6 +1645,15 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="use pre-downloaded dependencies from DIR; no network access",
     )
+    parser.add_argument(
+        "--dvdcss",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Windows only: user-supplied libdvdcss-2.dll for encrypted DVDs "
+            "(overrides the bundled-marker check; no download is attempted)"
+        ),
+    )
     args = parser.parse_args(argv)
     args.mode = args.mode or "install"
     _OS_OVERRIDE = normalize_platform(args.platform)
@@ -1633,6 +1701,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"will play: {kind} {shown}")
 
     offline = Path(args.offline).expanduser().resolve() if args.offline else None
+    dvdcss = getattr(args, "dvdcss", None)
     mode = getattr(args, "mode", "check")
     report = Report()
 
@@ -1656,7 +1725,7 @@ def run(args: argparse.Namespace) -> int:
     installed_tool = False
     if mode == "install":
         if uv_ok:
-            if not install_native(report, args.ask, offline):
+            if not install_native(report, args.ask, offline, dvdcss):
                 print("\nResult: FAIL — required native dependency install failed.")
                 return 1
             installed_tool = install_tool(report, offline)
@@ -1674,8 +1743,16 @@ def run(args: argparse.Namespace) -> int:
 
     report.section("Native libraries")
     mpv_names, dvdcss_names, dvdnav_names = native_names()
-    check_native(report, mpv_names, "libmpv", hint_libmpv(), hard=True)
-    check_native(report, dvdcss_names, "libdvdcss", hint_libdvdcss(), hard=False)
+    if key == "windows":
+        mpv_path = find_libmpv_dll() or find_any(mpv_names)
+        if mpv_path:
+            report.ok("libmpv", str(mpv_path))
+            report_windows_dvdcss(report, mpv_path, dvdcss)
+        else:
+            report.fail("libmpv not found", hint_libmpv())
+    else:
+        check_native(report, mpv_names, "libmpv", hint_libmpv(), hard=True)
+        check_native(report, dvdcss_names, "libdvdcss", hint_libdvdcss(), hard=False)
     check_native(report, dvdnav_names, "libdvdnav", hint_libdvdnav(), hard=False)
 
     PLATFORMS.get(key, platform_other)(report)

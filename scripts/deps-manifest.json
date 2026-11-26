@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "note": "Pinned Windows runtime libraries. An entry is installable only when sha256 is a 64-hex digest. libmpv is pinned to the shinchiro 20261111 mpv-dev-x86_64 archive. libdvdcss is optional and unverified: VideoLAN publishes no Windows DLL with a checksum, so CSS/encrypted discs stay experimental until a locally built DLL is supplied via --offline with a pinned hash.",
+  "note": "Pinned Windows runtime libraries. An entry is installable only when sha256 is a 64-hex digest. The amd64 libmpv is pinned to the shinchiro 20261111 mpv-dev-x86_64 archive, and its SHA-256 matches GitHub's published release asset digest. That libmpv statically bundles libdvdcss (DVDCSS_METHOD), so encrypted DVDs need no separate download.",
   "deps": {
     "windows-amd64": [
       {
@@ -12,16 +12,9 @@
         "required": true,
         "project": "shinchiro/mpv-winbuild-cmake",
         "verified_at": "2026-11-26",
-        "verified_by": "GET content-length 31776374; sha256 of body matches"
-      },
-      {
-        "name": "libdvdcss-2.dll",
-        "url": "https://download.videolan.org/pub/videolan/libdvdcss/1.6.0/libdvdcss-1.6.0.tar.xz",
-        "sha256": null,
-        "status": "unverified",
-        "required": false,
-        "project": "VideoLAN libdvdcss",
-        "note": "VideoLAN publishes source only; no official Windows DLL with a published checksum. Build libdvdcss-2.dll locally and pin its SHA-256, or use --offline."
+        "verified_by": "GET content-length 31776374; sha256 of body matches",
+        "github_asset_digest": "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452",
+        "digest_note": "GitHub release asset digest confirmed to match the pinned sha256 (2026-11-26); libdvdcss is statically bundled."
       }
     ],
     "windows-arm64": [

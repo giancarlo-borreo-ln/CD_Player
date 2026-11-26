@@ -74,6 +74,7 @@ call the script directly:
 python3 scripts/install.py            # detect the OS + `uv sync`
 python3 scripts/install.py --no-sync  # verify an existing environment
 python3 scripts/install.py --ask      # prompt before installing anything
+python3 scripts/install.py --dvdcss PATH  # Windows: trust a local libdvdcss-2.dll
 uv run dvd-player                     # auto-boots any disc in the drive
 uv run dvd-player /path/to/movie.iso
 uv run dvd-player /path/to/VIDEO_TS
@@ -140,12 +141,17 @@ Python 3.12+ with winget unattended; add `--ask` to be prompted first.
 |---|---|---|
 | Linux | Checks the `optical` group and `sg` module, prints distro packages and the desktop entry | **Full** support |
 | macOS | Checks Homebrew, prints `brew install mpv libdvdnav libdvdcss` and the `DYLD_FALLBACK_LIBRARY_PATH` hint | **Experimental** |
-| Windows | Checks the Python/uv install and locates `libmpv-2.dll`, `dvdnav.dll` and `libdvdcss-2.dll` via `ctypes.util.find_library` and known DLL directories | **Experimental** |
+| Windows | Checks the Python/uv install and locates `libmpv-2.dll` and `dvdnav.dll` via `ctypes.util.find_library` and known DLL directories; scans the DLL for `DVDCSS_METHOD` | **Experimental** |
 
 > **Experimental support (macOS/Windows):** ISO and `VIDEO_TS` folder playback
 > work; the optical device/disc layer (drive discovery, eject, auto-boot on
-> insert) is Linux-specific and is still being ported. libdvdnav and libdvdcss
-> are reported as warnings because mpv often bundles them.
+> insert) is Linux-specific and is still being ported. On Windows the pinned
+> `libmpv-2.dll` statically bundles libdvdcss, so encrypted/commercial DVDs
+> are supported with libmpv alone; the installer confirms this by scanning the
+> DLL for `DVDCSS_METHOD`. If you use a different libmpv, pass
+> `--dvdcss PATH` to supply your own trusted `libdvdcss-2.dll`. Hardware
+> combinations are not exhaustively tested, so treat Windows drive support as
+> experimental.
 
 Exit code is `0` when the player is ready and `1` when a hard dependency is
 missing or `--disc` is invalid; `2` is reserved for wrong-platform launchers
@@ -262,7 +268,7 @@ discs, keyed by a per-disc hash).
 |---|---|
 | "no read permission on /dev/sr0 … add the user to the 'optical' group" | `sudo usermod -aG optical $USER`, re-login |
 | "kernel module 'sg' is not loaded" | `sudo modprobe sg` (see above) |
-| "libdvdcss not found: encrypted DVDs cannot be decrypted" | `sudo pacman -S libdvdcss` |
+| "libdvdcss not found: encrypted DVDs cannot be decrypted" | Linux: `sudo pacman -S libdvdcss`; Windows: the pinned libmpv bundles it, or pass `--dvdcss PATH` |
 | "libdvdnav not found" — menus/navigation unavailable | `sudo pacman -S libdvdnav` (Debian/Ubuntu: `libdvdnav4`) |
 | No device listed / disc not detected | Drive not seen by the kernel: check `lsblk`, `lsusb`, `dmesg \| grep -i cdrom`; for USB drives, replug; internal drives may be disabled in BIOS/UEFI |
 | Tray won't eject | Permissions (optical group) or the drive is mounted: unmount it first |
