@@ -4,6 +4,7 @@ Run: python3 tests/dvd_installer_full.py
 """
 from __future__ import annotations
 
+import argparse
 import builtins
 import importlib.util
 import os
@@ -211,6 +212,153 @@ def test_windows_native_ask_prompts_on_missing_mpv() -> None:
         install.shutil.which, install.is_tty, builtins.input = old_which, old_tty, old_input
 
 
+def _uninstall_args(purge: bool = False, yes: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(
+        mode="uninstall", purge=purge, yes=yes, ask=False, disc=None, offline=None
+    )
+
+
+def test_non_tty_default_mode_is_install() -> None:
+    old_tty, old_run = install.is_tty, install.run
+    seen: list[str] = []
+
+    def fake_run(args: argparse.Namespace) -> int:
+        seen.append(args.mode)
+        return 0
+
+    try:
+        install.is_tty = lambda: False
+        install.run = fake_run
+        check(install.main([]) == 0)
+        check(seen == ["install"])
+    finally:
+        install.is_tty, install.run = old_tty, old_run
+
+
+def test_uninstall_non_tty_requires_yes() -> None:
+    old_tty, old_uninstall = install.is_tty, install.uninstall
+    calls: list[bool] = []
+
+    def fake_uninstall(report: object, purge: bool) -> int:
+        calls.append(purge)
+        return 0
+
+    try:
+        install.is_tty = lambda: False
+        install.uninstall = fake_uninstall
+        check(install.run(_uninstall_args(purge=True, yes=False)) == 1)
+        check(calls == [])
+        check(install.run(_uninstall_args(purge=True, yes=True)) == 0)
+        check(calls == [True])
+    finally:
+        install.is_tty, install.uninstall = old_tty, old_uninstall
+
+
+def test_uninstall_tty_always_confirms_even_with_yes() -> None:
+    old_tty, old_input, old_uninstall = install.is_tty, builtins.input, install.uninstall
+    calls: list[bool] = []
+
+    def fake_uninstall(report: object, purge: bool) -> int:
+        calls.append(purge)
+        return 0
+
+    try:
+        install.is_tty = lambda: True
+        install.uninstall = fake_uninstall
+        builtins.input = lambda prompt: "n"
+        check(install.run(_uninstall_args(purge=False, yes=True)) == 1)
+        check(calls == [])
+        builtins.input = lambda prompt: "y"
+        check(install.run(_uninstall_args(purge=False, yes=True)) == 0)
+        check(calls == [False])
+    finally:
+        install.is_tty, builtins.input, install.uninstall = old_tty, old_input, old_uninstall
+
+
+def _install_args() -> argparse.Namespace:
+    return argparse.Namespace(
+        mode="install", purge=False, yes=False, ask=False, disc=None,
+        offline=None, no_sync=False,
+    )
+
+
+def test_native_failure_aborts_before_install_tool() -> None:
+    old = (
+        install.ensure_python, install.check_python, install.ensure_uv,
+        install.install_native, install.install_tool,
+    )
+    calls: list[str] = []
+    try:
+        install.ensure_python = lambda report, ask: True
+        install.check_python = lambda report: True
+        install.ensure_uv = lambda report, ask: True
+        install.install_native = lambda report, ask, offline: False
+        install.install_tool = lambda report, offline: calls.append("tool") or True
+        check(install.run(_install_args()) == 1)
+        check(calls == [])
+    finally:
+        (
+            install.ensure_python, install.check_python, install.ensure_uv,
+            install.install_native, install.install_tool,
+        ) = old
+
+
+def _native_stubs(rc_for_optional: int):
+    old = (
+        install.current_os, install.distro_family, install.shutil.which,
+        install.run_argv, install.with_privilege, install.consent,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(argv: list[str], cwd: Path | None = None, capture: bool = False):
+        calls.append(list(argv))
+        rc = rc_for_optional if "libdvdcss2" in argv else 0
+        return install.subprocess.CompletedProcess(argv, rc, "", "")
+
+    install.current_os = lambda: "linux"
+    install.distro_family = lambda: "debian"
+    install.shutil.which = lambda name: "/usr/bin/apt-get" if name == "apt-get" else None
+    install.run_argv = fake_run
+    install.with_privilege = lambda argv: argv
+    install.consent = lambda ask, message: True
+    return old, calls
+
+
+def _restore_native_stubs(old: tuple) -> None:
+    (
+        install.current_os, install.distro_family, install.shutil.which,
+        install.run_argv, install.with_privilege, install.consent,
+    ) = old
+
+
+def test_optional_libdvdcss_failure_is_warning_only() -> None:
+    old, calls = _native_stubs(rc_for_optional=100)
+    try:
+        report = install.Report()
+        check(install.install_native(report, False, None) is True)
+        check(report.failures == 0)
+        check(report.warnings == 1)
+        check(len(calls) == 2)
+        check("libdvdcss2" not in calls[1])
+    finally:
+        _restore_native_stubs(old)
+
+
+def test_required_native_failure_is_hard() -> None:
+    old, calls = _native_stubs(rc_for_optional=0)
+    try:
+        install.run_argv = lambda argv, cwd=None, capture=False: (
+            calls.append(list(argv))
+            or install.subprocess.CompletedProcess(argv, 100, "", "")
+        )
+        report = install.Report()
+        check(install.install_native(report, False, None) is False)
+        check(report.failures == 1)
+        check(len(calls) == 2)
+    finally:
+        _restore_native_stubs(old)
+
+
 for test in (
     test_winget_preferred_without_7z,
     test_no_winget_no_extractor_fails_closed,
@@ -218,6 +366,12 @@ for test in (
     test_bootstrap_ask_prompts,
     test_windows_native_missing_stubs_does_not_prompt,
     test_windows_native_ask_prompts_on_missing_mpv,
+    test_non_tty_default_mode_is_install,
+    test_uninstall_non_tty_requires_yes,
+    test_uninstall_tty_always_confirms_even_with_yes,
+    test_native_failure_aborts_before_install_tool,
+    test_optional_libdvdcss_failure_is_warning_only,
+    test_required_native_failure_is_hard,
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
 ):

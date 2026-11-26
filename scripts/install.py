@@ -842,6 +842,28 @@ def consent(ask: bool, message: str) -> bool:
     return True
 
 
+def confirm_destructive(assume_yes: bool, message: str) -> bool:
+    """Guard destructive actions: always prompt on a TTY, else require --yes."""
+    if is_tty():
+        try:
+            answer = input(f"{message} [y/N] ").strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("y", "yes"):
+            print("[refuse] declined; nothing was removed", file=sys.stderr)
+            return False
+        return True
+    if assume_yes:
+        print(f"[consent] --yes: {message}")
+        return True
+    print(
+        "[refuse] refusing to remove anything without confirmation; "
+        "re-run with --yes for unattended uninstall",
+        file=sys.stderr,
+    )
+    return False
+
+
 def run_argv(
     argv: list[str], cwd: Path | None = None, capture: bool = False
 ) -> subprocess.CompletedProcess[str]:
@@ -1137,38 +1159,46 @@ def install_native(report: Report, ask: bool, offline: Path | None) -> bool:
         return install_windows_native(report, ask, offline)
 
     if key == "macos":
-        argv = ["brew", "install", "mpv", "libdvdnav", "libdvdcss"]
+        cmd = ["brew", "install"]
+        required_pkgs = ["mpv", "libdvdnav"]
+        optional_pkgs = ["libdvdcss"]
     elif key == "linux":
         if distro_family() == "arch":
-            argv = [
-                "pacman", "-S", "--needed", "--noconfirm",
-                "mpv", "libdvdnav", "libdvdread", "libdvdcss",
-            ]
+            cmd = ["pacman", "-S", "--needed", "--noconfirm"]
+            required_pkgs = ["mpv", "libdvdnav", "libdvdread"]
+            optional_pkgs = ["libdvdcss"]
         elif distro_family() == "debian":
-            argv = [
-                "apt-get", "install", "-y",
-                "mpv", "libmpv2", "libdvdnav4", "libdvdread8", "libdvdcss2",
-            ]
+            cmd = ["apt-get", "install", "-y"]
+            required_pkgs = ["mpv", "libmpv2", "libdvdnav4", "libdvdread8"]
+            optional_pkgs = ["libdvdcss2"]
         else:
-            report.warn("native package install skipped", hint_libmpv())
+            report.fail("native package install skipped", hint_libmpv())
             return False
     else:
-        report.warn("native package install skipped", "unsupported platform")
+        report.fail("native package install skipped", "unsupported platform")
         return False
     if offline is not None:
         print("  offline: skipping package manager; using already-installed libraries")
         return True
-    if shutil.which(argv[0]) is None:
-        report.fail(f"{argv[0]} not found", f"install the libraries manually: {hint_libmpv()}")
+    if shutil.which(cmd[0]) is None:
+        report.fail(f"{cmd[0]} not found", f"install the libraries manually: {hint_libmpv()}")
         return False
-    argv = with_privilege(argv)
-    if not consent(ask, f"install native libraries with {' '.join(argv)}?"):
+    required = with_privilege([*cmd, *required_pkgs])
+    if not consent(ask, f"install native libraries with {' '.join(required)}?"):
         report.fail("native library install declined", hint_libmpv())
         return False
-    result = run_argv(argv)
+    result = run_argv([*required, *optional_pkgs])
     if result.returncode != 0:
-        report.fail("native library install failed", f"{' '.join(argv)} exited {result.returncode}")
-        return False
+        # Optional libdvdcss must never block the required libmpv install.
+        print("  retrying without the optional libdvdcss package")
+        result = run_argv(required)
+        if result.returncode != 0:
+            report.fail(
+                "native library install failed",
+                f"{' '.join(required)} exited {result.returncode}",
+            )
+            return False
+        report.warn("libdvdcss not installed (optional)", hint_libdvdcss())
     return True
 
 
@@ -1519,14 +1549,14 @@ def main(argv: list[str] | None = None) -> int:
         dest="mode",
         action="store_const",
         const="install",
-        help="install/bootstrap everything (default when stdin is a terminal)",
+        help="install/bootstrap everything (default, even without a terminal)",
     )
     mode.add_argument(
         "--check",
         dest="mode",
         action="store_const",
         const="check",
-        help="verify only, make no changes (default when stdin is not a terminal)",
+        help="verify only, make no changes",
     )
     mode.add_argument(
         "--uninstall",
@@ -1557,7 +1587,7 @@ def main(argv: list[str] | None = None) -> int:
         help="use pre-downloaded dependencies from DIR; no network access",
     )
     args = parser.parse_args(argv)
-    args.mode = args.mode or ("install" if is_tty() else "check")
+    args.mode = args.mode or "install"
     _OS_OVERRIDE = normalize_platform(args.platform)
     global _RAW_ARGV, _BOOTSTRAPPED
     _RAW_ARGV = list(sys.argv[1:] if argv is None else argv)
@@ -1607,6 +1637,12 @@ def run(args: argparse.Namespace) -> int:
     report = Report()
 
     if mode == "uninstall":
+        action = "uninstall dvd-player"
+        if args.purge:
+            action += " and purge its config/state"
+        if not confirm_destructive(args.yes, f"This will {action}. Continue?"):
+            print("\nResult: FAIL — uninstall cancelled; nothing was removed.")
+            return 1
         return uninstall(report, args.purge)
 
     if not ensure_python(report, args.ask):
@@ -1620,7 +1656,9 @@ def run(args: argparse.Namespace) -> int:
     installed_tool = False
     if mode == "install":
         if uv_ok:
-            install_native(report, args.ask, offline)
+            if not install_native(report, args.ask, offline):
+                print("\nResult: FAIL — required native dependency install failed.")
+                return 1
             installed_tool = install_tool(report, offline)
         else:
             report.warn("install skipped", "uv is required to install dvd-player")
