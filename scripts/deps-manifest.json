@@ -16,17 +16,6 @@
         "github_asset_digest": "273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452",
         "digest_note": "GitHub release asset digest confirmed to match the pinned sha256 (2026-11-26); libdvdcss is statically bundled."
       }
-    ],
-    "windows-arm64": [
-      {
-        "name": "libmpv-2.dll",
-        "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-aarch64-20261111-git-bcde6b93cc.7z",
-        "sha256": null,
-        "status": "unverified",
-        "member": "libmpv-2.dll",
-        "required": true,
-        "project": "shinchiro/mpv-winbuild-cmake"
-      }
     ]
   }
 }

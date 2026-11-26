@@ -142,6 +142,16 @@ def test_manifest_hash_well_formed() -> None:
         for dep in deps
     ]
     check(not any("dvdcss" in name.lower() for name in names))
+    check(
+        not any(dep.get("status") == "unverified" for deps in manifest["deps"].values() for dep in deps)
+    )
+    check(
+        not any(
+            "dvdcss" in (dep.get("url") or "").lower()
+            for deps in manifest["deps"].values()
+            for dep in deps
+        )
+    )
 
 
 def _fake_winget_libmpv(payload: bytes) -> tuple[bool, install.Report, list[list[str]], str]:
