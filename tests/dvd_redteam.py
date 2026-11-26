@@ -8,20 +8,25 @@ Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 # code committed to src/dvd_player it checks, over EVERY **/*.py recursively:
 #   * the set of process-spawn sites equals EXPECTED_SPAWN_SITES exactly -
 #     three enumerated sites in hardware.py: _linux_eject (literal run),
-#     _subprocess_run (sanctioned alias) and _run_command (wrapper).  Adding,
-#     removing or moving a spawn path fails the audit, which names the diff.
+#     _subprocess_run (sanctioned alias) and _run_command (wrapper).  Alias
+#     chains are followed transitively (cycles rejected).  Adding, removing,
+#     renaming or moving a spawn path fails the audit, which names the diff.
+#   * spawn families: os.system/popen/exec*/spawn*/posix_spawn*/fork/forkpty,
+#     asyncio.create_subprocess_exec/shell, and any multiprocessing import are
+#     rejected in tainted modules.  No family is silently excluded.
 #   * each call site takes exactly one argv list, never shell=True and never a
 #     captured command string; the eject argv is [eject_bin, device].  The
 #     alias definition resolves to subprocess.run only through the literal
 #     sanctioned getattr; the wrapper takes a list[...] parameter and forwards
 #     it as one positional argument.
-#   * no os.system/popen/exec*/spawn*, eval/exec/compile/__import__, no
-#     dynamic-escape idioms in modules importing subprocess/os/shutil.
-# Deliberate exemptions, stated so the claims stay literal: the package
-# facade __init__.py imports those modules only to re-export them and owns the
-# lazy loader (its sys.modules/globals use is legitimate, so it is untainted);
-# hardware.py's getattr(subprocess, "run") alias is the one sanctioned
-# reflection, pinned to the name _subprocess_run.
+#   * eval/exec/compile/__import__, and no dynamic-escape idioms in modules
+#     importing subprocess/os/shutil.
+# Deliberate exemptions, stated so the claims stay literal: ONLY the exact
+# path src/dvd_player/__init__.py is exempt (the facade that re-exports these
+# modules and owns the lazy loader; its sys.modules/globals use is legitimate,
+# and the audit asserts no other file inherits this).  hardware.py's
+# getattr(subprocess, "run") alias is the one sanctioned reflection, pinned to
+# the name _subprocess_run.
 # It does NOT stop deliberate obfuscation, edits to this file, or runtime
 # behaviour outside section 0b's executed paths - hence the runtime sentinel.
 # ──────────────────────────────────────────────────────────────────────
@@ -100,7 +105,8 @@ SPAWN_ATTRS = {"run", "call", "Popen", "check_call", "check_output",
                "getoutput", "getstatusoutput"}
 SUBPROCESS_ATTRS = {"run", "SubprocessError", "TimeoutExpired", "CalledProcessError"}
 ALLOWED_SUBPROCESS_IMPORTS = SUBPROCESS_ATTRS | {"CompletedProcess"}
-banned_os = {"system", "popen"}
+banned_os = {"system", "popen", "fork", "forkpty",
+             "posix_spawn", "posix_spawnp"}
 
 subprocess_modules: set[str] = {"subprocess"}
 subprocess_from: dict[str, str] = {}
@@ -130,7 +136,7 @@ for node in ast.walk(tree):
                     )
                 subprocess_from[bound] = alias.name
             elif top == "os":
-                if alias.name in banned_os or alias.name.startswith(("exec", "spawn")):
+                if alias.name in banned_os or alias.name.startswith(("exec", "spawn", "posix_spawn")):
                     raise AssertionError(f"forbidden 'from os import {alias.name}'")
                 os_from[bound] = alias.name
 
@@ -170,8 +176,8 @@ EXPECTED_SPAWN_SITES = [
     ("hardware.py", "_subprocess_run", "alias"),
     ("hardware.py", "_run_command", "wrapper"),
 ]
-MODULE_TREES: dict[str, ast.Module] = {}
 SPAWN_SITE_NODES: list[tuple[str, str, str, ast.AST]] = []
+SPAWN_SITE_MODULES: dict[int, ast.Module] = {}
 
 
 def _module_spawn_aliases(module: ast.Module) -> tuple[set[str], dict[str, str]]:
@@ -222,13 +228,15 @@ def _is_sanctioned_run_getattr(value: ast.expr | None, modules: set[str]) -> boo
 
 for module_path in SOURCE_PATHS:
     module = ast.parse(module_path.read_text(encoding="utf-8"))
-    MODULE_TREES[module_path.name] = module
     parents: dict[int, ast.AST] = {}
     for parent in ast.walk(module):
         for child in ast.iter_child_nodes(parent):
             parents[id(child)] = parent
     modules, from_names = _module_spawn_aliases(module)
     alias_names: set[str] = set()
+    direct_aliases: dict[str, ast.AST] = {}
+    name_edges: dict[str, str] = {}
+    name_nodes: dict[str, ast.AST] = {}
     for node in ast.walk(module):
         target = value = None
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -240,7 +248,42 @@ for module_path in SOURCE_PATHS:
             continue
         if _is_subprocess_attr_alias(value, modules) or _is_sanctioned_run_getattr(value, modules):
             alias_names.add(target.id)
-            SPAWN_SITE_NODES.append((module_path.name, target.id, "alias", node))
+            direct_aliases[target.id] = node
+        elif isinstance(value, ast.Name):
+            name_edges[target.id] = value.id
+            name_nodes[target.id] = node
+    # Reject alias cycles (a = b; b = a) instead of looping forever.
+    _visiting: set[str] = set()
+    _done: set[str] = set()
+
+    def _walk_edges(name: str) -> None:
+        if name in _done:
+            return
+        if name in _visiting:
+            raise AssertionError(f"{module_path.name}: alias cycle involving {name!r}")
+        _visiting.add(name)
+        if name in name_edges:
+            _walk_edges(name_edges[name])
+        _visiting.discard(name)
+        _done.add(name)
+
+    for _name in list(name_edges):
+        _walk_edges(_name)
+    # Resolve alias-of-alias chains transitively; every hop is its own
+    # enumerated site, so a second route can never stay invisible.
+    for _name, _node in direct_aliases.items():
+        SPAWN_SITE_NODES.append((module_path.name, _name, "alias", _node))
+        SPAWN_SITE_MODULES[id(_node)] = module
+    _changed = True
+    while _changed:
+        _changed = False
+        for _name, _rhs in name_edges.items():
+            if _name in alias_names or _rhs not in alias_names:
+                continue
+            alias_names.add(_name)
+            SPAWN_SITE_NODES.append((module_path.name, _name, "alias", name_nodes[_name]))
+            SPAWN_SITE_MODULES[id(name_nodes[_name])] = module
+            _changed = True
     for node in ast.walk(module):
         if not isinstance(node, ast.Call):
             continue
@@ -248,10 +291,13 @@ for module_path in SOURCE_PATHS:
         symbol = _enclosing_symbol(node, parents)
         if _is_subprocess_attr_alias(func, modules):
             SPAWN_SITE_NODES.append((module_path.name, symbol, "literal-run", node))
+            SPAWN_SITE_MODULES[id(node)] = module
         elif isinstance(func, ast.Name) and from_names.get(func.id) in SPAWN_ATTRS:
             SPAWN_SITE_NODES.append((module_path.name, symbol, "literal-run", node))
+            SPAWN_SITE_MODULES[id(node)] = module
         elif isinstance(func, ast.Name) and func.id in alias_names:
             SPAWN_SITE_NODES.append((module_path.name, symbol, "wrapper", node))
+            SPAWN_SITE_MODULES[id(node)] = module
 
 _discovered_sites = [(file, symbol, kind) for file, symbol, kind, _ in SPAWN_SITE_NODES]
 if len(_discovered_sites) != len(EXPECTED_SPAWN_SITES) or set(_discovered_sites) != set(EXPECTED_SPAWN_SITES):
@@ -282,7 +328,7 @@ for _file, _symbol, _kind, _node in SPAWN_SITE_NODES:
     elif _kind == "wrapper":
         assert isinstance(_node, ast.Call)
         _functions = [
-            item for item in ast.walk(MODULE_TREES[_file])
+            item for item in ast.walk(SPAWN_SITE_MODULES[id(_node)])
             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == _symbol
         ]
         check(len(_functions) == 1)
@@ -315,7 +361,7 @@ for node in ast.walk(tree):
                 subprocess_calls.append(node)
             if func.id in os_from and (
                 os_from[func.id] in banned_os
-                or os_from[func.id].startswith(("exec", "spawn"))
+                or os_from[func.id].startswith(("exec", "spawn", "posix_spawn"))
             ):
                 raise AssertionError(f"forbidden os.{os_from[func.id]} call at line {node.lineno}")
             if func.id in {"getattr", "setattr"} and node.args:
@@ -338,7 +384,8 @@ for node in ast.walk(tree):
                 if func.attr in SPAWN_ATTRS:
                     subprocess_calls.append(node)
             if isinstance(base, ast.Name) and base.id in os_modules and (
-                func.attr in banned_os or func.attr.startswith(("exec", "spawn"))
+                func.attr in banned_os
+                or func.attr.startswith(("exec", "spawn", "posix_spawn"))
             ):
                 raise AssertionError(f"forbidden os.{func.attr} at line {node.lineno}")
         for keyword in node.keywords:
@@ -446,6 +493,8 @@ FORBIDDEN_TEXT = (
     ("os.popen", r"\bos\.popen\b"),
     ("os.exec*", r"\bos\.exec\w*"),
     ("os.spawn*", r"\bos\.spawn\w*"),
+    ("os.posix_spawn*", r"\bos\.posix_spawn\w*"),
+    ("os.fork*", r"\bos\.fork\w*"),
     ("__import__", r"\b__import__\b"),
     ("importlib", r"\bimportlib\b"),
     ("builtin eval()", r"(?<![\w.])eval\s*\("),
@@ -474,11 +523,17 @@ FORBIDDEN_TAINT_ATTRS = {
     "__dict__", "__builtins__", "__getattribute__", "__subclasses__",
     "__globals__", "__call__", "__get__",
 }
+FACADE_PATH = (PKG / "__init__.py").resolve()
+EXEMPT_MODULES: list[Path] = []
+ASYNCIO_SPAWN = {"create_subprocess_exec", "create_subprocess_shell"}
 for module_path in SOURCE_PATHS:
     module_text = module_path.read_text(encoding="utf-8")
     module_tree = ast.parse(module_text)
     module_aliases: set[str] = set()
     sys_aliases: set[str] = {"sys"}
+    asyncio_aliases: set[str] = {"asyncio"}
+    asyncio_from: dict[str, str] = {}
+    multiprocessing_used = False
     tainted = False
     for node in ast.walk(module_tree):
         if isinstance(node, ast.Import):
@@ -489,16 +544,50 @@ for module_path in SOURCE_PATHS:
                     module_aliases.add(alias.asname or top)
                 if top == "sys":
                     sys_aliases.add(alias.asname or "sys")
+                if top == "asyncio":
+                    asyncio_aliases.add(alias.asname or "asyncio")
+                if top == "multiprocessing":
+                    multiprocessing_used = True
         elif isinstance(node, ast.ImportFrom) and node.module:
-            if node.module.split(".")[0] in PROCESS_MODULES:
+            top = node.module.split(".")[0]
+            if top in PROCESS_MODULES:
                 tainted = True
-    # The package facade only re-exports these modules and owns the lazy
-    # loader; its sys.modules/globals use is exactly what the sentinel covers.
-    if module_path.name == "__init__.py":
+            if top == "asyncio":
+                for alias in node.names:
+                    asyncio_from[alias.asname or alias.name] = alias.name
+            if top == "multiprocessing":
+                multiprocessing_used = True
+    # ONLY the exact package facade is exempt; a subpackage __init__.py does
+    # not inherit it.  The facade re-exports these modules and owns the lazy
+    # loader, so its sys.modules use is legitimate and sentinel-covered.
+    if module_path.resolve() == FACADE_PATH:
         tainted = False
+        EXEMPT_MODULES.append(module_path)
     if not tainted:
         continue
+    if multiprocessing_used:
+        raise AssertionError(
+            f"{module_path.name}: multiprocessing is forbidden in process-touching modules"
+        )
     for node in ast.walk(module_tree):
+        if isinstance(node, ast.Call):
+            _func = node.func
+            if (
+                isinstance(_func, ast.Attribute)
+                and isinstance(_func.value, ast.Name)
+                and _func.value.id in asyncio_aliases
+                and _func.attr in ASYNCIO_SPAWN
+            ):
+                raise AssertionError(
+                    f"{module_path.name}: forbidden asyncio.{_func.attr}"
+                )
+            if (
+                isinstance(_func, ast.Name)
+                and asyncio_from.get(_func.id) in ASYNCIO_SPAWN
+            ):
+                raise AssertionError(
+                    f"{module_path.name}: forbidden asyncio {_func.id}"
+                )
         if isinstance(node, ast.Name) and node.id in FORBIDDEN_TAINT_NAMES:
             raise AssertionError(
                 f"{module_path.name}: forbidden {node.id} in process-touching module"
@@ -528,6 +617,8 @@ for module_path in SOURCE_PATHS:
                 raise AssertionError(
                     f"{module_path.name}: non-ASCII identifier {value!r} (homoglyph?)"
                 )
+
+check(EXEMPT_MODULES == [PKG / "__init__.py"])
 
 # ════════════════════════════════════════════════════════════════════
 # 0b. Runtime sentinel: catches dynamic routes static AST cannot see
