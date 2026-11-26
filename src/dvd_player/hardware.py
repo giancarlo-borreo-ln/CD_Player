@@ -88,12 +88,13 @@ _subprocess_run: Callable[..., CompletedProcess[str]] = getattr(  # noqa: B009
 
 
 def _run_command(argv: list[str]) -> CompletedProcess[str] | None:
-    """Run a helper tool without a shell; return None on launch failure."""
+    """Run a helper tool without a shell; return None when unavailable."""
     try:
         return _subprocess_run(
             argv, check=False, capture_output=True, text=True
         )
-    except OSError:
+    except (OSError, subprocess.SubprocessError):
+        # SubprocessError covers TimeoutExpired; callers degrade to "unknown".
         return None
 
 

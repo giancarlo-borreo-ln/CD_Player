@@ -6,6 +6,7 @@ import json
 import locale
 import os
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -296,6 +297,18 @@ with (
     mock.patch.object(hardware.shutil, "which", return_value=None),
 ):
     check(hardware.list_dvd_devices() == [])  # drutil absent -> degrade, no raise
+# A timed-out drutil probe is swallowed by _run_command -> [] (never raises).
+with (
+    mock.patch.object(hardware.sys, "platform", "darwin"),
+    mock.patch.object(hardware.os, "listdir", return_value=["disk2"]),
+    mock.patch.object(hardware.shutil, "which", return_value="/usr/bin/drutil"),
+    mock.patch.object(
+        hardware,
+        "_subprocess_run",
+        side_effect=subprocess.TimeoutExpired(["drutil", "status"], 1),
+    ),
+):
+    check(hardware.list_dvd_devices() == [])
 
 # macOS presence: mount-table hit/miss/unknown.
 mounts = types.SimpleNamespace(
