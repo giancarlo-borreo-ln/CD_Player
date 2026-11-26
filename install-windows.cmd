@@ -12,6 +12,10 @@ if /i not "%OS%"=="Windows_NT" (
     exit /b 2
 )
 
+echo.
+echo NOTICE: Windows support is verified statically, not on real hardware; encrypted-DVD playback depends on the libmpv build; Start Menu indexing may lag.
+echo.
+
 set "HERE=%~dp0"
 if "%HERE:~-1%"=="\" set "HERE=%HERE:~0,-1%"
 
@@ -60,17 +64,21 @@ if not "%ARGS:--uninstall=%"=="%ARGS%" set "LAUNCH="
 "%UV%" run --python 3.13 "%HERE%\scripts\install.py" --platform windows %MODE% %*
 if errorlevel 1 exit /b %ERRORLEVEL%
 
-if defined LAUNCH (
-    if exist "%USERPROFILE%\.local\bin\dvd-player.exe" (
-        set "PATH=%LOCALAPPDATA%\dvd-player\lib;%PATH%"
-        start "" "%USERPROFILE%\.local\bin\dvd-player.exe"
-    ) else (
-        echo install-windows.cmd: dvd-player.exe was not found after install. 1>&2
-        echo Run: uv tool install --force "%HERE%" 1>&2
-        exit /b 1
-    )
+if defined LAUNCH call :launch
+exit /b %ERRORLEVEL%
+
+:launch
+if not exist "%USERPROFILE%\.local\bin\dvd-player.exe" (
+    echo install-windows.cmd: dvd-player.exe was not found after install. 1>&2
+    echo Run: uv tool install --force "%HERE%" 1>&2
+    exit /b 1
 )
-exit /b 0
+set "PATH=%LOCALAPPDATA%\dvd-player\lib;%PATH%"
+start "" /wait "%USERPROFILE%\.local\bin\dvd-player.exe"
+if not errorlevel 1 exit /b 0
+echo install-windows.cmd: dvd-player exited with error %ERRORLEVEL%. 1>&2
+echo See the UI log: %LOCALAPPDATA%\dvd-player\dvd-player.log 1>&2
+exit /b %ERRORLEVEL%
 
 :find_uv
 set "UV="

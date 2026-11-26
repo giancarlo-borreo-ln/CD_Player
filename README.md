@@ -78,6 +78,11 @@ independent, PowerShell-native entry point with the same uv-first flow. The
 `.ps1` is statically validated only (it cannot be executed on the Linux CI
 host); the `.cmd` remains the Loki-tested path.
 
+Windows dependency trust (W2) relies on three verification layers: **winget
+verifies** the uv and mpv packages it installs, **`uv.lock` verifies** every
+Python wheel, and **libmpv is pinned and digest-verified** by
+`scripts/fetch_deps.py` against the hashes in `scripts/deps-manifest.json`.
+
 From a PowerShell prompt the one-liner is:
 
 ```powershell

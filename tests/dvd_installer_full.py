@@ -179,6 +179,106 @@ def test_windows_installers_are_independent_and_map_flags() -> None:
     check("--platform windows" in cmd)
 
 
+def test_windows_launch_exit_propagation_and_notice() -> None:
+    ps1 = (REPO / "install-windows.ps1").read_text(encoding="utf-8")
+    cmd = (REPO / "install-windows.cmd").read_text(encoding="utf-8")
+    ps1_lowered = ps1.lower()
+    cmd_lowered = cmd.lower()
+    notice = (
+        "windows support is verified statically, not on real hardware; "
+        "encrypted-dvd playback depends on the libmpv build; "
+        "start menu indexing may lag."
+    )
+    check(cmd_lowered.count(notice) == 1)
+    check(ps1_lowered.count(notice) == 1)
+    check('start "" /wait' in cmd_lowered)
+    check("if not errorlevel 1 exit /b 0" in cmd_lowered)
+    check("%localappdata%\\dvd-player\\dvd-player.log" in cmd_lowered)
+    check(
+        "start-process -filepath $exe -workingdirectory $repo -wait -passthru"
+        in ps1_lowered
+    )
+    check("$process.exitcode" in ps1_lowered)
+    check("dvd-player\\dvd-player.log" in ps1_lowered)
+
+
+def test_failure_after_tool_install_rolls_back_new_tool() -> None:
+    root = Path(tempfile.mkdtemp())
+    shortcut = root / "DVD Player.lnk"
+    exe = root / "dvd-player.exe"
+    exe.write_bytes(b"exe")
+    calls: list[list[str]] = []
+    old = (
+        install.ensure_python, install.check_python, install.ensure_uv,
+        install.install_native, install.install_tool, install.snapshot_install_state,
+        install.tool_binary, install.create_entry, install.smoke_test,
+        install.shutil.which, install.run_argv, install.check_native,
+        install.check_disc,
+    )
+
+    def fake_run(argv: list[str], cwd: Path | None = None, capture: bool = False):
+        calls.append(list(argv))
+        return install.subprocess.CompletedProcess(argv, 0, "", "")
+
+    def fake_create_entry(report: install.Report, binary: Path) -> bool:
+        shortcut.write_text("lnk", encoding="utf-8")
+        report.fail("Start Menu shortcut failed", "injected failure")
+        return False
+
+    try:
+        install.ensure_python = lambda report, ask: True
+        install.check_python = lambda report: True
+        install.ensure_uv = lambda report, ask: True
+        install.install_native = lambda report, ask, offline, dvdcss=None: True
+        install.snapshot_install_state = lambda: {
+            "tool_existed": False,
+            "entries": {str(shortcut): False},
+        }
+        install.install_tool = lambda report, offline: True
+        install.tool_binary = lambda: exe
+        install.create_entry = fake_create_entry
+        install.smoke_test = lambda report: True
+        install.shutil.which = lambda name: "uv" if name == "uv" else None
+        install.run_argv = fake_run
+        install.check_native = lambda *args, **kwargs: None
+        install.check_disc = lambda report: None
+        code = install.run(_install_args())
+    finally:
+        (
+            install.ensure_python, install.check_python, install.ensure_uv,
+            install.install_native, install.install_tool, install.snapshot_install_state,
+            install.tool_binary, install.create_entry, install.smoke_test,
+            install.shutil.which, install.run_argv, install.check_native,
+            install.check_disc,
+        ) = old
+    check(code == 1)
+    check(not shortcut.exists())
+    check(["uv", "tool", "uninstall", "dvd-player"] in calls)
+
+
+def test_rollback_keeps_preexisting_tool_and_shortcut() -> None:
+    root = Path(tempfile.mkdtemp())
+    shortcut = root / "DVD Player.lnk"
+    shortcut.write_text("lnk", encoding="utf-8")
+    calls: list[list[str]] = []
+    old_which, old_run = install.shutil.which, install.run_argv
+    try:
+        install.shutil.which = lambda name: "uv" if name == "uv" else None
+        install.run_argv = lambda argv, cwd=None, capture=False: (
+            calls.append(list(argv))
+            or install.subprocess.CompletedProcess(argv, 0, "", "")
+        )
+        report = install.Report()
+        install.rollback_install(
+            report, {"tool_existed": True, "entries": {str(shortcut): True}}
+        )
+    finally:
+        install.shutil.which, install.run_argv = old_which, old_run
+    check(calls == [])
+    check(shortcut.exists())
+    check(report.failures == 0)
+
+
 def test_windows_uv_first_flow_without_system_python() -> None:
     """Fakes winget/uv: uv is resolved or installed silently, no system Python."""
     cmd = (REPO / "install-windows.cmd").read_text(encoding="utf-8")
@@ -532,6 +632,9 @@ for test in (
     test_add_dll_directory_dirs_and_missing,
     test_manifest_hash_well_formed,
     test_windows_installers_are_independent_and_map_flags,
+    test_windows_launch_exit_propagation_and_notice,
+    test_failure_after_tool_install_rolls_back_new_tool,
+    test_rollback_keeps_preexisting_tool_and_shortcut,
     test_windows_uv_first_flow_without_system_python,
     test_bundled_libdvdcss_reports_ok,
     test_missing_dvdcss_marker_warns_once_without_fetch,

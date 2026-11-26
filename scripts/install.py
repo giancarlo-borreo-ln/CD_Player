@@ -1261,6 +1261,66 @@ def install_native(
     return True
 
 
+def tool_was_installed() -> bool | None:
+    """Snapshot whether the dvd-player uv tool existed; None if unknown."""
+    uv = shutil.which("uv")
+    if not uv:
+        return None
+    try:
+        result = subprocess.run(
+            [uv, "tool", "list"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if parts and parts[0].lower() == TOOL_NAME.lower():
+            return True
+    return False
+
+
+def snapshot_install_state() -> dict[str, object]:
+    """Record pre-install state needed for a transactional rollback."""
+    return {
+        "tool_existed": tool_was_installed(),
+        "entries": {str(path): path.exists() for path in entry_paths()},
+    }
+
+
+def rollback_install(report: Report, state: dict[str, object]) -> None:
+    """Undo a failed install without touching user config/data."""
+    report.section("Rollback")
+    if state.get("tool_existed") is False:
+        uv = shutil.which("uv")
+        if uv is None:
+            report.warn("uv not found", "could not remove the new dvd-player tool")
+        else:
+            result = run_argv([uv, "tool", "uninstall", TOOL_NAME], capture=True)
+            if result.returncode == 0:
+                report.ok("dvd-player tool", "removed (it did not exist before)")
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                report.warn("could not remove the new dvd-player tool", detail)
+    elif state.get("tool_existed") is True:
+        report.ok("dvd-player tool", "kept (it existed before this install)")
+
+    entries = state.get("entries")
+    if isinstance(entries, dict):
+        for raw, existed in entries.items():
+            if existed:
+                continue
+            path = Path(str(raw))
+            if path.exists() or path.is_symlink():
+                remove_path(path, report)
+    print("  [keep] config/data not touched by rollback")
+
+
 def install_tool(report: Report, offline: Path | None) -> bool:
     argv = ["uv", "tool", "install", "--force"]
     if offline is not None:
@@ -1723,12 +1783,27 @@ def run(args: argparse.Namespace) -> int:
 
     uv_ok = ensure_uv(report, args.ask)
     installed_tool = False
+    install_state: dict[str, object] | None = None
     if mode == "install":
         if uv_ok:
             if not install_native(report, args.ask, offline, dvdcss):
                 print("\nResult: FAIL — required native dependency install failed.")
                 return 1
+            install_state = snapshot_install_state()
             installed_tool = install_tool(report, offline)
+            if installed_tool:
+                report.section("Entry point")
+                binary = tool_binary()
+                if not binary.exists():
+                    report.fail(
+                        "installed dvd-player binary not found",
+                        f"expected {binary}; re-run: uv tool install --force .",
+                    )
+                    installed_tool = False
+                elif not (create_entry(report, binary) and smoke_test(report)):
+                    installed_tool = False
+            if not installed_tool and install_state is not None:
+                rollback_install(report, install_state)
         else:
             report.warn("install skipped", "uv is required to install dvd-player")
     else:
@@ -1757,19 +1832,11 @@ def run(args: argparse.Namespace) -> int:
 
     PLATFORMS.get(key, platform_other)(report)
 
-    if mode == "install" and installed_tool:
-        report.section("Entry point")
-        binary = tool_binary()
-        if not binary.exists():
-            report.fail(
-                "installed dvd-player binary not found",
-                f"expected {binary}; re-run: uv tool install --force .",
-            )
-        else:
-            create_entry(report, binary)
-            smoke_test(report)
-
     check_disc(report)
+
+    if report.failures and installed_tool and install_state is not None:
+        rollback_install(report, install_state)
+        installed_tool = False
 
     if report.failures:
         print(f"\nResult: FAIL — {report.failures} hard dependency problem(s) above.")

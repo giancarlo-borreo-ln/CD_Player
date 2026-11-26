@@ -50,6 +50,10 @@ function Write-Err {
     [Console]::Error.WriteLine("install-windows.ps1: $Message")
 }
 
+Write-Host ''
+Write-Host 'NOTICE: Windows support is verified statically, not on real hardware; encrypted-DVD playback depends on the libmpv build; Start Menu indexing may lag.'
+Write-Host ''
+
 function Find-Uv {
     $command = Get-Command uv -ErrorAction SilentlyContinue
     if ($null -ne $command) {
@@ -201,7 +205,13 @@ try {
         }
         $lib = Join-Path $env:LOCALAPPDATA 'dvd-player\lib'
         $env:PATH = "$lib;$env:PATH"
-        Start-Process -FilePath $exe -WorkingDirectory $Repo | Out-Null
+        $process = Start-Process -FilePath $exe -WorkingDirectory $Repo -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            Write-Err "dvd-player exited with code $($process.ExitCode)."
+            $log = Join-Path $env:LOCALAPPDATA 'dvd-player\dvd-player.log'
+            Write-Err "See the UI log: $log"
+            exit $process.ExitCode
+        }
     }
 
     $Error.Clear()
