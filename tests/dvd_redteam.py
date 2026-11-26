@@ -6,14 +6,17 @@ Run:  QT_QPA_PLATFORM=offscreen uv run python /tmp/dvd_redteam.py
 from __future__ import annotations
 
 import ast
+import io
 import json
 import locale
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import tokenize
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -104,11 +107,70 @@ assert isinstance(argv, ast.List)
 check(isinstance(argv.elts[0], ast.Name) and argv.elts[0].id == "eject_bin")
 check(isinstance(argv.elts[1], ast.Name) and argv.elts[1].id == "device")
 check(all(kw.arg != "shell" for kw in call.keywords))
-# textual sanity: exactly one 'subprocess.' occurrence in code (not comments)
-code_only = "\n".join(line.split("#", 1)[0] for line in source_text.splitlines())
-check(code_only.count("subprocess.") == 1)
-check("shell=True" not in code_only)
-check("os.system" not in code_only)
+# textual backstop: drop comments AND string literals (tokenizer-aware, so
+# '#' inside strings and docstrings mentioning exec() are not false positives),
+# then forbid the dangerous spellings.  subprocess.SubprocessError/
+# TimeoutExpired handlers are deliberately allowed: exception handling is not
+# command execution.
+def _strip_comments(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except tokenize.TokenError:
+        return text
+    removals: dict[int, list[tuple[int, int]]] = {}
+    for tok in toks:
+        if tok.type not in (tokenize.COMMENT, tokenize.STRING):
+            continue
+        (sr, sc), (er, ec) = tok.start, tok.end
+        if sr == er:
+            removals.setdefault(sr, []).append((sc, ec))
+        else:
+            removals.setdefault(sr, []).append((sc, len(lines[sr - 1].rstrip("\n"))))
+            for row in range(sr + 1, er):
+                removals.setdefault(row, []).append((0, len(lines[row - 1].rstrip("\n"))))
+            removals.setdefault(er, []).append((0, ec))
+    for row, spans in removals.items():
+        line = lines[row - 1]
+        body = line.rstrip("\n")
+        for start, end in sorted(spans, reverse=True):
+            body = body[:start] + body[end:]
+        lines[row - 1] = body + ("\n" if line.endswith("\n") else "")
+    return "".join(lines)
+
+
+code_only = _strip_comments(source_text)
+FORBIDDEN_TEXT = (
+    ("subprocess.Popen", r"\bsubprocess\.Popen\b"),
+    ("subprocess.call", r"\bsubprocess\.call\s*\("),
+    ("subprocess.check_call", r"\bsubprocess\.check_call\s*\("),
+    ("subprocess.check_output", r"\bsubprocess\.check_output\s*\("),
+    ("os.system", r"\bos\.system\b"),
+    ("os.popen", r"\bos\.popen\b"),
+    ("builtin eval()", r"(?<![\w.])eval\s*\("),
+    ("builtin exec()", r"(?<![\w.])exec\s*\("),
+    ("shell=True", r"\bshell\s*=\s*True\b"),
+)
+for label, pattern in FORBIDDEN_TEXT:
+    match = re.search(pattern, code_only)
+    if match is not None:
+        raise AssertionError(f"forbidden {label} found in source text")
+# the one allowed call site is still visible to the textual layer
+check(len(re.findall(r"\bsubprocess\.run\s*\(", code_only)) == 1)
+# no other subprocess API may be referenced through the module (calls or
+# aliases); only the run entry point and exception classes are permitted.
+_ALLOWED_SUBPROCESS_ATTRS = {
+    "run", "SubprocessError", "TimeoutExpired", "CalledProcessError",
+    "CompletedProcess",
+}
+for node in ast.walk(tree):
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "subprocess"
+        and node.attr not in _ALLOWED_SUBPROCESS_ATTRS
+    ):
+        raise AssertionError(f"forbidden subprocess.{node.attr} reference at line {node.lineno}")
 check("import pickle" not in code_only)
 check("import yaml" not in code_only and "from yaml" not in code_only)
 
